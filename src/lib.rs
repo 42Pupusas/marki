@@ -2,9 +2,31 @@ mod inline;
 mod section;
 mod special_char;
 
+use std::borrow::Cow;
+
 pub use inline::Inline;
 pub use section::Section;
 pub use special_char::SpecialChar;
+
+/// Normalize line endings for parsing. Returns the input borrowed if it
+/// contains no carriage returns, or an owned copy with `\r` stripped otherwise.
+///
+/// Use this before [`MarkdownFile::parse`] when the input may contain CRLF
+/// line endings:
+///
+/// ```
+/// let input = "# Hello\r\nWorld";
+/// let normalized = marki::normalize(input);
+/// let md = marki::MarkdownFile::parse(&normalized);
+/// ```
+#[must_use]
+pub fn normalize(input: &str) -> Cow<'_, str> {
+    if input.as_bytes().contains(&b'\r') {
+        Cow::Owned(input.replace('\r', ""))
+    } else {
+        Cow::Borrowed(input)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownFile<'src> {
@@ -756,6 +778,29 @@ mod tests {
                 },
                 Section::Heading {
                     level: 2,
+                    content: text("CRLF Support")
+                },
+                Section::Paragraph {
+                    content: vec![
+                        Inline::Text("The parser operates on LF ("),
+                        Inline::Code("\\n"),
+                        Inline::Text(") line endings. For CRLF ("),
+                        Inline::Code("\\r\\n"),
+                        Inline::Text(") input, call "),
+                        Inline::Code("normalize"),
+                        Inline::Text(" before parsing \u{2014} it returns the input borrowed when no "),
+                        Inline::Code("\\r"),
+                        Inline::Text(" is present (zero-cost), or an owned copy with "),
+                        Inline::Code("\\r"),
+                        Inline::Text(" stripped:"),
+                    ],
+                },
+                Section::CodeBlock {
+                    language: Some("rust"),
+                    code: "use marki::{normalize, MarkdownFile};\n\nlet normalized = normalize(input);\nlet md = MarkdownFile::parse(&normalized);",
+                },
+                Section::Heading {
+                    level: 2,
                     content: text("Known Limitations")
                 },
                 Section::UnorderedList {
@@ -767,15 +812,75 @@ mod tests {
                             Inline::Text(" is not recognized)"),
                         ],
                         vec![
-                            Inline::Text("Input should use LF ("),
-                            Inline::Code("\\n"),
-                            Inline::Text(") line endings; CRLF ("),
+                            Inline::Text("For CRLF ("),
                             Inline::Code("\\r\\n"),
-                            Inline::Text(") input will preserve "),
-                            Inline::Code("\\r"),
-                            Inline::Text(" in merged paragraph and code block content"),
+                            Inline::Text(") input, call "),
+                            Inline::Code("marki::normalize"),
+                            Inline::Text(" before parsing"),
                         ],
                     ],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_normalize_lf_is_borrowed() {
+        let input = "hello\nworld";
+        let normalized = normalize(input);
+        assert!(matches!(normalized, Cow::Borrowed(_)));
+        assert_eq!(&*normalized, input);
+    }
+
+    #[test]
+    fn test_normalize_crlf_strips_cr() {
+        let input = "hello\r\nworld\r\n";
+        let normalized = normalize(input);
+        assert!(matches!(normalized, Cow::Owned(_)));
+        assert_eq!(&*normalized, "hello\nworld\n");
+    }
+
+    #[test]
+    fn test_crlf_paragraph() {
+        let input = normalize("line one\r\nline two\r\n");
+        let md = MarkdownFile::parse(&input);
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: text("line one\nline two"),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_crlf_code_block() {
+        let input = normalize("```rust\r\nfn main() {}\r\nlet x = 1;\r\n```\r\n");
+        let md = MarkdownFile::parse(&input);
+        assert_eq!(
+            md.sections,
+            vec![Section::CodeBlock {
+                language: Some("rust"),
+                code: "fn main() {}\nlet x = 1;",
+            }]
+        );
+    }
+
+    #[test]
+    fn test_crlf_mixed_document() {
+        let input = normalize("# Title\r\n\r\nSome text.\r\n\r\n- a\r\n- b\r\n");
+        let md = MarkdownFile::parse(&input);
+        assert_eq!(
+            md.sections,
+            vec![
+                Section::Heading {
+                    level: 1,
+                    content: text("Title")
+                },
+                Section::Paragraph {
+                    content: text("Some text.")
+                },
+                Section::UnorderedList {
+                    items: vec![text("a"), text("b")]
                 },
             ]
         );

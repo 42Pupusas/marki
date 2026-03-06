@@ -38,8 +38,19 @@ for section in &md.sections {
 }
 ```
 
+## CRLF Support
+
+The parser operates on LF (`\n`) line endings. For CRLF (`\r\n`) input, call `normalize` before parsing — it returns the input borrowed when no `\r` is present (zero-cost), or an owned copy with `\r` stripped:
+
+```rust
+use marki::{normalize, MarkdownFile};
+
+let normalized = normalize(input);
+let md = MarkdownFile::parse(&normalized);
+```
+
 ## Known Limitations
 
 - List items are single-line only (no continuation with indentation)
 - Emphasis cannot span across blockquote lines (`> **bold\n> continues**` is not recognized)
-- Input should use LF (`\n`) line endings; CRLF (`\r\n`) input will preserve `\r` in merged paragraph and code block content
+- For CRLF (`\r\n`) input, call `marki::normalize` before parsing
