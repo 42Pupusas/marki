@@ -26,6 +26,7 @@ enum Accumulator<'src> {
         items: Vec<&'src str>,
     },
     InOrderedList {
+        start: u32,
         items: Vec<&'src str>,
     },
     InParagraph {
@@ -56,7 +57,8 @@ impl<'src> Accumulator<'src> {
             Self::InUnorderedList { items, .. } => Some(Section::UnorderedList {
                 items: items.into_iter().map(Inline::parse).collect(),
             }),
-            Self::InOrderedList { items } => Some(Section::OrderedList {
+            Self::InOrderedList { start, items } => Some(Section::OrderedList {
+                start,
                 items: items.into_iter().map(Inline::parse).collect(),
             }),
             Self::InParagraph { content } => Some(Section::Paragraph {
@@ -205,13 +207,16 @@ impl<'src> MarkdownFile<'src> {
             };
         }
 
-        if let Some(item) = Self::try_parse_ordered_item(line) {
-            if let Accumulator::InOrderedList { mut items } = acc {
+        if let Some((num, item)) = Self::try_parse_ordered_item(line) {
+            if let Accumulator::InOrderedList { start, mut items } = acc {
                 items.push(item);
-                return Accumulator::InOrderedList { items };
+                return Accumulator::InOrderedList { start, items };
             }
             acc.flush_into(sections);
-            return Accumulator::InOrderedList { items: vec![item] };
+            return Accumulator::InOrderedList {
+                start: num,
+                items: vec![item],
+            };
         }
 
         Self::fold_paragraph(input, sections, acc, line)
@@ -304,14 +309,14 @@ impl<'src> MarkdownFile<'src> {
         rest.strip_prefix(' ').map(|item| (first, item))
     }
 
-    fn try_parse_ordered_item(line: &str) -> Option<&str> {
+    fn try_parse_ordered_item(line: &str) -> Option<(u32, &str)> {
         let (num_part, rest) = line.split_once(". ")?;
         if !num_part.is_empty()
             && num_part.len() <= 9
             && num_part.as_bytes().iter().all(u8::is_ascii_digit)
             && !rest.is_empty()
         {
-            Some(rest)
+            Some((num_part.parse().ok()?, rest))
         } else {
             None
         }
@@ -421,6 +426,7 @@ mod tests {
         assert_eq!(
             md.sections,
             vec![Section::OrderedList {
+                start: 1,
                 items: vec![text("first"), text("second"), text("third")],
             }]
         );
@@ -697,6 +703,7 @@ mod tests {
                     code: "use marki::MarkdownFile;\n\nlet md: MarkdownFile = \"# Hello\\n\\nWorld\".parse().unwrap();",
                 },
                 Section::OrderedList {
+                    start: 1,
                     items: vec![
                         text("Parse a string"),
                         text("Read a file"),

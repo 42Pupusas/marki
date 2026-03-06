@@ -13,6 +13,7 @@ pub enum Inline<'src> {
         alt: &'src str,
         url: &'src str,
     },
+    Code(&'src str),
 }
 
 impl<'src> From<&'src str> for Inline<'src> {
@@ -29,8 +30,78 @@ static SPECIAL: [bool; 256] = {
     table[b'[' as usize] = true;
     table[b'!' as usize] = true;
     table[b'\\' as usize] = true;
+    table[b'`' as usize] = true;
     table
 };
+
+/// What emphasis types remain possible for a given delimiter character.
+#[derive(Clone, Copy)]
+enum DelimiterAvail {
+    /// Both bold and italic are still possible.
+    Both,
+    /// Bold failed; only italic can be attempted.
+    ItalicOnly,
+    /// Italic failed; only bold can be attempted.
+    BoldOnly,
+    /// Neither bold nor italic can succeed.
+    None,
+}
+
+impl DelimiterAvail {
+    const fn can_bold(self) -> bool {
+        matches!(self, Self::Both | Self::BoldOnly)
+    }
+
+    const fn can_italic(self) -> bool {
+        matches!(self, Self::Both | Self::ItalicOnly)
+    }
+
+    const fn bold_failed(&mut self) {
+        *self = match *self {
+            Self::Both => Self::ItalicOnly,
+            Self::BoldOnly => Self::None,
+            other => other,
+        };
+    }
+
+    const fn italic_failed(&mut self) {
+        *self = match *self {
+            Self::Both => Self::BoldOnly,
+            Self::ItalicOnly => Self::None,
+            other => other,
+        };
+    }
+
+    const fn from_count(count: usize) -> Self {
+        match count {
+            0 | 1 => Self::None,
+            2 | 3 => Self::ItalicOnly,
+            _ => Self::Both,
+        }
+    }
+}
+
+/// Tracks delimiter availability per character type, avoiding O(n²)
+/// re-scanning in both top-level and recursive parse calls.
+struct EmphasisState {
+    star: DelimiterAvail,
+    under: DelimiterAvail,
+}
+
+impl EmphasisState {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        let star_count = bytes.iter().filter(|&&b| b == b'*').take(4).count();
+        let under_count = bytes.iter().filter(|&&b| b == b'_').take(4).count();
+        Self {
+            star: DelimiterAvail::from_count(star_count),
+            under: DelimiterAvail::from_count(under_count),
+        }
+    }
+
+    const fn avail_mut(&mut self, is_star: bool) -> &mut DelimiterAvail {
+        if is_star { &mut self.star } else { &mut self.under }
+    }
+}
 
 impl<'src> Inline<'src> {
     #[must_use]
@@ -39,16 +110,7 @@ impl<'src> Inline<'src> {
         let mut result = Vec::new();
         let mut plain_start = 0;
         let mut i = 0;
-
-        // Pre-scan delimiter counts to avoid O(n²) re-scanning in
-        // recursive calls. If there aren't enough delimiters for a
-        // matched pair, skip those attempts entirely.
-        let star_count = bytes.iter().filter(|&&b| b == b'*').take(4).count();
-        let under_count = bytes.iter().filter(|&&b| b == b'_').take(4).count();
-        let mut no_close_bold_star = star_count < 4;
-        let mut no_close_bold_under = under_count < 4;
-        let mut no_close_italic_star = star_count < 2;
-        let mut no_close_italic_under = under_count < 2;
+        let mut emph = EmphasisState::from_bytes(bytes);
 
         while let Some(&b) = bytes.get(i) {
             // Fast-skip non-special bytes via lookup table
@@ -64,6 +126,19 @@ impl<'src> Inline<'src> {
                 }
                 plain_start = i + 1;
                 i += 2;
+                continue;
+            }
+
+            // Inline code: `code` or ``code``
+            if b == SpecialChar::Backtick
+                && let Some((code, end)) = Self::try_parse_inline_code(input, bytes, i)
+            {
+                if plain_start < i {
+                    result.push(Self::Text(&input[plain_start..i]));
+                }
+                result.push(Self::Code(code));
+                plain_start = end;
+                i = end;
                 continue;
             }
 
@@ -97,52 +172,15 @@ impl<'src> Inline<'src> {
                 continue;
             }
 
-            let is_emphasis = matches!(
-                SpecialChar::from_byte(b),
-                Some(sc) if sc.is_emphasis_char()
-            );
-
-            // Bold: ** or __
-            if is_emphasis
-                && bytes.get(i + 1) == Some(&b)
-                && !(b == SpecialChar::Asterisk && no_close_bold_star)
-                && !(b == SpecialChar::Underscore && no_close_bold_under)
-            {
-                if let Some((inner, end)) = Self::try_parse_delimited(input, bytes, i, b, 2) {
-                    if plain_start < i {
-                        result.push(Self::Text(&input[plain_start..i]));
-                    }
-                    result.push(Self::Bold(Self::parse(inner)));
-                    plain_start = end;
-                    i = end;
-                    continue;
+            // Bold/Italic: ** __ * _
+            if let Some((elem, end)) = Self::try_parse_emphasis(input, bytes, i, b, &mut emph) {
+                if plain_start < i {
+                    result.push(Self::Text(&input[plain_start..i]));
                 }
-                if b == SpecialChar::Asterisk {
-                    no_close_bold_star = true;
-                } else {
-                    no_close_bold_under = true;
-                }
-            }
-
-            // Italic: * or _
-            if is_emphasis
-                && !(b == SpecialChar::Asterisk && no_close_italic_star)
-                && !(b == SpecialChar::Underscore && no_close_italic_under)
-            {
-                if let Some((inner, end)) = Self::try_parse_delimited(input, bytes, i, b, 1) {
-                    if plain_start < i {
-                        result.push(Self::Text(&input[plain_start..i]));
-                    }
-                    result.push(Self::Italic(Self::parse(inner)));
-                    plain_start = end;
-                    i = end;
-                    continue;
-                }
-                if b == SpecialChar::Asterisk {
-                    no_close_italic_star = true;
-                } else {
-                    no_close_italic_under = true;
-                }
+                result.push(elem);
+                plain_start = end;
+                i = end;
+                continue;
             }
 
             i += 1;
@@ -153,6 +191,44 @@ impl<'src> Inline<'src> {
         }
 
         result
+    }
+
+    #[inline]
+    fn try_parse_emphasis(
+        input: &'src str,
+        bytes: &[u8],
+        i: usize,
+        b: u8,
+        emph: &mut EmphasisState,
+    ) -> Option<(Self, usize)> {
+        let is_emphasis = matches!(
+            SpecialChar::from_byte(b),
+            Some(sc) if sc.is_emphasis_char()
+        );
+        if !is_emphasis {
+            return None;
+        }
+
+        let is_star = b == SpecialChar::Asterisk;
+        let avail = emph.avail_mut(is_star);
+
+        // Bold: ** or __
+        if avail.can_bold() && bytes.get(i + 1) == Some(&b) {
+            if let Some((inner, end)) = Self::try_parse_delimited(input, bytes, i, b, 2) {
+                return Some((Self::Bold(Self::parse(inner)), end));
+            }
+            avail.bold_failed();
+        }
+
+        // Italic: * or _
+        if avail.can_italic() {
+            if let Some((inner, end)) = Self::try_parse_delimited(input, bytes, i, b, 1) {
+                return Some((Self::Italic(Self::parse(inner)), end));
+            }
+            avail.italic_failed();
+        }
+
+        None
     }
 
     fn try_parse_bracket_paren(
@@ -261,6 +337,57 @@ impl<'src> Inline<'src> {
                 return Some((input.get(inner_start..i)?, i + count));
             }
             i += 1;
+        }
+
+        None
+    }
+
+    /// Parse inline code: `` `code` `` or ``` ``code`` ```.
+    /// The opening and closing backtick sequences must have the same length.
+    /// Content is taken verbatim (no backslash escaping inside code spans).
+    fn try_parse_inline_code(
+        input: &'src str,
+        bytes: &[u8],
+        start: usize,
+    ) -> Option<(&'src str, usize)> {
+        let backtick_count = bytes
+            .get(start..)?
+            .iter()
+            .take_while(|&&b| b == SpecialChar::Backtick)
+            .count();
+        if backtick_count == 0 {
+            return None;
+        }
+
+        let content_start = start + backtick_count;
+        let mut i = content_start;
+        while i < bytes.len() {
+            // Find next backtick
+            let remaining = bytes.get(i..)?;
+            let offset = remaining.iter().position(|&b| b == SpecialChar::Backtick)?;
+            i += offset;
+
+            // Count consecutive backticks
+            let close_count = bytes
+                .get(i..)?
+                .iter()
+                .take_while(|&&b| b == SpecialChar::Backtick)
+                .count();
+
+            if close_count == backtick_count {
+                // Strip single leading/trailing space per CommonMark
+                let mut cs = content_start;
+                let mut ce = i;
+                if ce - cs >= 2
+                    && bytes.get(cs) == Some(&b' ')
+                    && bytes.get(ce - 1) == Some(&b' ')
+                {
+                    cs += 1;
+                    ce -= 1;
+                }
+                return Some((input.get(cs..ce)?, i + close_count));
+            }
+            i += close_count;
         }
 
         None

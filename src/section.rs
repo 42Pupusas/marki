@@ -17,6 +17,7 @@ pub enum Section<'src> {
         items: Vec<Vec<Inline<'src>>>,
     },
     OrderedList {
+        start: u32,
         items: Vec<Vec<Inline<'src>>>,
     },
     Blockquote {
