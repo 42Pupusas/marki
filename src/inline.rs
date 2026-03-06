@@ -28,6 +28,7 @@ static SPECIAL: [bool; 256] = {
     table[b'_' as usize] = true;
     table[b'[' as usize] = true;
     table[b'!' as usize] = true;
+    table[b'\\' as usize] = true;
     table
 };
 
@@ -47,14 +48,22 @@ impl<'src> Inline<'src> {
         let mut no_close_italic_star = false;
         let mut no_close_italic_under = false;
 
-        while i < bytes.len() {
+        while let Some(&b) = bytes.get(i) {
             // Fast-skip non-special bytes via lookup table
-            if !SPECIAL[bytes[i] as usize] {
+            if !SPECIAL[b as usize] {
                 i += 1;
                 continue;
             }
 
-            let b = bytes[i];
+            // Backslash escape: skip the backslash, include the escaped char as text
+            if b == SpecialChar::Backslash && i + 1 < bytes.len() {
+                if plain_start < i {
+                    result.push(Self::Text(&input[plain_start..i]));
+                }
+                plain_start = i + 1;
+                i += 2;
+                continue;
+            }
 
             // Image: ![alt](url)
             if b == SpecialChar::ExclamationMark
@@ -154,9 +163,28 @@ impl<'src> Inline<'src> {
         }
 
         let bracket_start = start + 1;
-        let close_bracket = *SpecialChar::CloseBracket.as_ref();
-        let bracket_end =
-            bytes.get(bracket_start..)?.iter().position(|&b| b == close_bracket)? + bracket_start;
+        let mut depth = 0u32;
+        let mut bracket_end = None;
+        let mut j = bracket_start;
+        while j < bytes.len() {
+            match bytes.get(j).and_then(|&b| SpecialChar::from_byte(b)) {
+                Some(SpecialChar::Backslash) => {
+                    j += 2;
+                    continue;
+                }
+                Some(SpecialChar::OpenBracket) => depth += 1,
+                Some(SpecialChar::CloseBracket) => {
+                    if depth == 0 {
+                        bracket_end = Some(j);
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        let bracket_end = bracket_end?;
 
         let paren_pos = bracket_end + 1;
         if bytes.get(paren_pos) != Some(SpecialChar::OpenParen.as_ref()) {
@@ -164,9 +192,28 @@ impl<'src> Inline<'src> {
         }
 
         let paren_start = paren_pos + 1;
-        let close_paren = *SpecialChar::CloseParen.as_ref();
-        let paren_end =
-            bytes.get(paren_start..)?.iter().position(|&b| b == close_paren)? + paren_start;
+        let mut depth = 0u32;
+        let mut paren_end = None;
+        let mut j = paren_start;
+        while j < bytes.len() {
+            match bytes.get(j).and_then(|&b| SpecialChar::from_byte(b)) {
+                Some(SpecialChar::Backslash) => {
+                    j += 2;
+                    continue;
+                }
+                Some(SpecialChar::OpenParen) => depth += 1,
+                Some(SpecialChar::CloseParen) => {
+                    if depth == 0 {
+                        paren_end = Some(j);
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        let paren_end = paren_end?;
 
         Some((
             input.get(bracket_start..bracket_end)?,
@@ -192,6 +239,12 @@ impl<'src> Inline<'src> {
 
         let mut i = inner_start;
         while i < bytes.len() {
+            // Skip backslash-escaped bytes
+            if bytes.get(i) == Some(SpecialChar::Backslash.as_ref()) {
+                i += 2;
+                continue;
+            }
+
             // Skip to next occurrence of the marker byte
             match bytes.get(i..)?.iter().position(|&b| b == marker) {
                 Some(offset) => i += offset,

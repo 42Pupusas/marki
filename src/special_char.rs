@@ -11,6 +11,7 @@ pub enum SpecialChar {
     CloseBracket,
     OpenParen,
     CloseParen,
+    Backslash,
 }
 
 impl SpecialChar {
@@ -28,6 +29,7 @@ impl SpecialChar {
             b']' => Some(Self::CloseBracket),
             b'(' => Some(Self::OpenParen),
             b')' => Some(Self::CloseParen),
+            b'\\' => Some(Self::Backslash),
             _ => None,
         }
     }
@@ -67,6 +69,7 @@ impl AsRef<u8> for SpecialChar {
             Self::CloseBracket => &b']',
             Self::OpenParen => &b'(',
             Self::CloseParen => &b')',
+            Self::Backslash => &b'\\',
         }
     }
 }

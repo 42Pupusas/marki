@@ -16,6 +16,7 @@ enum Accumulator<'src> {
     InCodeBlock {
         language: Option<&'src str>,
         content: Option<&'src str>,
+        fence_len: usize,
     },
     InBlockquote {
         lines: Vec<&'src str>,
@@ -36,7 +37,9 @@ impl<'src> Accumulator<'src> {
     fn flush(self) -> Option<Section<'src>> {
         match self {
             Self::Empty => None,
-            Self::InCodeBlock { language, content } => Some(Section::CodeBlock {
+            Self::InCodeBlock {
+                language, content, ..
+            } => Some(Section::CodeBlock {
                 language,
                 code: content.unwrap_or(""),
             }),
@@ -61,107 +64,122 @@ impl<'src> Accumulator<'src> {
             }),
         }
     }
-}
 
-struct FoldResult<'src> {
-    acc: Accumulator<'src>,
-    emitted: Vec<Section<'src>>,
-}
-
-impl<'src> FoldResult<'src> {
-    const fn new(acc: Accumulator<'src>) -> Self {
-        Self {
-            acc,
-            emitted: Vec::new(),
+    fn flush_into(self, sections: &mut Vec<Section<'src>>) {
+        if let Some(section) = self.flush() {
+            sections.push(section);
         }
-    }
-
-    fn emit(mut self, section: Section<'src>) -> Self {
-        self.emitted.push(section);
-        self
-    }
-
-    fn flush_prior(mut self, prior: Accumulator<'src>) -> Self {
-        if let Some(section) = prior.flush() {
-            self.emitted.push(section);
-        }
-        self
     }
 }
 
 impl<'src> MarkdownFile<'src> {
     #[must_use]
     pub fn parse(input: &'src str) -> Self {
-        let (mut sections, final_acc) = input.lines().fold(
-            (Vec::new(), Accumulator::Empty),
-            |(mut sections, acc), line| {
-                let result = Self::fold_line(input, acc, line);
-                sections.extend(result.emitted);
-                (sections, result.acc)
-            },
-        );
-
-        if let Some(section) = final_acc.flush() {
-            sections.push(section);
+        let mut sections = Vec::new();
+        let mut acc = Accumulator::Empty;
+        for line in input.lines() {
+            acc = Self::fold_line(input, &mut sections, acc, line);
         }
-
+        acc.flush_into(&mut sections);
         Self { sections }
     }
 
-    fn fold_line(input: &'src str, acc: Accumulator<'src>, line: &'src str) -> FoldResult<'src> {
-        if let Accumulator::InCodeBlock { language, content } = acc {
-            if Self::is_code_fence(line) {
-                let section = Section::CodeBlock {
-                    language,
-                    code: content.unwrap_or(""),
-                };
-                return FoldResult::new(Accumulator::Empty).emit(section);
-            }
-            let content = content.map_or(line, |existing| {
-                Self::merge_slices(input, existing, line).unwrap_or(existing)
-            });
-            return FoldResult::new(Accumulator::InCodeBlock {
-                language,
-                content: Some(content),
-            });
+    fn fold_line(
+        input: &'src str,
+        sections: &mut Vec<Section<'src>>,
+        acc: Accumulator<'src>,
+        line: &'src str,
+    ) -> Accumulator<'src> {
+        if let Accumulator::InCodeBlock {
+            language,
+            content,
+            fence_len,
+        } = acc
+        {
+            return Self::fold_code_block(input, sections, language, content, fence_len, line);
         }
 
         if line.trim().is_empty() {
-            return FoldResult::new(Accumulator::Empty).flush_prior(acc);
+            acc.flush_into(sections);
+            return Accumulator::Empty;
         }
 
-        if Self::is_code_fence(line) {
-            let language = Self::extract_code_language(line);
-            return FoldResult::new(Accumulator::InCodeBlock {
+        let fence_len = Self::code_fence_len(line);
+        if fence_len > 0 {
+            let language = Self::extract_code_language(line, fence_len);
+            acc.flush_into(sections);
+            return Accumulator::InCodeBlock {
                 language,
                 content: None,
-            })
-            .flush_prior(acc);
+                fence_len,
+            };
         }
 
         if let Some(section) = Self::try_parse_heading(line) {
-            return FoldResult::new(Accumulator::Empty)
-                .flush_prior(acc)
-                .emit(section);
+            acc.flush_into(sections);
+            sections.push(section);
+            return Accumulator::Empty;
         }
 
         if Self::is_horizontal_rule(line) {
-            return FoldResult::new(Accumulator::Empty)
-                .flush_prior(acc)
-                .emit(Section::HorizontalRule);
+            acc.flush_into(sections);
+            sections.push(Section::HorizontalRule);
+            return Accumulator::Empty;
         }
 
+        Self::fold_block_element(input, sections, acc, line)
+    }
+
+    #[inline]
+    fn fold_code_block(
+        input: &'src str,
+        sections: &mut Vec<Section<'src>>,
+        language: Option<&'src str>,
+        content: Option<&'src str>,
+        fence_len: usize,
+        line: &'src str,
+    ) -> Accumulator<'src> {
+        if Self::code_fence_len(line) >= fence_len {
+            sections.push(Section::CodeBlock {
+                language,
+                code: content.unwrap_or(""),
+            });
+            return Accumulator::Empty;
+        }
+        let content = content.map_or(line, |existing| {
+            Self::merge_slices(input, existing, line).unwrap_or_else(|| {
+                debug_assert!(
+                    false,
+                    "merge_slices failed in code block: slices not from same base"
+                );
+                existing
+            })
+        });
+        Accumulator::InCodeBlock {
+            language,
+            content: Some(content),
+            fence_len,
+        }
+    }
+
+    #[inline]
+    fn fold_block_element(
+        input: &'src str,
+        sections: &mut Vec<Section<'src>>,
+        acc: Accumulator<'src>,
+        line: &'src str,
+    ) -> Accumulator<'src> {
         if line.as_bytes().first() == Some(SpecialChar::GreaterThan.as_ref()) {
             let rest = &line[1..];
             let content = rest.strip_prefix(' ').unwrap_or(rest);
             if let Accumulator::InBlockquote { mut lines } = acc {
                 lines.push(content);
-                return FoldResult::new(Accumulator::InBlockquote { lines });
+                return Accumulator::InBlockquote { lines };
             }
-            return FoldResult::new(Accumulator::InBlockquote {
+            acc.flush_into(sections);
+            return Accumulator::InBlockquote {
                 lines: vec![content],
-            })
-            .flush_prior(acc);
+            };
         }
 
         if let Some((marker, item)) = Self::try_parse_unordered_item(line) {
@@ -172,46 +190,76 @@ impl<'src> MarkdownFile<'src> {
             {
                 if m == marker {
                     items.push(item);
-                    return FoldResult::new(Accumulator::InUnorderedList { marker, items });
+                    return Accumulator::InUnorderedList { marker, items };
                 }
-                return FoldResult::new(Accumulator::InUnorderedList {
+                Accumulator::InUnorderedList { marker: m, items }.flush_into(sections);
+                return Accumulator::InUnorderedList {
                     marker,
                     items: vec![item],
-                })
-                .flush_prior(Accumulator::InUnorderedList { marker: m, items });
+                };
             }
-            return FoldResult::new(Accumulator::InUnorderedList {
+            acc.flush_into(sections);
+            return Accumulator::InUnorderedList {
                 marker,
                 items: vec![item],
-            })
-            .flush_prior(acc);
+            };
         }
 
         if let Some(item) = Self::try_parse_ordered_item(line) {
             if let Accumulator::InOrderedList { mut items } = acc {
                 items.push(item);
-                return FoldResult::new(Accumulator::InOrderedList { items });
+                return Accumulator::InOrderedList { items };
             }
-            return FoldResult::new(Accumulator::InOrderedList { items: vec![item] })
-                .flush_prior(acc);
+            acc.flush_into(sections);
+            return Accumulator::InOrderedList { items: vec![item] };
         }
 
+        Self::fold_paragraph(input, sections, acc, line)
+    }
+
+    #[inline]
+    fn fold_paragraph(
+        input: &'src str,
+        sections: &mut Vec<Section<'src>>,
+        acc: Accumulator<'src>,
+        line: &'src str,
+    ) -> Accumulator<'src> {
         if let Accumulator::InParagraph { content } = acc {
-            let content = Self::merge_slices(input, content, line).unwrap_or(content);
-            return FoldResult::new(Accumulator::InParagraph { content });
+            return Self::merge_slices(input, content, line).map_or_else(
+                || {
+                    sections.push(Section::Paragraph {
+                        content: Inline::parse(content),
+                    });
+                    Accumulator::InParagraph { content: line }
+                },
+                |merged| Accumulator::InParagraph { content: merged },
+            );
         }
-        FoldResult::new(Accumulator::InParagraph { content: line }).flush_prior(acc)
+        acc.flush_into(sections);
+        Accumulator::InParagraph { content: line }
     }
 
-    fn is_code_fence(line: &str) -> bool {
-        SpecialChar::Backtick.count_leading(line.trim_start()) >= 3
-    }
-
-    fn extract_code_language(line: &str) -> Option<&str> {
+    /// Returns the fence length (number of backticks) if the line is a valid
+    /// code fence, or 0 if it is not. A valid fence has 3+ backticks with no
+    /// backticks in the info string.
+    fn code_fence_len(line: &str) -> usize {
         let trimmed = line.trim_start();
-        let backticks = SpecialChar::Backtick.count_leading(trimmed);
-        let after = trimmed[backticks..].trim();
-        if after.is_empty() { None } else { Some(after) }
+        let len = SpecialChar::Backtick.count_leading(trimmed);
+        if len >= 3 && !trimmed.as_bytes()[len..].contains(&b'`') {
+            len
+        } else {
+            0
+        }
+    }
+
+    fn extract_code_language(line: &str, fence_len: usize) -> Option<&str> {
+        let trimmed = line.trim_start();
+        let after = trimmed[fence_len..].trim();
+        if after.is_empty() {
+            None
+        } else {
+            Some(after)
+        }
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -259,6 +307,7 @@ impl<'src> MarkdownFile<'src> {
     fn try_parse_ordered_item(line: &str) -> Option<&str> {
         let (num_part, rest) = line.split_once(". ")?;
         if !num_part.is_empty()
+            && num_part.len() <= 9
             && num_part.as_bytes().iter().all(u8::is_ascii_digit)
             && !rest.is_empty()
         {
