@@ -89,6 +89,13 @@ struct EmphasisState {
 }
 
 impl EmphasisState {
+    const fn assume_both() -> Self {
+        Self {
+            star: DelimiterAvail::Both,
+            under: DelimiterAvail::Both,
+        }
+    }
+
     fn from_bytes(bytes: &[u8]) -> Self {
         let mut stars: u8 = 0;
         let mut unders: u8 = 0;
@@ -112,25 +119,32 @@ impl EmphasisState {
     }
 
     const fn avail_mut(&mut self, is_star: bool) -> &mut DelimiterAvail {
-        if is_star { &mut self.star } else { &mut self.under }
+        if is_star {
+            &mut self.star
+        } else {
+            &mut self.under
+        }
     }
 }
 
 impl<'src> Inline<'src> {
+    /// Threshold below which the emphasis pre-scan costs more than it saves.
+    const EMPH_SCAN_THRESHOLD: usize = 256;
+
     #[must_use]
     pub fn parse(input: &'src str) -> Vec<Self> {
         let bytes = input.as_bytes();
-        let emph = EmphasisState::from_bytes(bytes);
+        let emph = if bytes.len() < Self::EMPH_SCAN_THRESHOLD {
+            EmphasisState::assume_both()
+        } else {
+            EmphasisState::from_bytes(bytes)
+        };
         Self::parse_with_emph(input, bytes, emph)
     }
 
     fn parse_inner(input: &'src str) -> Vec<Self> {
         let bytes = input.as_bytes();
-        let emph = EmphasisState {
-            star: DelimiterAvail::Both,
-            under: DelimiterAvail::Both,
-        };
-        Self::parse_with_emph(input, bytes, emph)
+        Self::parse_with_emph(input, bytes, EmphasisState::assume_both())
     }
 
     fn parse_with_emph(input: &'src str, bytes: &[u8], emph: EmphasisState) -> Vec<Self> {
@@ -143,7 +157,11 @@ impl<'src> Inline<'src> {
     /// allocations when building blockquotes or list items.
     pub fn parse_into(input: &'src str, out: &mut Vec<Self>) {
         let bytes = input.as_bytes();
-        let emph = EmphasisState::from_bytes(bytes);
+        let emph = if bytes.len() < Self::EMPH_SCAN_THRESHOLD {
+            EmphasisState::assume_both()
+        } else {
+            EmphasisState::from_bytes(bytes)
+        };
         Self::parse_into_with_emph(input, bytes, emph, out);
     }
 
@@ -372,7 +390,9 @@ impl<'src> Inline<'src> {
                     // Raw whitespace blocks closing, but escaped whitespace does not.
                     !prev.is_ascii_whitespace()
                         || (i >= inner_start + 2
-                            && bytes.get(i - 2).is_some_and(|&b| b == SpecialChar::Backslash))
+                            && bytes
+                                .get(i - 2)
+                                .is_some_and(|&b| b == SpecialChar::Backslash))
                 })
             {
                 return Some((input.get(inner_start..i)?, i + count));
@@ -419,9 +439,7 @@ impl<'src> Inline<'src> {
                 // Strip single leading/trailing space per CommonMark
                 let mut cs = content_start;
                 let mut ce = i;
-                if ce - cs >= 2
-                    && bytes.get(cs) == Some(&b' ')
-                    && bytes.get(ce - 1) == Some(&b' ')
+                if ce - cs >= 2 && bytes.get(cs) == Some(&b' ') && bytes.get(ce - 1) == Some(&b' ')
                 {
                     cs += 1;
                     ce -= 1;

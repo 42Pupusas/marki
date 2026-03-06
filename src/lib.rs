@@ -188,6 +188,21 @@ impl<'src> MarkdownFile<'src> {
         }
     }
 
+    /// Returns true if the first byte of `line` could start a block-level
+    /// element (blockquote, list marker, or HR character). Used to fast-path
+    /// paragraph continuations.
+    const fn could_start_block(first: u8) -> bool {
+        matches!(
+            SpecialChar::from_byte(first),
+            Some(
+                SpecialChar::GreaterThan
+                    | SpecialChar::Dash
+                    | SpecialChar::Asterisk
+                    | SpecialChar::Underscore
+            )
+        ) || first.is_ascii_digit()
+    }
+
     #[inline]
     fn fold_block_element(
         input: &'src str,
@@ -195,6 +210,15 @@ impl<'src> MarkdownFile<'src> {
         acc: Accumulator<'src>,
         line: &'src str,
     ) -> Accumulator<'src> {
+        // Fast-path: if we're in a paragraph and the line can't start a block
+        // element, skip all the block-level checks and extend the paragraph.
+        if let Accumulator::InParagraph { .. } = acc
+            && let Some(&first) = line.as_bytes().first()
+            && !Self::could_start_block(first)
+        {
+            return Self::fold_paragraph(input, sections, acc, line);
+        }
+
         if line.as_bytes().first().copied() == Some(SpecialChar::GreaterThan as u8) {
             let rest = &line[1..];
             let content = rest.strip_prefix(' ').unwrap_or(rest);
@@ -287,9 +311,12 @@ impl<'src> MarkdownFile<'src> {
         if bytes.get(first).copied() != Some(SpecialChar::Backtick as u8) {
             return 0;
         }
-        let trimmed = &line[first..];
-        let len = SpecialChar::Backtick.count_leading(trimmed);
-        if len >= 3 && !trimmed.as_bytes()[len..].contains(&(SpecialChar::Backtick as u8)) {
+        // Count backticks directly from the offset we already found.
+        let len = bytes[first..]
+            .iter()
+            .take_while(|&&b| b == SpecialChar::Backtick)
+            .count();
+        if len >= 3 && !bytes[first + len..].contains(&(SpecialChar::Backtick as u8)) {
             len
         } else {
             0
@@ -299,11 +326,7 @@ impl<'src> MarkdownFile<'src> {
     fn extract_code_language(line: &str, fence_len: usize) -> Option<&str> {
         let trimmed = line.trim_start();
         let after = trimmed[fence_len..].trim();
-        if after.is_empty() {
-            None
-        } else {
-            Some(after)
-        }
+        if after.is_empty() { None } else { Some(after) }
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -321,20 +344,23 @@ impl<'src> MarkdownFile<'src> {
 
     fn is_horizontal_rule(line: &str) -> bool {
         let bytes = line.as_bytes();
-        // Quick reject on first non-whitespace byte.
         let first = bytes.iter().find(|b| !b.is_ascii_whitespace());
-        let rule_char = match first {
-            Some(&b) => SpecialChar::from_byte(b).filter(|sc| sc.is_rule_char()),
-            _ => None,
-        };
-        let Some(rule_char) = rule_char else {
+        let Some(&first_byte) = first else {
             return false;
         };
-        let count = bytes
-            .iter()
-            .filter(|&&b| !b.is_ascii_whitespace())
-            .count();
-        count >= 3 && bytes.iter().all(|&b| b == rule_char || b.is_ascii_whitespace())
+        let Some(rule_char) = SpecialChar::from_byte(first_byte).filter(|sc| sc.is_rule_char())
+        else {
+            return false;
+        };
+        let mut count = 0u32;
+        for &b in bytes {
+            if b == rule_char {
+                count += 1;
+            } else if !b.is_ascii_whitespace() {
+                return false;
+            }
+        }
+        count >= 3
     }
 
     fn try_parse_unordered_item(line: &str) -> Option<(SpecialChar, &str)> {
@@ -364,40 +390,30 @@ impl<'src> MarkdownFile<'src> {
         if digits == 0 {
             return None;
         }
-        // Expect ". " after the digits, and non-empty item text
-        let rest = bytes.get(digits + 2..)?;
-        if bytes.get(digits).copied() != Some(b'.')
-            || bytes.get(digits + 1).copied() != Some(b' ')
-            || rest.is_empty()
+        // Expect ". " after the digits, then non-empty item text.
+        if bytes.get(digits).copied() != Some(b'.') || bytes.get(digits + 1).copied() != Some(b' ')
         {
             return None;
         }
-        Some((num, line.get(digits + 2..)?))
+        let rest = line.get(digits + 2..)?;
+        if rest.is_empty() {
+            return None;
+        }
+        Some((num, rest))
     }
 
     /// Merge two subslices of `base` into one contiguous slice spanning from the
     /// start of `a` to the end of `b`.
     fn merge_slices(base: &'src str, a: &str, b: &str) -> Option<&'src str> {
         let base_start = base.as_ptr() as usize;
-        let base_end = base_start.checked_add(base.len())?;
-
         let a_start = a.as_ptr() as usize;
-        let b_start = b.as_ptr() as usize;
-        let b_end = b_start.checked_add(b.len())?;
+        let b_end = b.as_ptr() as usize + b.len();
 
-        if a_start < base_start || a_start.checked_add(a.len())? > base_end {
-            return None;
-        }
-        if b_start < base_start || b_end > base_end {
-            return None;
-        }
-        if b_start < a_start {
+        if a_start < base_start || b_end > base_start + base.len() || b_end < a_start {
             return None;
         }
 
-        let start = a_start - base_start;
-        let end = b_end - base_start;
-        base.get(start..end)
+        base.get((a_start - base_start)..(b_end - base_start))
     }
 }
 
@@ -693,9 +709,9 @@ mod tests {
                     content: text("marki")
                 },
                 Section::Paragraph {
-                    content: vec![
-                        Inline::Text("A zero-copy Markdown parser for Rust. Parses markdown strings into structured sections and inline elements, borrowing directly from the input with no intermediate allocations for text content."),
-                    ],
+                    content: vec![Inline::Text(
+                        "A zero-copy Markdown parser for Rust. Parses markdown strings into structured sections and inline elements, borrowing directly from the input with no intermediate allocations for text content."
+                    ),],
                 },
                 Section::Heading {
                     level: 2,
@@ -801,7 +817,9 @@ mod tests {
                         Inline::Code("\\r\\n"),
                         Inline::Text(") input, call "),
                         Inline::Code("normalize"),
-                        Inline::Text(" before parsing \u{2014} it returns the input borrowed when no "),
+                        Inline::Text(
+                            " before parsing \u{2014} it returns the input borrowed when no "
+                        ),
                         Inline::Code("\\r"),
                         Inline::Text(" is present (zero-cost), or an owned copy with "),
                         Inline::Code("\\r"),
