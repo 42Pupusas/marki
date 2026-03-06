@@ -67,12 +67,12 @@ impl<'src> Accumulator<'src> {
                 code: content.unwrap_or(""),
             }),
             Self::InBlockquote { lines } => {
-                let mut content = Vec::new();
+                let mut content = Vec::with_capacity(lines.len() * 3);
                 for (i, line) in lines.iter().enumerate() {
                     if i > 0 {
                         content.push(Inline::Text("\n"));
                     }
-                    content.extend(Inline::parse(line));
+                    Inline::parse_into(line, &mut content);
                 }
                 Some(Section::Blockquote { content })
             }
@@ -96,10 +96,18 @@ impl<'src> Accumulator<'src> {
     }
 }
 
+/// Create a `Vec` with pre-allocated capacity and a single initial element.
+fn vec_with_first<T>(first: T) -> Vec<T> {
+    let mut v = Vec::with_capacity(4);
+    v.push(first);
+    v
+}
+
 impl<'src> MarkdownFile<'src> {
     #[must_use]
     pub fn parse(input: &'src str) -> Self {
-        let mut sections = Vec::new();
+        // Rough heuristic: ~50 bytes per section on average.
+        let mut sections = Vec::with_capacity(input.len() / 50 + 1);
         let mut acc = Accumulator::Empty;
         for line in input.lines() {
             acc = Self::fold_line(input, &mut sections, acc, line);
@@ -187,7 +195,7 @@ impl<'src> MarkdownFile<'src> {
         acc: Accumulator<'src>,
         line: &'src str,
     ) -> Accumulator<'src> {
-        if line.as_bytes().first().copied() == Some(SpecialChar::GreaterThan.as_byte()) {
+        if line.as_bytes().first().copied() == Some(SpecialChar::GreaterThan as u8) {
             let rest = &line[1..];
             let content = rest.strip_prefix(' ').unwrap_or(rest);
             if let Accumulator::InBlockquote { mut lines } = acc {
@@ -196,7 +204,7 @@ impl<'src> MarkdownFile<'src> {
             }
             acc.flush_into(sections);
             return Accumulator::InBlockquote {
-                lines: vec![content],
+                lines: vec_with_first(content),
             };
         }
 
@@ -219,13 +227,13 @@ impl<'src> MarkdownFile<'src> {
                 Accumulator::InUnorderedList { marker: m, items }.flush_into(sections);
                 return Accumulator::InUnorderedList {
                     marker,
-                    items: vec![item],
+                    items: vec_with_first(item),
                 };
             }
             acc.flush_into(sections);
             return Accumulator::InUnorderedList {
                 marker,
-                items: vec![item],
+                items: vec_with_first(item),
             };
         }
 
@@ -237,7 +245,7 @@ impl<'src> MarkdownFile<'src> {
             acc.flush_into(sections);
             return Accumulator::InOrderedList {
                 start: num,
-                items: vec![item],
+                items: vec_with_first(item),
             };
         }
 
@@ -270,9 +278,18 @@ impl<'src> MarkdownFile<'src> {
     /// code fence, or 0 if it is not. A valid fence has 3+ backticks with no
     /// backticks in the info string.
     fn code_fence_len(line: &str) -> usize {
-        let trimmed = line.trim_start();
+        let bytes = line.as_bytes();
+        // Quick reject: first non-whitespace byte must be a backtick.
+        let first = bytes
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .unwrap_or(0);
+        if bytes.get(first).copied() != Some(SpecialChar::Backtick as u8) {
+            return 0;
+        }
+        let trimmed = &line[first..];
         let len = SpecialChar::Backtick.count_leading(trimmed);
-        if len >= 3 && !trimmed.as_bytes()[len..].contains(&b'`') {
+        if len >= 3 && !trimmed.as_bytes()[len..].contains(&(SpecialChar::Backtick as u8)) {
             len
         } else {
             0
@@ -304,24 +321,20 @@ impl<'src> MarkdownFile<'src> {
 
     fn is_horizontal_rule(line: &str) -> bool {
         let bytes = line.as_bytes();
-        let mut rule_byte = 0u8;
-        let mut count = 0usize;
-        for &b in bytes {
-            if b.is_ascii_whitespace() {
-                continue;
-            }
-            if rule_byte == 0 {
-                if !matches!(b, b'-' | b'*' | b'_') {
-                    return false;
-                }
-                rule_byte = b;
-            }
-            if b != rule_byte {
-                return false;
-            }
-            count += 1;
-        }
-        count >= 3
+        // Quick reject on first non-whitespace byte.
+        let first = bytes.iter().find(|b| !b.is_ascii_whitespace());
+        let rule_char = match first {
+            Some(&b) => SpecialChar::from_byte(b).filter(|sc| sc.is_rule_char()),
+            _ => None,
+        };
+        let Some(rule_char) = rule_char else {
+            return false;
+        };
+        let count = bytes
+            .iter()
+            .filter(|&&b| !b.is_ascii_whitespace())
+            .count();
+        count >= 3 && bytes.iter().all(|&b| b == rule_char || b.is_ascii_whitespace())
     }
 
     fn try_parse_unordered_item(line: &str) -> Option<(SpecialChar, &str)> {
@@ -883,6 +896,21 @@ mod tests {
                     items: vec![text("a"), text("b")]
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn test_emphasis_close_after_escaped_space() {
+        // Backslash-escaped space before closing delimiter should still close
+        let md = MarkdownFile::parse(r"*test\ *");
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![Inline::Italic(vec![
+                    Inline::Text("test"),
+                    Inline::Text(" "),
+                ])],
+            }]
         );
     }
 }

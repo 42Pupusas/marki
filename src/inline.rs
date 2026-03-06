@@ -25,12 +25,12 @@ impl<'src> From<&'src str> for Inline<'src> {
 /// Lookup table: true for bytes that can start an inline element.
 static SPECIAL: [bool; 256] = {
     let mut table = [false; 256];
-    table[b'*' as usize] = true;
-    table[b'_' as usize] = true;
-    table[b'[' as usize] = true;
-    table[b'!' as usize] = true;
-    table[b'\\' as usize] = true;
-    table[b'`' as usize] = true;
+    table[SpecialChar::Asterisk as u8 as usize] = true;
+    table[SpecialChar::Underscore as u8 as usize] = true;
+    table[SpecialChar::OpenBracket as u8 as usize] = true;
+    table[SpecialChar::ExclamationMark as u8 as usize] = true;
+    table[SpecialChar::Backslash as u8 as usize] = true;
+    table[SpecialChar::Backtick as u8 as usize] = true;
     table
 };
 
@@ -93,12 +93,12 @@ impl EmphasisState {
         let mut stars: u8 = 0;
         let mut unders: u8 = 0;
         for &b in bytes {
-            if b == b'*' {
+            if b == SpecialChar::Asterisk {
                 stars += 1;
                 if stars >= 4 && unders >= 4 {
                     break;
                 }
-            } else if b == b'_' {
+            } else if b == SpecialChar::Underscore {
                 unders += 1;
                 if stars >= 4 && unders >= 4 {
                     break;
@@ -120,10 +120,41 @@ impl<'src> Inline<'src> {
     #[must_use]
     pub fn parse(input: &'src str) -> Vec<Self> {
         let bytes = input.as_bytes();
-        let mut result = Vec::new();
+        let emph = EmphasisState::from_bytes(bytes);
+        Self::parse_with_emph(input, bytes, emph)
+    }
+
+    fn parse_inner(input: &'src str) -> Vec<Self> {
+        let bytes = input.as_bytes();
+        let emph = EmphasisState {
+            star: DelimiterAvail::Both,
+            under: DelimiterAvail::Both,
+        };
+        Self::parse_with_emph(input, bytes, emph)
+    }
+
+    fn parse_with_emph(input: &'src str, bytes: &[u8], emph: EmphasisState) -> Vec<Self> {
+        let mut result = Vec::with_capacity(4);
+        Self::parse_into_with_emph(input, bytes, emph, &mut result);
+        result
+    }
+
+    /// Push parsed inline elements directly into `out`, avoiding temporary Vec
+    /// allocations when building blockquotes or list items.
+    pub fn parse_into(input: &'src str, out: &mut Vec<Self>) {
+        let bytes = input.as_bytes();
+        let emph = EmphasisState::from_bytes(bytes);
+        Self::parse_into_with_emph(input, bytes, emph, out);
+    }
+
+    fn parse_into_with_emph(
+        input: &'src str,
+        bytes: &[u8],
+        mut emph: EmphasisState,
+        result: &mut Vec<Self>,
+    ) {
         let mut plain_start = 0;
         let mut i = 0;
-        let mut emph = EmphasisState::from_bytes(bytes);
 
         while let Some(&b) = bytes.get(i) {
             // Fast-skip non-special bytes via lookup table
@@ -157,7 +188,7 @@ impl<'src> Inline<'src> {
 
             // Image: ![alt](url)
             if b == SpecialChar::ExclamationMark
-                && bytes.get(i + 1).copied() == Some(SpecialChar::OpenBracket.as_byte())
+                && bytes.get(i + 1).copied() == Some(SpecialChar::OpenBracket as u8)
                 && let Some((alt, url, end)) = Self::try_parse_bracket_paren(input, bytes, i + 1)
             {
                 if plain_start < i {
@@ -177,7 +208,7 @@ impl<'src> Inline<'src> {
                     result.push(Self::Text(&input[plain_start..i]));
                 }
                 result.push(Self::Link {
-                    text: Self::parse(text_str),
+                    text: Self::parse_inner(text_str),
                     url,
                 });
                 plain_start = end;
@@ -202,8 +233,6 @@ impl<'src> Inline<'src> {
         if plain_start < input.len() {
             result.push(Self::Text(&input[plain_start..]));
         }
-
-        result
     }
 
     #[inline]
@@ -228,7 +257,7 @@ impl<'src> Inline<'src> {
         // Bold: ** or __
         if avail.can_bold() && bytes.get(i + 1) == Some(&b) {
             if let Some((inner, end)) = Self::try_parse_delimited(input, bytes, i, b, 2) {
-                return Some((Self::Bold(Self::parse(inner)), end));
+                return Some((Self::Bold(Self::parse_inner(inner)), end));
             }
             avail.bold_failed();
         }
@@ -236,11 +265,39 @@ impl<'src> Inline<'src> {
         // Italic: * or _
         if avail.can_italic() {
             if let Some((inner, end)) = Self::try_parse_delimited(input, bytes, i, b, 1) {
-                return Some((Self::Italic(Self::parse(inner)), end));
+                return Some((Self::Italic(Self::parse_inner(inner)), end));
             }
             avail.italic_failed();
         }
 
+        None
+    }
+
+    /// Find the position of a matching closing delimiter, handling backslash
+    /// escapes and nested pairs.
+    fn find_matching_close(
+        bytes: &[u8],
+        start: usize,
+        open: SpecialChar,
+        close: SpecialChar,
+    ) -> Option<usize> {
+        let mut depth = 0u32;
+        let mut j = start;
+        while let Some(&b) = bytes.get(j) {
+            if b == SpecialChar::Backslash {
+                j += 2;
+                continue;
+            }
+            if b == open {
+                depth += 1;
+            } else if b == close {
+                if depth == 0 {
+                    return Some(j);
+                }
+                depth -= 1;
+            }
+            j += 1;
+        }
         None
     }
 
@@ -249,58 +306,30 @@ impl<'src> Inline<'src> {
         bytes: &[u8],
         start: usize,
     ) -> Option<(&'src str, &'src str, usize)> {
-        if bytes.get(start).copied() != Some(SpecialChar::OpenBracket.as_byte()) {
+        if bytes.get(start).copied() != Some(SpecialChar::OpenBracket as u8) {
             return None;
         }
 
         let bracket_start = start + 1;
-        let mut depth = 0u32;
-        let mut bracket_end = None;
-        let mut j = bracket_start;
-        while let Some(&b) = bytes.get(j) {
-            if b == SpecialChar::Backslash {
-                j += 2;
-                continue;
-            }
-            if b == SpecialChar::OpenBracket {
-                depth += 1;
-            } else if b == SpecialChar::CloseBracket {
-                if depth == 0 {
-                    bracket_end = Some(j);
-                    break;
-                }
-                depth -= 1;
-            }
-            j += 1;
-        }
-        let bracket_end = bracket_end?;
+        let bracket_end = Self::find_matching_close(
+            bytes,
+            bracket_start,
+            SpecialChar::OpenBracket,
+            SpecialChar::CloseBracket,
+        )?;
 
         let paren_pos = bracket_end + 1;
-        if bytes.get(paren_pos).copied() != Some(SpecialChar::OpenParen.as_byte()) {
+        if bytes.get(paren_pos).copied() != Some(SpecialChar::OpenParen as u8) {
             return None;
         }
 
         let paren_start = paren_pos + 1;
-        let mut depth = 0u32;
-        let mut paren_end = None;
-        let mut j = paren_start;
-        while let Some(&b) = bytes.get(j) {
-            if b == SpecialChar::Backslash {
-                j += 2;
-                continue;
-            }
-            if b == SpecialChar::OpenParen {
-                depth += 1;
-            } else if b == SpecialChar::CloseParen {
-                if depth == 0 {
-                    paren_end = Some(j);
-                    break;
-                }
-                depth -= 1;
-            }
-            j += 1;
-        }
-        let paren_end = paren_end?;
+        let paren_end = Self::find_matching_close(
+            bytes,
+            paren_start,
+            SpecialChar::OpenParen,
+            SpecialChar::CloseParen,
+        )?;
 
         Some((
             input.get(bracket_start..bracket_end)?,
@@ -339,7 +368,12 @@ impl<'src> Inline<'src> {
             let all_match = (1..count).all(|j| bytes.get(i + j) == Some(&marker));
             if all_match
                 && i > inner_start
-                && bytes.get(i - 1).is_some_and(|b| !b.is_ascii_whitespace())
+                && bytes.get(i - 1).is_some_and(|prev| {
+                    // Raw whitespace blocks closing, but escaped whitespace does not.
+                    !prev.is_ascii_whitespace()
+                        || (i >= inner_start + 2
+                            && bytes.get(i - 2).is_some_and(|&b| b == SpecialChar::Backslash))
+                })
             {
                 return Some((input.get(inner_start..i)?, i + count));
             }
