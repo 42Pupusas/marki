@@ -1,0 +1,11 @@
+[package]
+name = "marki"
+version = "0.1.0"
+edition = "2024"
+
+[lints.clippy]
+pedantic = "warn"
+perf = "warn"
+nursery = "warn"
+
+[dependencies]
