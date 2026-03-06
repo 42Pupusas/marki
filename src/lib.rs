@@ -658,9 +658,9 @@ mod tests {
                     content: text("marki")
                 },
                 Section::Paragraph {
-                    content: text(
-                        "A simple Rust library for parsing markdown files into structured sections."
-                    ),
+                    content: vec![
+                        Inline::Text("A zero-copy Markdown parser for Rust. Parses markdown strings into structured sections and inline elements, borrowing directly from the input with no intermediate allocations for text content."),
+                    ],
                 },
                 Section::Heading {
                     level: 2,
@@ -668,9 +668,16 @@ mod tests {
                 },
                 Section::UnorderedList {
                     items: vec![
-                        text("Parse markdown from strings or files"),
-                        text("Type-safe representation of markdown elements"),
-                        text("Zero-copy parsing with fold-based state machine"),
+                        text("Zero-copy parsing \u{2014} all text slices borrow from the input"),
+                        vec![
+                            Inline::Text("Type-safe representation of markdown elements via "),
+                            Inline::Code("SpecialChar"),
+                            Inline::Text(", "),
+                            Inline::Code("Section"),
+                            Inline::Text(", and "),
+                            Inline::Code("Inline"),
+                        ],
+                        text("Fold-based state machine for single-pass block-level parsing"),
                     ],
                 },
                 Section::Heading {
@@ -680,12 +687,26 @@ mod tests {
                 Section::UnorderedList {
                     items: vec![
                         text("Headings (levels 1-6)"),
-                        text("Paragraphs"),
-                        text("Code blocks (with optional language)"),
-                        text("Unordered lists"),
-                        text("Ordered lists"),
+                        text("Paragraphs (with multi-line continuation)"),
+                        text("Code blocks (fenced with backticks, optional language)"),
+                        vec![
+                            Inline::Text("Unordered lists ("),
+                            Inline::Code("-"),
+                            Inline::Text(" or "),
+                            Inline::Code("*"),
+                            Inline::Text(" markers)"),
+                        ],
+                        text("Ordered lists (with preserved start number)"),
                         text("Blockquotes"),
-                        text("Horizontal rules"),
+                        vec![
+                            Inline::Text("Horizontal rules ("),
+                            Inline::Code("---"),
+                            Inline::Text(", "),
+                            Inline::Code("***"),
+                            Inline::Text(", "),
+                            Inline::Code("___"),
+                            Inline::Text(")"),
+                        ],
                     ],
                 },
                 Section::Heading {
@@ -696,11 +717,23 @@ mod tests {
                     items: vec![
                         vec![
                             Inline::Bold(vec![Inline::Text("Bold")]),
-                            Inline::Text(" text"),
+                            Inline::Text(" text ("),
+                            Inline::Code("**"),
+                            Inline::Text(" or "),
+                            Inline::Code("__"),
+                            Inline::Text(")"),
                         ],
                         vec![
                             Inline::Italic(vec![Inline::Text("Italic")]),
-                            Inline::Text(" text"),
+                            Inline::Text(" text ("),
+                            Inline::Code("*"),
+                            Inline::Text(" or "),
+                            Inline::Code("_"),
+                            Inline::Text(")"),
+                        ],
+                        vec![
+                            Inline::Code("Code"),
+                            Inline::Text(" spans (backtick-delimited, CommonMark space-stripping)"),
                         ],
                         vec![Inline::Link {
                             text: vec![Inline::Text("Links")],
@@ -710,6 +743,7 @@ mod tests {
                             alt: "Images",
                             url: "image.png",
                         }],
+                        text("Backslash escapes"),
                     ],
                 },
                 Section::Heading {
@@ -718,14 +752,29 @@ mod tests {
                 },
                 Section::CodeBlock {
                     language: Some("rust"),
-                    code: "use marki::MarkdownFile;\n\nlet md: MarkdownFile = \"# Hello\\n\\nWorld\".parse().unwrap();",
+                    code: "use marki::MarkdownFile;\n\nlet md = MarkdownFile::parse(\"# Hello\\n\\nWorld\");\nfor section in &md.sections {\n    println!(\"{section:?}\");\n}",
                 },
-                Section::OrderedList {
-                    start: 1,
+                Section::Heading {
+                    level: 2,
+                    content: text("Known Limitations")
+                },
+                Section::UnorderedList {
                     items: vec![
-                        text("Parse a string"),
-                        text("Read a file"),
-                        text("Inspect sections"),
+                        text("List items are single-line only (no continuation with indentation)"),
+                        vec![
+                            Inline::Text("Emphasis cannot span across blockquote lines ("),
+                            Inline::Code("> **bold\\n> continues**"),
+                            Inline::Text(" is not recognized)"),
+                        ],
+                        vec![
+                            Inline::Text("Input should use LF ("),
+                            Inline::Code("\\n"),
+                            Inline::Text(") line endings; CRLF ("),
+                            Inline::Code("\\r\\n"),
+                            Inline::Text(") input will preserve "),
+                            Inline::Code("\\r"),
+                            Inline::Text(" in merged paragraph and code block content"),
+                        ],
                     ],
                 },
             ]
