@@ -21,9 +21,15 @@ impl<'src> From<&'src str> for Inline<'src> {
     }
 }
 
-fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
-    haystack.iter().position(|&b| b == needle)
-}
+/// Lookup table: true for bytes that can start an inline element.
+static SPECIAL: [bool; 256] = {
+    let mut table = [false; 256];
+    table[b'*' as usize] = true;
+    table[b'_' as usize] = true;
+    table[b'[' as usize] = true;
+    table[b'!' as usize] = true;
+    table
+};
 
 impl<'src> Inline<'src> {
     #[must_use]
@@ -33,12 +39,26 @@ impl<'src> Inline<'src> {
         let mut plain_start = 0;
         let mut i = 0;
 
+        // Track failed delimiter scans to avoid O(n²) re-scanning.
+        // Once we scan forward for a closing delimiter and find none,
+        // no later position can find one either — skip future attempts.
+        let mut no_close_bold_star = false;
+        let mut no_close_bold_under = false;
+        let mut no_close_italic_star = false;
+        let mut no_close_italic_under = false;
+
         while i < bytes.len() {
+            // Fast-skip non-special bytes via lookup table
+            if !SPECIAL[bytes[i] as usize] {
+                i += 1;
+                continue;
+            }
+
             let b = bytes[i];
 
             // Image: ![alt](url)
-            if b == SpecialChar::ExclamationMark.as_byte()
-                && bytes.get(i + 1) == Some(&SpecialChar::OpenBracket.as_byte())
+            if b == SpecialChar::ExclamationMark
+                && bytes.get(i + 1) == Some(SpecialChar::OpenBracket.as_ref())
                 && let Some((alt, url, end)) = Self::try_parse_bracket_paren(input, bytes, i + 1)
             {
                 if plain_start < i {
@@ -51,7 +71,7 @@ impl<'src> Inline<'src> {
             }
 
             // Link: [text](url)
-            if b == SpecialChar::OpenBracket.as_byte()
+            if b == SpecialChar::OpenBracket
                 && let Some((text_str, url, end)) = Self::try_parse_bracket_paren(input, bytes, i)
             {
                 if plain_start < i {
@@ -66,33 +86,52 @@ impl<'src> Inline<'src> {
                 continue;
             }
 
+            let is_emphasis = matches!(
+                SpecialChar::from_byte(b),
+                Some(sc) if sc.is_emphasis_char()
+            );
+
             // Bold: ** or __
-            if let Some(sc) = SpecialChar::from_byte(b)
-                && sc.is_emphasis_char()
+            if is_emphasis
                 && bytes.get(i + 1) == Some(&b)
-                && let Some((inner, end)) = Self::try_parse_delimited(input, bytes, i, b, 2)
+                && !(b == SpecialChar::Asterisk && no_close_bold_star)
+                && !(b == SpecialChar::Underscore && no_close_bold_under)
             {
-                if plain_start < i {
-                    result.push(Self::Text(&input[plain_start..i]));
+                if let Some((inner, end)) = Self::try_parse_delimited(input, bytes, i, b, 2) {
+                    if plain_start < i {
+                        result.push(Self::Text(&input[plain_start..i]));
+                    }
+                    result.push(Self::Bold(Self::parse(inner)));
+                    plain_start = end;
+                    i = end;
+                    continue;
                 }
-                result.push(Self::Bold(Self::parse(inner)));
-                plain_start = end;
-                i = end;
-                continue;
+                if b == SpecialChar::Asterisk {
+                    no_close_bold_star = true;
+                } else {
+                    no_close_bold_under = true;
+                }
             }
 
             // Italic: * or _
-            if let Some(sc) = SpecialChar::from_byte(b)
-                && sc.is_emphasis_char()
-                && let Some((inner, end)) = Self::try_parse_delimited(input, bytes, i, b, 1)
+            if is_emphasis
+                && !(b == SpecialChar::Asterisk && no_close_italic_star)
+                && !(b == SpecialChar::Underscore && no_close_italic_under)
             {
-                if plain_start < i {
-                    result.push(Self::Text(&input[plain_start..i]));
+                if let Some((inner, end)) = Self::try_parse_delimited(input, bytes, i, b, 1) {
+                    if plain_start < i {
+                        result.push(Self::Text(&input[plain_start..i]));
+                    }
+                    result.push(Self::Italic(Self::parse(inner)));
+                    plain_start = end;
+                    i = end;
+                    continue;
                 }
-                result.push(Self::Italic(Self::parse(inner)));
-                plain_start = end;
-                i = end;
-                continue;
+                if b == SpecialChar::Asterisk {
+                    no_close_italic_star = true;
+                } else {
+                    no_close_italic_under = true;
+                }
             }
 
             i += 1;
@@ -110,23 +149,24 @@ impl<'src> Inline<'src> {
         bytes: &[u8],
         start: usize,
     ) -> Option<(&'src str, &'src str, usize)> {
-        if bytes.get(start) != Some(&SpecialChar::OpenBracket.as_byte()) {
+        if bytes.get(start) != Some(SpecialChar::OpenBracket.as_ref()) {
             return None;
         }
 
         let bracket_start = start + 1;
-        let search_region = bytes.get(bracket_start..)?;
+        let close_bracket = *SpecialChar::CloseBracket.as_ref();
         let bracket_end =
-            memchr(SpecialChar::CloseBracket.as_byte(), search_region)? + bracket_start;
+            bytes.get(bracket_start..)?.iter().position(|&b| b == close_bracket)? + bracket_start;
 
         let paren_pos = bracket_end + 1;
-        if bytes.get(paren_pos) != Some(&SpecialChar::OpenParen.as_byte()) {
+        if bytes.get(paren_pos) != Some(SpecialChar::OpenParen.as_ref()) {
             return None;
         }
 
         let paren_start = paren_pos + 1;
-        let search_region = bytes.get(paren_start..)?;
-        let paren_end = memchr(SpecialChar::CloseParen.as_byte(), search_region)? + paren_start;
+        let close_paren = *SpecialChar::CloseParen.as_ref();
+        let paren_end =
+            bytes.get(paren_start..)?.iter().position(|&b| b == close_paren)? + paren_start;
 
         Some((
             input.get(bracket_start..bracket_end)?,
@@ -142,12 +182,7 @@ impl<'src> Inline<'src> {
         marker: u8,
         count: usize,
     ) -> Option<(&'src str, usize)> {
-        for j in 0..count {
-            if bytes.get(start + j) != Some(&marker) {
-                return None;
-            }
-        }
-
+        // Caller already verified opening markers exist; skip straight to inner content
         let inner_start = start + count;
         let &first_inner = bytes.get(inner_start)?;
 
@@ -157,14 +192,18 @@ impl<'src> Inline<'src> {
 
         let mut i = inner_start;
         while i < bytes.len() {
-            if bytes.get(i) == Some(&marker) {
-                let all_match = (0..count).all(|j| bytes.get(i + j) == Some(&marker));
-                if all_match
-                    && i > inner_start
-                    && bytes.get(i - 1).is_some_and(|b| !b.is_ascii_whitespace())
-                {
-                    return Some((input.get(inner_start..i)?, i + count));
-                }
+            // Skip to next occurrence of the marker byte
+            match bytes.get(i..)?.iter().position(|&b| b == marker) {
+                Some(offset) => i += offset,
+                None => return None,
+            }
+
+            let all_match = (0..count).all(|j| bytes.get(i + j) == Some(&marker));
+            if all_match
+                && i > inner_start
+                && bytes.get(i - 1).is_some_and(|b| !b.is_ascii_whitespace())
+            {
+                return Some((input.get(inner_start..i)?, i + count));
             }
             i += 1;
         }

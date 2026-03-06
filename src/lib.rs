@@ -236,21 +236,23 @@ impl<'src> MarkdownFile<'src> {
     }
 
     fn is_horizontal_rule(line: &str) -> bool {
-        let trimmed = line.trim();
+        let trimmed = line.trim().as_bytes();
         if trimmed.len() < 3 {
             return false;
         }
-        let first = match trimmed.chars().next().and_then(SpecialChar::from_char) {
-            Some(sc) if sc.is_rule_char() => sc,
-            _ => return false,
-        };
-        let non_space: usize = trimmed
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .take_while(|&c| c == first.as_char())
-            .count();
-        let total_non_space: usize = trimmed.chars().filter(|c| !c.is_whitespace()).count();
-        non_space >= 3 && non_space == total_non_space
+        let first = trimmed[0];
+        if !matches!(first, b'-' | b'*' | b'_') {
+            return false;
+        }
+        let mut count = 0usize;
+        for &b in trimmed {
+            if b == first {
+                count += 1;
+            } else if !b.is_ascii_whitespace() {
+                return false;
+            }
+        }
+        count >= 3
     }
 
     fn try_parse_unordered_item(line: &str) -> Option<(SpecialChar, &str)> {

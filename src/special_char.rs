@@ -50,11 +50,6 @@ impl SpecialChar {
     }
 
     #[must_use]
-    pub const fn as_byte(self) -> u8 {
-        self.as_char() as u8
-    }
-
-    #[must_use]
     pub const fn from_byte(b: u8) -> Option<Self> {
         Self::from_char(b as char)
     }
@@ -76,7 +71,37 @@ impl SpecialChar {
 
     #[must_use]
     pub fn count_leading(self, s: &str) -> usize {
-        s.chars().take_while(|&c| c == self.as_char()).count()
+        s.as_bytes().iter().take_while(|&&b| b == self).count()
+    }
+}
+
+impl AsRef<u8> for SpecialChar {
+    fn as_ref(&self) -> &u8 {
+        match self {
+            Self::Hash => &b'#',
+            Self::Dash => &b'-',
+            Self::Asterisk => &b'*',
+            Self::Underscore => &b'_',
+            Self::GreaterThan => &b'>',
+            Self::Backtick => &b'`',
+            Self::ExclamationMark => &b'!',
+            Self::OpenBracket => &b'[',
+            Self::CloseBracket => &b']',
+            Self::OpenParen => &b'(',
+            Self::CloseParen => &b')',
+        }
+    }
+}
+
+impl PartialEq<u8> for SpecialChar {
+    fn eq(&self, other: &u8) -> bool {
+        *self.as_ref() == *other
+    }
+}
+
+impl PartialEq<SpecialChar> for u8 {
+    fn eq(&self, other: &SpecialChar) -> bool {
+        *self == *other.as_ref()
     }
 }
 
