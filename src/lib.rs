@@ -10,6 +10,11 @@ pub enum SpecialChar {
     Underscore,
     GreaterThan,
     Backtick,
+    ExclamationMark,
+    OpenBracket,
+    CloseBracket,
+    OpenParen,
+    CloseParen,
 }
 
 impl SpecialChar {
@@ -22,6 +27,11 @@ impl SpecialChar {
             '_' => Some(Self::Underscore),
             '>' => Some(Self::GreaterThan),
             '`' => Some(Self::Backtick),
+            '!' => Some(Self::ExclamationMark),
+            '[' => Some(Self::OpenBracket),
+            ']' => Some(Self::CloseBracket),
+            '(' => Some(Self::OpenParen),
+            ')' => Some(Self::CloseParen),
             _ => None,
         }
     }
@@ -35,6 +45,11 @@ impl SpecialChar {
             Self::Underscore => '_',
             Self::GreaterThan => '>',
             Self::Backtick => '`',
+            Self::ExclamationMark => '!',
+            Self::OpenBracket => '[',
+            Self::CloseBracket => ']',
+            Self::OpenParen => '(',
+            Self::CloseParen => ')',
         }
     }
 
@@ -46,6 +61,11 @@ impl SpecialChar {
     #[must_use]
     pub const fn is_list_char(self) -> bool {
         matches!(self, Self::Dash | Self::Asterisk)
+    }
+
+    #[must_use]
+    pub const fn is_emphasis_char(self) -> bool {
+        matches!(self, Self::Asterisk | Self::Underscore)
     }
 
     #[must_use]
@@ -61,13 +81,174 @@ impl std::fmt::Display for SpecialChar {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Inline {
+    Text(String),
+    Bold(Vec<Inline>),
+    Italic(Vec<Inline>),
+    Link { text: Vec<Inline>, url: String },
+    Image { alt: String, url: String },
+}
+
+impl From<&str> for Inline {
+    fn from(s: &str) -> Self {
+        Self::Text(s.to_string())
+    }
+}
+
+impl Inline {
+    #[must_use]
+    pub fn parse(input: &str) -> Vec<Self> {
+        let chars: Vec<char> = input.chars().collect();
+        let mut result = Vec::new();
+        let mut i = 0;
+        let mut plain_start = 0;
+
+        while i < chars.len() {
+            // Image: ![alt](url)
+            if chars[i] == SpecialChar::ExclamationMark.as_char()
+                && chars.get(i + 1) == Some(&SpecialChar::OpenBracket.as_char())
+                && let Some((alt, url, end)) = Self::try_parse_bracket_paren(&chars, i + 1)
+            {
+                Self::flush_plain(&chars, plain_start, i, &mut result);
+                result.push(Self::Image { alt, url });
+                i = end;
+                plain_start = i;
+                continue;
+            }
+
+            // Link: [text](url)
+            if chars[i] == SpecialChar::OpenBracket.as_char()
+                && let Some((text, url, end)) = Self::try_parse_bracket_paren(&chars, i)
+            {
+                Self::flush_plain(&chars, plain_start, i, &mut result);
+                result.push(Self::Link {
+                    text: Self::parse(&text),
+                    url,
+                });
+                i = end;
+                plain_start = i;
+                continue;
+            }
+
+            // Bold: ** or __
+            if let Some(sc) = SpecialChar::from_char(chars[i])
+                && sc.is_emphasis_char()
+                && chars.get(i + 1) == Some(&chars[i])
+                && let Some((inner, end)) = Self::try_parse_delimited(&chars, i, chars[i], 2)
+            {
+                Self::flush_plain(&chars, plain_start, i, &mut result);
+                result.push(Self::Bold(Self::parse(&inner)));
+                i = end;
+                plain_start = i;
+                continue;
+            }
+
+            // Italic: * or _
+            if let Some(sc) = SpecialChar::from_char(chars[i])
+                && sc.is_emphasis_char()
+                && let Some((inner, end)) = Self::try_parse_delimited(&chars, i, chars[i], 1)
+            {
+                Self::flush_plain(&chars, plain_start, i, &mut result);
+                result.push(Self::Italic(Self::parse(&inner)));
+                i = end;
+                plain_start = i;
+                continue;
+            }
+
+            i += 1;
+        }
+
+        Self::flush_plain(&chars, plain_start, chars.len(), &mut result);
+        result
+    }
+
+    fn flush_plain(chars: &[char], start: usize, end: usize, result: &mut Vec<Self>) {
+        if start < end {
+            let text: String = chars[start..end].iter().collect();
+            result.push(Self::Text(text));
+        }
+    }
+
+    fn try_parse_bracket_paren(chars: &[char], start: usize) -> Option<(String, String, usize)> {
+        if chars.get(start) != Some(&SpecialChar::OpenBracket.as_char()) {
+            return None;
+        }
+
+        let mut i = start + 1;
+        let bracket_start = i;
+
+        while i < chars.len() && chars[i] != SpecialChar::CloseBracket.as_char() {
+            i += 1;
+        }
+        if i >= chars.len() {
+            return None;
+        }
+        let bracket_content: String = chars[bracket_start..i].iter().collect();
+        i += 1;
+
+        if chars.get(i) != Some(&SpecialChar::OpenParen.as_char()) {
+            return None;
+        }
+        i += 1;
+        let paren_start = i;
+
+        while i < chars.len() && chars[i] != SpecialChar::CloseParen.as_char() {
+            i += 1;
+        }
+        if i >= chars.len() {
+            return None;
+        }
+        let paren_content: String = chars[paren_start..i].iter().collect();
+        i += 1;
+
+        Some((bracket_content, paren_content, i))
+    }
+
+    fn try_parse_delimited(
+        chars: &[char],
+        start: usize,
+        marker: char,
+        count: usize,
+    ) -> Option<(String, usize)> {
+        for j in 0..count {
+            if chars.get(start + j) != Some(&marker) {
+                return None;
+            }
+        }
+
+        let inner_start = start + count;
+        if inner_start >= chars.len() {
+            return None;
+        }
+
+        if chars[inner_start] == marker || chars[inner_start].is_whitespace() {
+            return None;
+        }
+
+        let mut i = inner_start;
+        while i < chars.len() {
+            if chars[i] == marker {
+                let all_match = (0..count).all(|j| chars.get(i + j) == Some(&marker));
+                if all_match && i > inner_start && !chars[i - 1].is_whitespace() {
+                    let inner: String = chars[inner_start..i].iter().collect();
+                    return Some((inner, i + count));
+                }
+            }
+            i += 1;
+        }
+
+        None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Section {
-    Heading { level: u8, text: String },
-    Paragraph { text: String },
+    Heading { level: u8, content: Vec<Inline> },
+    Paragraph { content: Vec<Inline> },
     CodeBlock { language: Option<String>, code: String },
-    UnorderedList { items: Vec<String> },
-    OrderedList { items: Vec<String> },
-    Blockquote { text: String },
+    UnorderedList { items: Vec<Vec<Inline>> },
+    OrderedList { items: Vec<Vec<Inline>> },
+    Blockquote { content: Vec<Inline> },
     HorizontalRule,
 }
 
@@ -106,16 +287,16 @@ impl Accumulator<'_> {
                 code: lines.join("\n"),
             }),
             Self::InBlockquote { lines } => Some(Section::Blockquote {
-                text: lines.join("\n"),
+                content: Inline::parse(&lines.join("\n")),
             }),
             Self::InUnorderedList { items, .. } => Some(Section::UnorderedList {
-                items: items.into_iter().map(String::from).collect(),
+                items: items.into_iter().map(Inline::parse).collect(),
             }),
             Self::InOrderedList { items } => Some(Section::OrderedList {
-                items: items.into_iter().map(String::from).collect(),
+                items: items.into_iter().map(Inline::parse).collect(),
             }),
             Self::InParagraph { lines } => Some(Section::Paragraph {
-                text: lines.join("\n"),
+                content: Inline::parse(&lines.join("\n")),
             }),
         }
     }
@@ -181,7 +362,6 @@ impl MarkdownFile {
     }
 
     fn fold_line<'a>(acc: Accumulator<'a>, line: &'a str) -> FoldResult<'a> {
-        // Inside a code block, only a closing fence exits
         if let Accumulator::InCodeBlock { language, mut lines } = acc {
             if Self::is_code_fence(line) {
                 let section = Section::CodeBlock {
@@ -194,12 +374,10 @@ impl MarkdownFile {
             return FoldResult::new(Accumulator::InCodeBlock { language, lines });
         }
 
-        // Blank line flushes current accumulator
         if line.trim().is_empty() {
             return FoldResult::new(Accumulator::Empty).flush_prior(acc);
         }
 
-        // Code fence opens a new code block
         if Self::is_code_fence(line) {
             let language = Self::extract_code_language(line);
             return FoldResult::new(Accumulator::InCodeBlock {
@@ -209,21 +387,18 @@ impl MarkdownFile {
             .flush_prior(acc);
         }
 
-        // Heading
         if let Some(section) = Self::try_parse_heading(line) {
             return FoldResult::new(Accumulator::Empty)
                 .flush_prior(acc)
                 .emit(section);
         }
 
-        // Horizontal rule
         if Self::is_horizontal_rule(line) {
             return FoldResult::new(Accumulator::Empty)
                 .flush_prior(acc)
                 .emit(Section::HorizontalRule);
         }
 
-        // Blockquote
         if line.starts_with(SpecialChar::GreaterThan.as_char()) {
             let content = line[1..].strip_prefix(' ').unwrap_or_else(|| &line[1..]);
             if let Accumulator::InBlockquote { mut lines } = acc {
@@ -236,7 +411,6 @@ impl MarkdownFile {
             .flush_prior(acc);
         }
 
-        // Unordered list
         if let Some((marker, item)) = Self::try_parse_unordered_item(line) {
             if let Accumulator::InUnorderedList {
                 marker: m,
@@ -260,7 +434,6 @@ impl MarkdownFile {
             .flush_prior(acc);
         }
 
-        // Ordered list
         if let Some(item) = Self::try_parse_ordered_item(line) {
             if let Accumulator::InOrderedList { mut items } = acc {
                 items.push(item);
@@ -270,7 +443,6 @@ impl MarkdownFile {
                 .flush_prior(acc);
         }
 
-        // Paragraph
         if let Accumulator::InParagraph { mut lines } = acc {
             lines.push(line);
             return FoldResult::new(Accumulator::InParagraph { lines });
@@ -293,7 +465,7 @@ impl MarkdownFile {
         if (1..=6).contains(&level) && line.as_bytes().get(level) == Some(&b' ') {
             Some(Section::Heading {
                 level: level as u8,
-                text: line[level..].trim().to_string(),
+                content: Inline::parse(line[level..].trim()),
             })
         } else {
             None
@@ -343,14 +515,18 @@ impl MarkdownFile {
 mod tests {
     use super::*;
 
+    fn text(s: &str) -> Vec<Inline> {
+        vec![Inline::Text(s.into())]
+    }
+
     #[test]
     fn test_heading() {
         let md: MarkdownFile = "# Hello\n## World".parse().unwrap();
         assert_eq!(
             md.sections,
             vec![
-                Section::Heading { level: 1, text: "Hello".into() },
-                Section::Heading { level: 2, text: "World".into() },
+                Section::Heading { level: 1, content: text("Hello") },
+                Section::Heading { level: 2, content: text("World") },
             ]
         );
     }
@@ -361,7 +537,7 @@ mod tests {
         assert_eq!(
             md.sections,
             vec![Section::Paragraph {
-                text: "This is a paragraph.\nWith two lines.".into()
+                content: text("This is a paragraph.\nWith two lines.")
             }]
         );
     }
@@ -396,7 +572,7 @@ mod tests {
         assert_eq!(
             md.sections,
             vec![Section::UnorderedList {
-                items: vec!["one".into(), "two".into(), "three".into()],
+                items: vec![text("one"), text("two"), text("three")],
             }]
         );
     }
@@ -407,7 +583,7 @@ mod tests {
         assert_eq!(
             md.sections,
             vec![Section::OrderedList {
-                items: vec!["first".into(), "second".into(), "third".into()],
+                items: vec![text("first"), text("second"), text("third")],
             }]
         );
     }
@@ -418,7 +594,7 @@ mod tests {
         assert_eq!(
             md.sections,
             vec![Section::Blockquote {
-                text: "line one\nline two".into(),
+                content: text("line one\nline two"),
             }]
         );
     }
@@ -438,10 +614,10 @@ mod tests {
         assert_eq!(
             md.sections,
             vec![
-                Section::Heading { level: 1, text: "Title".into() },
-                Section::Paragraph { text: "Some text.".into() },
-                Section::UnorderedList { items: vec!["a".into(), "b".into()] },
-                Section::Blockquote { text: "quote".into() },
+                Section::Heading { level: 1, content: text("Title") },
+                Section::Paragraph { content: text("Some text.") },
+                Section::UnorderedList { items: vec![text("a"), text("b")] },
+                Section::Blockquote { content: text("quote") },
                 Section::HorizontalRule,
                 Section::CodeBlock { language: None, code: "code".into() },
             ]
@@ -454,9 +630,137 @@ mod tests {
         assert_eq!(
             md.sections,
             vec![
-                Section::Paragraph { text: "some text".into() },
-                Section::Heading { level: 1, text: "Heading".into() },
+                Section::Paragraph { content: text("some text") },
+                Section::Heading { level: 1, content: text("Heading") },
             ]
+        );
+    }
+
+    #[test]
+    fn test_bold() {
+        let md: MarkdownFile = "This is **bold** text".parse().unwrap();
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![
+                    Inline::Text("This is ".into()),
+                    Inline::Bold(vec![Inline::Text("bold".into())]),
+                    Inline::Text(" text".into()),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_italic() {
+        let md: MarkdownFile = "This is *italic* text".parse().unwrap();
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![
+                    Inline::Text("This is ".into()),
+                    Inline::Italic(vec![Inline::Text("italic".into())]),
+                    Inline::Text(" text".into()),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_bold_underscore() {
+        let md: MarkdownFile = "__bold__".parse().unwrap();
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![Inline::Bold(vec![Inline::Text("bold".into())])],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_italic_underscore() {
+        let md: MarkdownFile = "_italic_".parse().unwrap();
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![Inline::Italic(vec![Inline::Text("italic".into())])],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_link() {
+        let md: MarkdownFile = "Click [here](https://example.com) now".parse().unwrap();
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![
+                    Inline::Text("Click ".into()),
+                    Inline::Link {
+                        text: vec![Inline::Text("here".into())],
+                        url: "https://example.com".into(),
+                    },
+                    Inline::Text(" now".into()),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_image() {
+        let md: MarkdownFile = "![alt text](image.png)".parse().unwrap();
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![Inline::Image {
+                    alt: "alt text".into(),
+                    url: "image.png".into(),
+                }],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_bold_inside_link() {
+        let md: MarkdownFile = "[**bold link**](url)".parse().unwrap();
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![Inline::Link {
+                    text: vec![Inline::Bold(vec![Inline::Text("bold link".into())])],
+                    url: "url".into(),
+                }],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_inline_in_heading() {
+        let md: MarkdownFile = "# A **bold** heading".parse().unwrap();
+        assert_eq!(
+            md.sections,
+            vec![Section::Heading {
+                level: 1,
+                content: vec![
+                    Inline::Text("A ".into()),
+                    Inline::Bold(vec![Inline::Text("bold".into())]),
+                    Inline::Text(" heading".into()),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_inline_in_list() {
+        let md: MarkdownFile = "- *italic item*\n- **bold item**".parse().unwrap();
+        assert_eq!(
+            md.sections,
+            vec![Section::UnorderedList {
+                items: vec![
+                    vec![Inline::Italic(vec![Inline::Text("italic item".into())])],
+                    vec![Inline::Bold(vec![Inline::Text("bold item".into())])],
+                ],
+            }]
         );
     }
 
@@ -466,40 +770,61 @@ mod tests {
         assert_eq!(
             md.sections,
             vec![
-                Section::Heading { level: 1, text: "marki".into() },
+                Section::Heading { level: 1, content: text("marki") },
                 Section::Paragraph {
-                    text: "A simple Rust library for parsing markdown files into structured sections.".into(),
+                    content: text("A simple Rust library for parsing markdown files into structured sections."),
                 },
-                Section::Heading { level: 2, text: "Features".into() },
+                Section::Heading { level: 2, content: text("Features") },
                 Section::UnorderedList {
                     items: vec![
-                        "Parse markdown from strings or files".into(),
-                        "Type-safe representation of markdown elements".into(),
-                        "Zero-copy parsing with fold-based state machine".into(),
+                        text("Parse markdown from strings or files"),
+                        text("Type-safe representation of markdown elements"),
+                        text("Zero-copy parsing with fold-based state machine"),
                     ],
                 },
-                Section::Heading { level: 2, text: "Supported Sections".into() },
+                Section::Heading { level: 2, content: text("Supported Sections") },
                 Section::UnorderedList {
                     items: vec![
-                        "Headings (levels 1-6)".into(),
-                        "Paragraphs".into(),
-                        "Code blocks (with optional language)".into(),
-                        "Unordered lists".into(),
-                        "Ordered lists".into(),
-                        "Blockquotes".into(),
-                        "Horizontal rules".into(),
+                        text("Headings (levels 1-6)"),
+                        text("Paragraphs"),
+                        text("Code blocks (with optional language)"),
+                        text("Unordered lists"),
+                        text("Ordered lists"),
+                        text("Blockquotes"),
+                        text("Horizontal rules"),
                     ],
                 },
-                Section::Heading { level: 2, text: "Usage".into() },
+                Section::Heading { level: 2, content: text("Inline Formatting") },
+                Section::UnorderedList {
+                    items: vec![
+                        vec![
+                            Inline::Bold(vec![Inline::Text("Bold".into())]),
+                            Inline::Text(" text".into()),
+                        ],
+                        vec![
+                            Inline::Italic(vec![Inline::Text("Italic".into())]),
+                            Inline::Text(" text".into()),
+                        ],
+                        vec![Inline::Link {
+                            text: vec![Inline::Text("Links".into())],
+                            url: "https://example.com".into(),
+                        }],
+                        vec![Inline::Image {
+                            alt: "Images".into(),
+                            url: "image.png".into(),
+                        }],
+                    ],
+                },
+                Section::Heading { level: 2, content: text("Usage") },
                 Section::CodeBlock {
                     language: Some("rust".into()),
                     code: "use marki::MarkdownFile;\n\nlet md: MarkdownFile = \"# Hello\\n\\nWorld\".parse().unwrap();".into(),
                 },
                 Section::OrderedList {
                     items: vec![
-                        "Parse a string".into(),
-                        "Read a file".into(),
-                        "Inspect sections".into(),
+                        text("Parse a string"),
+                        text("Read a file"),
+                        text("Inspect sections"),
                     ],
                 },
             ]

@@ -18,6 +18,13 @@ A simple Rust library for parsing markdown files into structured sections.
 - Blockquotes
 - Horizontal rules
 
+## Inline Formatting
+
+- **Bold** text
+- *Italic* text
+- [Links](https://example.com)
+- ![Images](image.png)
+
 ## Usage
 
 ```rust
