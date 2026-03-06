@@ -198,6 +198,7 @@ impl<'src> MarkdownFile<'src> {
                 SpecialChar::GreaterThan
                     | SpecialChar::Dash
                     | SpecialChar::Asterisk
+                    | SpecialChar::Plus
                     | SpecialChar::Underscore
             )
         ) || first.is_ascii_digit()
@@ -490,6 +491,17 @@ mod tests {
     }
 
     #[test]
+    fn test_unordered_list_plus() {
+        let md = MarkdownFile::parse("+ one\n+ two\n+ three");
+        assert_eq!(
+            md.sections,
+            vec![Section::UnorderedList {
+                items: vec![text("one"), text("two"), text("three")],
+            }]
+        );
+    }
+
+    #[test]
     fn test_ordered_list() {
         let md = MarkdownFile::parse("1. first\n2. second\n3. third");
         assert_eq!(
@@ -743,8 +755,10 @@ mod tests {
                         vec![
                             Inline::Text("Unordered lists ("),
                             Inline::Code("-"),
-                            Inline::Text(" or "),
+                            Inline::Text(", "),
                             Inline::Code("*"),
+                            Inline::Text(", or "),
+                            Inline::Code("+"),
                             Inline::Text(" markers)"),
                         ],
                         text("Ordered lists (with preserved start number)"),

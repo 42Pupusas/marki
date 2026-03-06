@@ -303,6 +303,8 @@ impl<'src> Inline<'src> {
         let mut j = start;
         while let Some(&b) = bytes.get(j) {
             if b == SpecialChar::Backslash {
+                // Skip escaped character. If the backslash is the last byte,
+                // j + 2 overshoots and the `bytes.get(j)` guard exits the loop.
                 j += 2;
                 continue;
             }
@@ -373,6 +375,8 @@ impl<'src> Inline<'src> {
         let mut i = inner_start;
         while let Some(&b) = bytes.get(i) {
             if b == SpecialChar::Backslash {
+                // Skip escaped character. If the backslash is the last byte,
+                // i + 2 overshoots and the `bytes.get(i)` guard exits the loop.
                 i += 2;
                 continue;
             }

@@ -13,7 +13,7 @@ A zero-copy Markdown parser for Rust. Parses markdown strings into structured se
 - Headings (levels 1-6)
 - Paragraphs (with multi-line continuation)
 - Code blocks (fenced with backticks, optional language)
-- Unordered lists (`-` or `*` markers)
+- Unordered lists (`-`, `*`, or `+` markers)
 - Ordered lists (with preserved start number)
 - Blockquotes
 - Horizontal rules (`---`, `***`, `___`)

@@ -5,6 +5,7 @@ pub enum SpecialChar {
     Hash = b'#',
     OpenParen = b'(',
     CloseParen = b')',
+    Plus = b'+',
     Asterisk = b'*',
     Dash = b'-',
     GreaterThan = b'>',
@@ -20,6 +21,7 @@ impl SpecialChar {
     pub const fn from_byte(b: u8) -> Option<Self> {
         match b {
             b'#' => Some(Self::Hash),
+            b'+' => Some(Self::Plus),
             b'-' => Some(Self::Dash),
             b'*' => Some(Self::Asterisk),
             b'_' => Some(Self::Underscore),
@@ -42,7 +44,7 @@ impl SpecialChar {
 
     #[must_use]
     pub const fn is_list_char(self) -> bool {
-        matches!(self, Self::Dash | Self::Asterisk)
+        matches!(self, Self::Dash | Self::Asterisk | Self::Plus)
     }
 
     #[must_use]
