@@ -40,13 +40,15 @@ impl<'src> Inline<'src> {
         let mut plain_start = 0;
         let mut i = 0;
 
-        // Track failed delimiter scans to avoid O(n²) re-scanning.
-        // Once we scan forward for a closing delimiter and find none,
-        // no later position can find one either — skip future attempts.
-        let mut no_close_bold_star = false;
-        let mut no_close_bold_under = false;
-        let mut no_close_italic_star = false;
-        let mut no_close_italic_under = false;
+        // Pre-scan delimiter counts to avoid O(n²) re-scanning in
+        // recursive calls. If there aren't enough delimiters for a
+        // matched pair, skip those attempts entirely.
+        let star_count = bytes.iter().filter(|&&b| b == b'*').take(4).count();
+        let under_count = bytes.iter().filter(|&&b| b == b'_').take(4).count();
+        let mut no_close_bold_star = star_count < 4;
+        let mut no_close_bold_under = under_count < 4;
+        let mut no_close_italic_star = star_count < 2;
+        let mut no_close_italic_under = under_count < 2;
 
         while let Some(&b) = bytes.get(i) {
             // Fast-skip non-special bytes via lookup table

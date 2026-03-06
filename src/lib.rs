@@ -121,12 +121,6 @@ impl<'src> MarkdownFile<'src> {
             return Accumulator::Empty;
         }
 
-        if Self::is_horizontal_rule(line) {
-            acc.flush_into(sections);
-            sections.push(Section::HorizontalRule);
-            return Accumulator::Empty;
-        }
-
         Self::fold_block_element(input, sections, acc, line)
     }
 
@@ -180,6 +174,12 @@ impl<'src> MarkdownFile<'src> {
             return Accumulator::InBlockquote {
                 lines: vec![content],
             };
+        }
+
+        if Self::is_horizontal_rule(line) {
+            acc.flush_into(sections);
+            sections.push(Section::HorizontalRule);
+            return Accumulator::Empty;
         }
 
         if let Some((marker, item)) = Self::try_parse_unordered_item(line) {
