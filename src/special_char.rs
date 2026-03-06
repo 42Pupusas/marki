@@ -50,6 +50,16 @@ impl SpecialChar {
     }
 
     #[must_use]
+    pub const fn as_byte(self) -> u8 {
+        self.as_char() as u8
+    }
+
+    #[must_use]
+    pub const fn from_byte(b: u8) -> Option<Self> {
+        Self::from_char(b as char)
+    }
+
+    #[must_use]
     pub const fn is_rule_char(self) -> bool {
         matches!(self, Self::Dash | Self::Asterisk | Self::Underscore)
     }
