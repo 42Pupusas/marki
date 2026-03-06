@@ -15,43 +15,21 @@ pub enum SpecialChar {
 
 impl SpecialChar {
     #[must_use]
-    pub const fn from_char(c: char) -> Option<Self> {
-        match c {
-            '#' => Some(Self::Hash),
-            '-' => Some(Self::Dash),
-            '*' => Some(Self::Asterisk),
-            '_' => Some(Self::Underscore),
-            '>' => Some(Self::GreaterThan),
-            '`' => Some(Self::Backtick),
-            '!' => Some(Self::ExclamationMark),
-            '[' => Some(Self::OpenBracket),
-            ']' => Some(Self::CloseBracket),
-            '(' => Some(Self::OpenParen),
-            ')' => Some(Self::CloseParen),
+    pub const fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            b'#' => Some(Self::Hash),
+            b'-' => Some(Self::Dash),
+            b'*' => Some(Self::Asterisk),
+            b'_' => Some(Self::Underscore),
+            b'>' => Some(Self::GreaterThan),
+            b'`' => Some(Self::Backtick),
+            b'!' => Some(Self::ExclamationMark),
+            b'[' => Some(Self::OpenBracket),
+            b']' => Some(Self::CloseBracket),
+            b'(' => Some(Self::OpenParen),
+            b')' => Some(Self::CloseParen),
             _ => None,
         }
-    }
-
-    #[must_use]
-    pub const fn as_char(self) -> char {
-        match self {
-            Self::Hash => '#',
-            Self::Dash => '-',
-            Self::Asterisk => '*',
-            Self::Underscore => '_',
-            Self::GreaterThan => '>',
-            Self::Backtick => '`',
-            Self::ExclamationMark => '!',
-            Self::OpenBracket => '[',
-            Self::CloseBracket => ']',
-            Self::OpenParen => '(',
-            Self::CloseParen => ')',
-        }
-    }
-
-    #[must_use]
-    pub const fn from_byte(b: u8) -> Option<Self> {
-        Self::from_char(b as char)
     }
 
     #[must_use]
@@ -107,6 +85,6 @@ impl PartialEq<SpecialChar> for u8 {
 
 impl std::fmt::Display for SpecialChar {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_char())
+        write!(f, "{}", *self.as_ref() as char)
     }
 }

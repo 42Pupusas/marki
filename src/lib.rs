@@ -32,35 +32,6 @@ enum Accumulator<'src> {
     },
 }
 
-/// Merge two subslices of `base` into one contiguous slice spanning from the
-/// start of `a` to the end of `b`.
-///
-/// # Panics
-///
-/// Panics if `a` or `b` are not subslices of `base`, or if `b` starts before `a`.
-fn merge_slices<'src>(base: &'src str, a: &str, b: &str) -> Option<&'src str> {
-    let base_start = base.as_ptr() as usize;
-    let base_end = base_start.checked_add(base.len())?;
-
-    let a_start = a.as_ptr() as usize;
-    let b_start = b.as_ptr() as usize;
-    let b_end = b_start.checked_add(b.len())?;
-
-    if a_start < base_start || a_start.checked_add(a.len())? > base_end {
-        return None;
-    }
-    if b_start < base_start || b_end > base_end {
-        return None;
-    }
-    if b_start < a_start {
-        return None;
-    }
-
-    let start = a_start - base_start;
-    let end = b_end - base_start;
-    base.get(start..end)
-}
-
 impl<'src> Accumulator<'src> {
     fn flush(self) -> Option<Section<'src>> {
         match self {
@@ -147,7 +118,7 @@ impl<'src> MarkdownFile<'src> {
                 return FoldResult::new(Accumulator::Empty).emit(section);
             }
             let content = content.map_or(line, |existing| {
-                merge_slices(input, existing, line).unwrap_or(existing)
+                Self::merge_slices(input, existing, line).unwrap_or(existing)
             });
             return FoldResult::new(Accumulator::InCodeBlock {
                 language,
@@ -226,7 +197,7 @@ impl<'src> MarkdownFile<'src> {
         }
 
         if let Accumulator::InParagraph { content } = acc {
-            let content = merge_slices(input, content, line).unwrap_or(content);
+            let content = Self::merge_slices(input, content, line).unwrap_or(content);
             return FoldResult::new(Accumulator::InParagraph { content });
         }
         FoldResult::new(Accumulator::InParagraph { content: line }).flush_prior(acc)
@@ -287,12 +258,39 @@ impl<'src> MarkdownFile<'src> {
 
     fn try_parse_ordered_item(line: &str) -> Option<&str> {
         let (num_part, rest) = line.split_once(". ")?;
-        if !num_part.is_empty() && num_part.as_bytes().iter().all(u8::is_ascii_digit) && !rest.is_empty()
+        if !num_part.is_empty()
+            && num_part.as_bytes().iter().all(u8::is_ascii_digit)
+            && !rest.is_empty()
         {
             Some(rest)
         } else {
             None
         }
+    }
+
+    /// Merge two subslices of `base` into one contiguous slice spanning from the
+    /// start of `a` to the end of `b`.
+    fn merge_slices(base: &'src str, a: &str, b: &str) -> Option<&'src str> {
+        let base_start = base.as_ptr() as usize;
+        let base_end = base_start.checked_add(base.len())?;
+
+        let a_start = a.as_ptr() as usize;
+        let b_start = b.as_ptr() as usize;
+        let b_end = b_start.checked_add(b.len())?;
+
+        if a_start < base_start || a_start.checked_add(a.len())? > base_end {
+            return None;
+        }
+        if b_start < base_start || b_end > base_end {
+            return None;
+        }
+        if b_start < a_start {
+            return None;
+        }
+
+        let start = a_start - base_start;
+        let end = b_end - base_start;
+        base.get(start..end)
     }
 }
 
