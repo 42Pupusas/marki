@@ -180,8 +180,9 @@ impl<'src> MarkdownFile<'src> {
                 .emit(Section::HorizontalRule);
         }
 
-        if line.starts_with(SpecialChar::GreaterThan.as_char()) {
-            let content = line[1..].strip_prefix(' ').unwrap_or_else(|| &line[1..]);
+        if line.as_bytes().first() == Some(SpecialChar::GreaterThan.as_ref()) {
+            let rest = &line[1..];
+            let content = rest.strip_prefix(' ').unwrap_or(rest);
             if let Accumulator::InBlockquote { mut lines } = acc {
                 lines.push(content);
                 return FoldResult::new(Accumulator::InBlockquote { lines });
@@ -236,7 +237,9 @@ impl<'src> MarkdownFile<'src> {
     }
 
     fn extract_code_language(line: &str) -> Option<&str> {
-        let after = line.trim_start().trim_start_matches('`').trim();
+        let trimmed = line.trim_start();
+        let backticks = SpecialChar::Backtick.count_leading(trimmed);
+        let after = trimmed[backticks..].trim();
         if after.is_empty() { None } else { Some(after) }
     }
 
@@ -274,18 +277,17 @@ impl<'src> MarkdownFile<'src> {
     }
 
     fn try_parse_unordered_item(line: &str) -> Option<(SpecialChar, &str)> {
-        let first = line.chars().next().and_then(SpecialChar::from_char)?;
+        let first = SpecialChar::from_byte(*line.as_bytes().first()?)?;
         if !first.is_list_char() {
             return None;
         }
-        line.strip_prefix(first.as_char())
-            .and_then(|rest| rest.strip_prefix(' '))
-            .map(|item| (first, item))
+        let rest = line.get(1..)?;
+        rest.strip_prefix(' ').map(|item| (first, item))
     }
 
     fn try_parse_ordered_item(line: &str) -> Option<&str> {
         let (num_part, rest) = line.split_once(". ")?;
-        if !num_part.is_empty() && num_part.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty()
+        if !num_part.is_empty() && num_part.as_bytes().iter().all(u8::is_ascii_digit) && !rest.is_empty()
         {
             Some(rest)
         } else {
