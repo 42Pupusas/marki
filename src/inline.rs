@@ -1,131 +1,115 @@
 use crate::SpecialChar;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Inline {
-    Text(String),
-    Bold(Vec<Inline>),
-    Italic(Vec<Inline>),
-    Link { text: Vec<Inline>, url: String },
-    Image { alt: String, url: String },
+pub enum Inline<'src> {
+    Text(&'src str),
+    Bold(Vec<Inline<'src>>),
+    Italic(Vec<Inline<'src>>),
+    Link {
+        text: Vec<Inline<'src>>,
+        url: &'src str,
+    },
+    Image {
+        alt: &'src str,
+        url: &'src str,
+    },
 }
 
-impl From<&str> for Inline {
-    fn from(s: &str) -> Self {
-        Self::Text(s.to_string())
-    }
-}
-
-struct InlineAccumulator {
-    result: Vec<Inline>,
-    plain_start: usize,
-    skip_to: usize,
-}
-
-impl InlineAccumulator {
-    const fn new() -> Self {
-        Self {
-            result: Vec::new(),
-            plain_start: 0,
-            skip_to: 0,
-        }
-    }
-
-    fn flush_plain(mut self, input: &str, end: usize) -> Self {
-        if self.plain_start < end {
-            self.result
-                .push(Inline::Text(input[self.plain_start..end].to_string()));
-        }
-        self
-    }
-
-    fn emit(mut self, input: &str, pos: usize, inline: Inline, skip_to: usize) -> Self {
-        self = self.flush_plain(input, pos);
-        self.result.push(inline);
-        self.skip_to = skip_to;
-        self.plain_start = skip_to;
-        self
-    }
-
-    fn finish(self, input: &str) -> Vec<Inline> {
-        let acc = self.flush_plain(input, input.len());
-        acc.result
+impl<'src> From<&'src str> for Inline<'src> {
+    fn from(s: &'src str) -> Self {
+        Self::Text(s)
     }
 }
 
-impl Inline {
+fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
+    haystack.iter().position(|&b| b == needle)
+}
+
+impl<'src> Inline<'src> {
     #[must_use]
-    pub fn parse(input: &str) -> Vec<Self> {
+    pub fn parse(input: &'src str) -> Vec<Self> {
         let bytes = input.as_bytes();
+        let mut result = Vec::new();
+        let mut plain_start = 0;
+        let mut i = 0;
 
-        bytes
-            .iter()
-            .enumerate()
-            .fold(InlineAccumulator::new(), |acc, (i, _)| {
-                Self::fold_byte(input, bytes, acc, i)
-            })
-            .finish(input)
-    }
+        while i < bytes.len() {
+            let b = bytes[i];
 
-    fn fold_byte(input: &str, bytes: &[u8], acc: InlineAccumulator, i: usize) -> InlineAccumulator {
-        if i < acc.skip_to {
-            return acc;
-        }
+            // Image: ![alt](url)
+            if b == SpecialChar::ExclamationMark.as_byte()
+                && bytes.get(i + 1) == Some(&SpecialChar::OpenBracket.as_byte())
+                && let Some((alt, url, end)) = Self::try_parse_bracket_paren(input, bytes, i + 1)
+            {
+                if plain_start < i {
+                    result.push(Self::Text(&input[plain_start..i]));
+                }
+                result.push(Self::Image { alt, url });
+                plain_start = end;
+                i = end;
+                continue;
+            }
 
-        let Some(&b) = bytes.get(i) else {
-            return acc;
-        };
-
-        // Image: ![alt](url)
-        if b == SpecialChar::ExclamationMark.as_byte()
-            && bytes.get(i + 1) == Some(&SpecialChar::OpenBracket.as_byte())
-            && let Some((alt, url, end)) = Self::try_parse_bracket_paren(input, bytes, i + 1)
-        {
-            return acc.emit(input, i, Self::Image { alt, url }, end);
-        }
-
-        // Link: [text](url)
-        if b == SpecialChar::OpenBracket.as_byte()
-            && let Some((text, url, end)) = Self::try_parse_bracket_paren(input, bytes, i)
-        {
-            return acc.emit(
-                input,
-                i,
-                Self::Link {
-                    text: Self::parse(&text),
+            // Link: [text](url)
+            if b == SpecialChar::OpenBracket.as_byte()
+                && let Some((text_str, url, end)) = Self::try_parse_bracket_paren(input, bytes, i)
+            {
+                if plain_start < i {
+                    result.push(Self::Text(&input[plain_start..i]));
+                }
+                result.push(Self::Link {
+                    text: Self::parse(text_str),
                     url,
-                },
-                end,
-            );
+                });
+                plain_start = end;
+                i = end;
+                continue;
+            }
+
+            // Bold: ** or __
+            if let Some(sc) = SpecialChar::from_byte(b)
+                && sc.is_emphasis_char()
+                && bytes.get(i + 1) == Some(&b)
+                && let Some((inner, end)) = Self::try_parse_delimited(input, bytes, i, b, 2)
+            {
+                if plain_start < i {
+                    result.push(Self::Text(&input[plain_start..i]));
+                }
+                result.push(Self::Bold(Self::parse(inner)));
+                plain_start = end;
+                i = end;
+                continue;
+            }
+
+            // Italic: * or _
+            if let Some(sc) = SpecialChar::from_byte(b)
+                && sc.is_emphasis_char()
+                && let Some((inner, end)) = Self::try_parse_delimited(input, bytes, i, b, 1)
+            {
+                if plain_start < i {
+                    result.push(Self::Text(&input[plain_start..i]));
+                }
+                result.push(Self::Italic(Self::parse(inner)));
+                plain_start = end;
+                i = end;
+                continue;
+            }
+
+            i += 1;
         }
 
-        // Bold: ** or __
-        if let Some(sc) = SpecialChar::from_byte(b)
-            && sc.is_emphasis_char()
-            && bytes.get(i + 1) == Some(&b)
-            && let Some((inner, end)) = Self::try_parse_delimited(input, bytes, i, b, 2)
-        {
-            return acc.emit(input, i, Self::Bold(Self::parse(&inner)), end);
+        if plain_start < input.len() {
+            result.push(Self::Text(&input[plain_start..]));
         }
 
-        // Italic: * or _
-        if let Some(sc) = SpecialChar::from_byte(b)
-            && sc.is_emphasis_char()
-            && let Some((inner, end)) = Self::try_parse_delimited(input, bytes, i, b, 1)
-        {
-            return acc.emit(input, i, Self::Italic(Self::parse(&inner)), end);
-        }
-
-        acc
+        result
     }
 
     fn try_parse_bracket_paren(
-        input: &str,
+        input: &'src str,
         bytes: &[u8],
         start: usize,
-    ) -> Option<(String, String, usize)> {
-        fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
-            haystack.iter().position(|&b| b == needle)
-        }
+    ) -> Option<(&'src str, &'src str, usize)> {
         if bytes.get(start) != Some(&SpecialChar::OpenBracket.as_byte()) {
             return None;
         }
@@ -145,19 +129,19 @@ impl Inline {
         let paren_end = memchr(SpecialChar::CloseParen.as_byte(), search_region)? + paren_start;
 
         Some((
-            input.get(bracket_start..bracket_end)?.to_string(),
-            input.get(paren_start..paren_end)?.to_string(),
+            input.get(bracket_start..bracket_end)?,
+            input.get(paren_start..paren_end)?,
             paren_end + 1,
         ))
     }
 
     fn try_parse_delimited(
-        input: &str,
+        input: &'src str,
         bytes: &[u8],
         start: usize,
         marker: u8,
         count: usize,
-    ) -> Option<(String, usize)> {
+    ) -> Option<(&'src str, usize)> {
         for j in 0..count {
             if bytes.get(start + j) != Some(&marker) {
                 return None;
@@ -179,7 +163,7 @@ impl Inline {
                     && i > inner_start
                     && bytes.get(i - 1).is_some_and(|b| !b.is_ascii_whitespace())
                 {
-                    return Some((input.get(inner_start..i)?.to_string(), i + count));
+                    return Some((input.get(inner_start..i)?, i + count));
                 }
             }
             i += 1;

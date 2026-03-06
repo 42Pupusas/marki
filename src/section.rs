@@ -1,26 +1,26 @@
 use crate::Inline;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Section {
+pub enum Section<'src> {
     Heading {
         level: u8,
-        content: Vec<Inline>,
+        content: Vec<Inline<'src>>,
     },
     Paragraph {
-        content: Vec<Inline>,
+        content: Vec<Inline<'src>>,
     },
     CodeBlock {
-        language: Option<String>,
-        code: String,
+        language: Option<&'src str>,
+        code: &'src str,
     },
     UnorderedList {
-        items: Vec<Vec<Inline>>,
+        items: Vec<Vec<Inline<'src>>>,
     },
     OrderedList {
-        items: Vec<Vec<Inline>>,
+        items: Vec<Vec<Inline<'src>>>,
     },
     Blockquote {
-        content: Vec<Inline>,
+        content: Vec<Inline<'src>>,
     },
     HorizontalRule,
 }
