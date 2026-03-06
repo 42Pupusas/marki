@@ -165,7 +165,7 @@ impl<'src> MarkdownFile<'src> {
         acc: Accumulator<'src>,
         line: &'src str,
     ) -> Accumulator<'src> {
-        if line.as_bytes().first() == Some(SpecialChar::GreaterThan.as_ref()) {
+        if line.as_bytes().first().copied() == Some(SpecialChar::GreaterThan.as_byte()) {
             let rest = &line[1..];
             let content = rest.strip_prefix(' ').unwrap_or(rest);
             if let Accumulator::InBlockquote { mut lines } = acc {
@@ -281,21 +281,23 @@ impl<'src> MarkdownFile<'src> {
     }
 
     fn is_horizontal_rule(line: &str) -> bool {
-        let trimmed = line.trim().as_bytes();
-        if trimmed.len() < 3 {
-            return false;
-        }
-        let first = trimmed[0];
-        if !matches!(first, b'-' | b'*' | b'_') {
-            return false;
-        }
+        let bytes = line.as_bytes();
+        let mut rule_byte = 0u8;
         let mut count = 0usize;
-        for &b in trimmed {
-            if b == first {
-                count += 1;
-            } else if !b.is_ascii_whitespace() {
+        for &b in bytes {
+            if b.is_ascii_whitespace() {
+                continue;
+            }
+            if rule_byte == 0 {
+                if !matches!(b, b'-' | b'*' | b'_') {
+                    return false;
+                }
+                rule_byte = b;
+            }
+            if b != rule_byte {
                 return false;
             }
+            count += 1;
         }
         count >= 3
     }
@@ -310,16 +312,32 @@ impl<'src> MarkdownFile<'src> {
     }
 
     fn try_parse_ordered_item(line: &str) -> Option<(u32, &str)> {
-        let (num_part, rest) = line.split_once(". ")?;
-        if !num_part.is_empty()
-            && num_part.len() <= 9
-            && num_part.as_bytes().iter().all(u8::is_ascii_digit)
-            && !rest.is_empty()
-        {
-            Some((num_part.parse().ok()?, rest))
-        } else {
-            None
+        let bytes = line.as_bytes();
+        let mut num: u32 = 0;
+        let mut digits = 0usize;
+        for &b in bytes {
+            if b.is_ascii_digit() {
+                digits += 1;
+                if digits > 9 {
+                    return None;
+                }
+                num = num * 10 + u32::from(b - b'0');
+            } else {
+                break;
+            }
         }
+        if digits == 0 {
+            return None;
+        }
+        // Expect ". " after the digits, and non-empty item text
+        let rest = bytes.get(digits + 2..)?;
+        if bytes.get(digits).copied() != Some(b'.')
+            || bytes.get(digits + 1).copied() != Some(b' ')
+            || rest.is_empty()
+        {
+            return None;
+        }
+        Some((num, line.get(digits + 2..)?))
     }
 
     /// Merge two subslices of `base` into one contiguous slice spanning from the

@@ -90,11 +90,24 @@ struct EmphasisState {
 
 impl EmphasisState {
     fn from_bytes(bytes: &[u8]) -> Self {
-        let star_count = bytes.iter().filter(|&&b| b == b'*').take(4).count();
-        let under_count = bytes.iter().filter(|&&b| b == b'_').take(4).count();
+        let mut stars: u8 = 0;
+        let mut unders: u8 = 0;
+        for &b in bytes {
+            if b == b'*' {
+                stars += 1;
+                if stars >= 4 && unders >= 4 {
+                    break;
+                }
+            } else if b == b'_' {
+                unders += 1;
+                if stars >= 4 && unders >= 4 {
+                    break;
+                }
+            }
+        }
         Self {
-            star: DelimiterAvail::from_count(star_count),
-            under: DelimiterAvail::from_count(under_count),
+            star: DelimiterAvail::from_count(stars as usize),
+            under: DelimiterAvail::from_count(unders as usize),
         }
     }
 
@@ -144,7 +157,7 @@ impl<'src> Inline<'src> {
 
             // Image: ![alt](url)
             if b == SpecialChar::ExclamationMark
-                && bytes.get(i + 1) == Some(SpecialChar::OpenBracket.as_ref())
+                && bytes.get(i + 1).copied() == Some(SpecialChar::OpenBracket.as_byte())
                 && let Some((alt, url, end)) = Self::try_parse_bracket_paren(input, bytes, i + 1)
             {
                 if plain_start < i {
@@ -236,7 +249,7 @@ impl<'src> Inline<'src> {
         bytes: &[u8],
         start: usize,
     ) -> Option<(&'src str, &'src str, usize)> {
-        if bytes.get(start) != Some(SpecialChar::OpenBracket.as_ref()) {
+        if bytes.get(start).copied() != Some(SpecialChar::OpenBracket.as_byte()) {
             return None;
         }
 
@@ -244,28 +257,26 @@ impl<'src> Inline<'src> {
         let mut depth = 0u32;
         let mut bracket_end = None;
         let mut j = bracket_start;
-        while j < bytes.len() {
-            match bytes.get(j).and_then(|&b| SpecialChar::from_byte(b)) {
-                Some(SpecialChar::Backslash) => {
-                    j += 2;
-                    continue;
+        while let Some(&b) = bytes.get(j) {
+            if b == SpecialChar::Backslash {
+                j += 2;
+                continue;
+            }
+            if b == SpecialChar::OpenBracket {
+                depth += 1;
+            } else if b == SpecialChar::CloseBracket {
+                if depth == 0 {
+                    bracket_end = Some(j);
+                    break;
                 }
-                Some(SpecialChar::OpenBracket) => depth += 1,
-                Some(SpecialChar::CloseBracket) => {
-                    if depth == 0 {
-                        bracket_end = Some(j);
-                        break;
-                    }
-                    depth -= 1;
-                }
-                _ => {}
+                depth -= 1;
             }
             j += 1;
         }
         let bracket_end = bracket_end?;
 
         let paren_pos = bracket_end + 1;
-        if bytes.get(paren_pos) != Some(SpecialChar::OpenParen.as_ref()) {
+        if bytes.get(paren_pos).copied() != Some(SpecialChar::OpenParen.as_byte()) {
             return None;
         }
 
@@ -273,21 +284,19 @@ impl<'src> Inline<'src> {
         let mut depth = 0u32;
         let mut paren_end = None;
         let mut j = paren_start;
-        while j < bytes.len() {
-            match bytes.get(j).and_then(|&b| SpecialChar::from_byte(b)) {
-                Some(SpecialChar::Backslash) => {
-                    j += 2;
-                    continue;
+        while let Some(&b) = bytes.get(j) {
+            if b == SpecialChar::Backslash {
+                j += 2;
+                continue;
+            }
+            if b == SpecialChar::OpenParen {
+                depth += 1;
+            } else if b == SpecialChar::CloseParen {
+                if depth == 0 {
+                    paren_end = Some(j);
+                    break;
                 }
-                Some(SpecialChar::OpenParen) => depth += 1,
-                Some(SpecialChar::CloseParen) => {
-                    if depth == 0 {
-                        paren_end = Some(j);
-                        break;
-                    }
-                    depth -= 1;
-                }
-                _ => {}
+                depth -= 1;
             }
             j += 1;
         }
@@ -307,7 +316,6 @@ impl<'src> Inline<'src> {
         marker: u8,
         count: usize,
     ) -> Option<(&'src str, usize)> {
-        // Caller already verified opening markers exist; skip straight to inner content
         let inner_start = start + count;
         let &first_inner = bytes.get(inner_start)?;
 
@@ -316,20 +324,19 @@ impl<'src> Inline<'src> {
         }
 
         let mut i = inner_start;
-        while i < bytes.len() {
-            // Skip backslash-escaped bytes
-            if bytes.get(i) == Some(SpecialChar::Backslash.as_ref()) {
+        while let Some(&b) = bytes.get(i) {
+            if b == SpecialChar::Backslash {
                 i += 2;
                 continue;
             }
 
-            // Skip to next occurrence of the marker byte
-            match bytes.get(i..)?.iter().position(|&b| b == marker) {
-                Some(offset) => i += offset,
-                None => return None,
+            if b != marker {
+                i += 1;
+                continue;
             }
 
-            let all_match = (0..count).all(|j| bytes.get(i + j) == Some(&marker));
+            // Found a marker byte — check for a valid closing run.
+            let all_match = (1..count).all(|j| bytes.get(i + j) == Some(&marker));
             if all_match
                 && i > inner_start
                 && bytes.get(i - 1).is_some_and(|b| !b.is_ascii_whitespace())
