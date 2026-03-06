@@ -459,4 +459,50 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn test_parse_readme_file() {
+        let md = MarkdownFile::from_file("README.md").unwrap();
+        assert_eq!(
+            md.sections,
+            vec![
+                Section::Heading { level: 1, text: "marki".into() },
+                Section::Paragraph {
+                    text: "A simple Rust library for parsing markdown files into structured sections.".into(),
+                },
+                Section::Heading { level: 2, text: "Features".into() },
+                Section::UnorderedList {
+                    items: vec![
+                        "Parse markdown from strings or files".into(),
+                        "Type-safe representation of markdown elements".into(),
+                        "Zero-copy parsing with fold-based state machine".into(),
+                    ],
+                },
+                Section::Heading { level: 2, text: "Supported Sections".into() },
+                Section::UnorderedList {
+                    items: vec![
+                        "Headings (levels 1-6)".into(),
+                        "Paragraphs".into(),
+                        "Code blocks (with optional language)".into(),
+                        "Unordered lists".into(),
+                        "Ordered lists".into(),
+                        "Blockquotes".into(),
+                        "Horizontal rules".into(),
+                    ],
+                },
+                Section::Heading { level: 2, text: "Usage".into() },
+                Section::CodeBlock {
+                    language: Some("rust".into()),
+                    code: "use marki::MarkdownFile;\n\nlet md: MarkdownFile = \"# Hello\\n\\nWorld\".parse().unwrap();".into(),
+                },
+                Section::OrderedList {
+                    items: vec![
+                        "Parse a string".into(),
+                        "Read a file".into(),
+                        "Inspect sections".into(),
+                    ],
+                },
+            ]
+        );
+    }
 }
