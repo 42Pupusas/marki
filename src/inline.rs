@@ -239,7 +239,7 @@ impl<'src> InlineBuf<'src> {
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn push(&mut self, item: Inline<'src>) {
-        if self.overflow.is_empty() && self.len < STACK_CAP {
+        if self.len < STACK_CAP {
             self.stack[self.len] = MaybeUninit::new(item);
             self.len += 1;
         } else {
@@ -288,7 +288,8 @@ impl<'src> InlineBuf<'src> {
 #[allow(clippy::inline_always)]
 #[inline(always)]
 pub fn pool_offset(pool_len: usize) -> u32 {
-    u32::try_from(pool_len).expect("inline pool exceeded u32::MAX elements")
+    debug_assert!(pool_len <= u32::MAX as usize);
+    pool_len as u32
 }
 
 impl<'src> Inline<'src> {
@@ -826,11 +827,11 @@ impl<'src> Inline<'src> {
         bytes: &[u8],
         start: usize,
     ) -> Option<(&'src str, usize)> {
-        let backtick_count = bytes
-            .get(start..)?
-            .iter()
-            .take_while(|&&b| b == SpecialChar::Backtick)
-            .count();
+        let backtick = SpecialChar::Backtick.byte();
+        let mut backtick_count = 0;
+        while bytes.get(start + backtick_count).copied() == Some(backtick) {
+            backtick_count += 1;
+        }
         if backtick_count == 0 {
             return None;
         }
@@ -839,14 +840,13 @@ impl<'src> Inline<'src> {
         let mut i = content_start;
         while i < bytes.len() {
             // SIMD-accelerated backtick scan.
-            i = find_byte(bytes, i, SpecialChar::Backtick.byte())?;
+            i = find_byte(bytes, i, backtick)?;
 
             // Count consecutive backticks
-            let close_count = bytes
-                .get(i..)?
-                .iter()
-                .take_while(|&&b| b == SpecialChar::Backtick)
-                .count();
+            let mut close_count = 0;
+            while bytes.get(i + close_count).copied() == Some(backtick) {
+                close_count += 1;
+            }
 
             if close_count == backtick_count {
                 // CommonMark §6.1: strip one leading and one trailing space

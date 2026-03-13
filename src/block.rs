@@ -4,6 +4,16 @@ use crate::special_char::SpecialChar;
 use crate::inline::pool_offset;
 use crate::{Inline, MarkdownFile};
 
+/// Mutable parsing context that bundles the output vectors, reducing the number
+/// of parameters threaded through every `fold_*` call.
+struct ParseCtx<'src> {
+    input: &'src str,
+    bytes: &'src [u8],
+    sections: Vec<Section<'src>>,
+    pool: Vec<Inline<'src>>,
+    span_pool: Vec<InlineSpan>,
+}
+
 enum Accumulator<'src> {
     Empty,
     InCodeBlock {
@@ -89,14 +99,9 @@ impl<'src> Accumulator<'src> {
         }
     }
 
-    fn flush_into(
-        self,
-        sections: &mut Vec<Section<'src>>,
-        pool: &mut Vec<Inline<'src>>,
-        span_pool: &mut Vec<InlineSpan>,
-    ) {
-        if let Some(section) = self.flush(pool, span_pool) {
-            sections.push(section);
+    fn flush_into(self, ctx: &mut ParseCtx<'src>) {
+        if let Some(section) = self.flush(&mut ctx.pool, &mut ctx.span_pool) {
+            ctx.sections.push(section);
         }
     }
 }
@@ -137,10 +142,14 @@ impl<'src> MarkdownFile<'src> {
     #[must_use]
     pub fn parse(input: &'src str) -> Self {
         let bytes = input.as_bytes();
-        // Rough heuristic: ~50 bytes per section on average.
-        let mut sections = Vec::with_capacity(input.len() / 50 + 1);
-        let mut pool = Vec::with_capacity(input.len() / 20);
-        let mut span_pool = Vec::with_capacity(input.len() / 100 + 1);
+        let mut ctx = ParseCtx {
+            input,
+            bytes,
+            // Rough heuristic: ~50 bytes per section on average.
+            sections: Vec::with_capacity(input.len() / 50 + 1),
+            pool: Vec::with_capacity(input.len() / 20),
+            span_pool: Vec::with_capacity(input.len() / 100 + 1),
+        };
         let mut acc = Accumulator::Empty;
         let mut pos = 0;
 
@@ -149,18 +158,26 @@ impl<'src> MarkdownFile<'src> {
 
             // Fast-path: when we detect a code fence opening, scan ahead for
             // the closing fence in one shot instead of processing line-by-line.
+            // CommonMark §4.5: a code fence can be indented 0-3 spaces, so we
+            // only need to check if a backtick appears within the first 4 bytes.
             if !matches!(acc, Accumulator::InCodeBlock { .. }) {
-                let first = bytes.get(pos).copied().unwrap_or(b' ');
-                if first == SpecialChar::Backtick.byte() || first.is_ascii_whitespace() {
+                let first = bytes.get(pos).copied().unwrap_or(SpecialChar::Space.byte());
+                let backtick = SpecialChar::Backtick.byte();
+                if first == backtick
+                    || (first == SpecialChar::Space
+                        && bytes[pos..line_end]
+                            .get(..4)
+                            .is_some_and(|w| w.contains(&backtick)))
+                {
                     let fence_len = Self::code_fence_len_bytes(&bytes[pos..line_end]);
                     if fence_len > 0 {
                         let language =
                             Self::extract_code_language_bytes(input, &bytes[pos..line_end]);
-                        acc.flush_into(&mut sections, &mut pool, &mut span_pool);
+                        acc.flush_into(&mut ctx);
                         let content_start = line_end + 1;
                         let (code, resume) =
                             Self::scan_code_block_fast(input, bytes, content_start, fence_len);
-                        sections.push(Section::CodeBlock { language, code });
+                        ctx.sections.push(Section::CodeBlock { language, code });
                         pos = resume;
                         acc = Accumulator::Empty;
                         continue;
@@ -168,24 +185,15 @@ impl<'src> MarkdownFile<'src> {
                 }
             }
 
-            acc = Self::fold_line(
-                input,
-                bytes,
-                &mut sections,
-                &mut pool,
-                &mut span_pool,
-                acc,
-                pos,
-                line_end,
-            );
+            acc = ctx.fold_line(acc, pos, line_end);
             pos = line_end + 1;
         }
 
-        acc.flush_into(&mut sections, &mut pool, &mut span_pool);
+        acc.flush_into(&mut ctx);
         Self {
-            sections,
-            pool,
-            span_pool,
+            sections: ctx.sections,
+            pool: ctx.pool,
+            span_pool: ctx.span_pool,
         }
     }
 
@@ -228,90 +236,6 @@ impl<'src> MarkdownFile<'src> {
         (code, bytes.len())
     }
 
-    /// Process one line given as byte range `[pos..line_end)`.
-    /// Operates on `&[u8]` throughout; converts to `&str` only when storing.
-    #[allow(clippy::too_many_arguments)]
-    fn fold_line(
-        input: &'src str,
-        bytes: &[u8],
-        sections: &mut Vec<Section<'src>>,
-        pool: &mut Vec<Inline<'src>>,
-        span_pool: &mut Vec<InlineSpan>,
-        acc: Accumulator<'src>,
-        pos: usize,
-        line_end: usize,
-    ) -> Accumulator<'src> {
-        if let Accumulator::InCodeBlock {
-            language,
-            content,
-            fence_len,
-        } = acc
-        {
-            return Self::fold_code_block(
-                input, sections, language, content, fence_len, pos, line_end,
-            );
-        }
-
-        let first = bytes.get(pos).copied().unwrap_or(b' ');
-
-        if first.is_ascii_whitespace() && is_blank_line(bytes, pos, line_end) {
-            acc.flush_into(sections, pool, span_pool);
-            return Accumulator::Empty;
-        }
-
-        // Code fence opening is already handled by parse()'s fast-path before
-        // fold_line is called, so no need to re-check here.
-
-        // ATX headings (CommonMark §4.2): only if line starts with '#'.
-        if first == SpecialChar::Hash.byte()
-            && let Some(section) =
-                Self::try_parse_heading_bytes(input, &bytes[pos..line_end], pos, pool)
-        {
-            acc.flush_into(sections, pool, span_pool);
-            sections.push(section);
-            return Accumulator::Empty;
-        }
-
-        Self::fold_block_element(input, bytes, sections, pool, span_pool, acc, pos, line_end)
-    }
-
-    #[inline]
-    fn fold_code_block(
-        input: &'src str,
-        sections: &mut Vec<Section<'src>>,
-        language: Option<&'src str>,
-        content: Option<&'src str>,
-        fence_len: usize,
-        pos: usize,
-        line_end: usize,
-    ) -> Accumulator<'src> {
-        // Guard: only check for closing fence if first byte could be a backtick
-        // or whitespace (indented fence). Avoids calling code_fence_len on
-        // every code block content line.
-        let bytes = input.as_bytes();
-        let first = bytes.get(pos).copied().unwrap_or(0);
-        if (first == SpecialChar::Backtick.byte() || first.is_ascii_whitespace())
-            && Self::code_fence_len_bytes(&bytes[pos..line_end]) >= fence_len
-        {
-            sections.push(Section::CodeBlock {
-                language,
-                code: content.unwrap_or(""),
-            });
-            return Accumulator::Empty;
-        }
-        // SAFETY: pos and line_end are at newline boundaries.
-        let line_str = unsafe { str_from_range(input, pos, line_end) };
-        let content = content.map_or(line_str, |existing| {
-            Self::merge_slices(input, existing, line_str)
-                .expect("merge_slices failed in code block: slices not from same input")
-        });
-        Accumulator::InCodeBlock {
-            language,
-            content: Some(content),
-            fence_len,
-        }
-    }
-
     /// Lookup table: true for bytes that could start a block-level element
     /// (blockquote, list marker, HR character, or digit for ordered lists).
     const COULD_START_BLOCK: [bool; 256] = {
@@ -328,195 +252,6 @@ impl<'src> MarkdownFile<'src> {
         }
         table
     };
-
-    #[inline]
-    #[allow(clippy::too_many_arguments)]
-    fn fold_block_element(
-        input: &'src str,
-        bytes: &[u8],
-        sections: &mut Vec<Section<'src>>,
-        pool: &mut Vec<Inline<'src>>,
-        span_pool: &mut Vec<InlineSpan>,
-        acc: Accumulator<'src>,
-        pos: usize,
-        line_end: usize,
-    ) -> Accumulator<'src> {
-        let line_bytes = &bytes[pos..line_end];
-
-        // Fast-path: if we're in a paragraph and the line can't start a block
-        // element, skip all the block-level checks and extend the paragraph.
-        if let Accumulator::InParagraph { .. } = acc
-            && !line_bytes.is_empty()
-            && !Self::COULD_START_BLOCK[line_bytes[0] as usize]
-        {
-            return Self::fold_paragraph(input, sections, pool, span_pool, acc, pos, line_end);
-        }
-
-        if line_bytes.first() == SpecialChar::GreaterThan {
-            // SAFETY: pos+1 is after '>', which is ASCII.
-            let content_start = pos + 1;
-            let content = if bytes.get(content_start) == SpecialChar::Space {
-                // SAFETY: pos+2 is after '> ', both ASCII.
-                unsafe { str_from_range(input, content_start + 1, line_end) }
-            } else {
-                unsafe { str_from_range(input, content_start, line_end) }
-            };
-            if let Accumulator::InBlockquote { mut lines } = acc {
-                lines.push(content);
-                return Accumulator::InBlockquote { lines };
-            }
-            acc.flush_into(sections, pool, span_pool);
-            return Accumulator::InBlockquote {
-                lines: vec_with_first(content),
-            };
-        }
-
-        // Blockquote lazy continuation (CommonMark §5.1): a non-blank line
-        // that doesn't start a new block-level construct continues the
-        // current blockquote.
-        let acc = if let Accumulator::InBlockquote { mut lines } = acc {
-            if !Self::is_horizontal_rule_bytes(line_bytes)
-                && Self::try_parse_heading_bytes(input, line_bytes, pos, pool).is_none()
-                && Self::code_fence_len_bytes(line_bytes) == 0
-                && Self::try_parse_unordered_item_bytes(line_bytes).is_none()
-                && Self::try_parse_ordered_item_bytes(line_bytes).is_none()
-            {
-                // SAFETY: pos and line_end are at newline boundaries.
-                lines.push(unsafe { str_from_range(input, pos, line_end) });
-                return Accumulator::InBlockquote { lines };
-            }
-            // Line starts a new block — flush the blockquote and fall through.
-            Accumulator::InBlockquote { lines }.flush_into(sections, pool, span_pool);
-            Accumulator::Empty
-        } else {
-            acc
-        };
-
-        // Horizontal rules (CommonMark §4.1): three or more -, *, or _
-        // characters (optionally with spaces) on a line by themselves.
-        if Self::is_horizontal_rule_bytes(line_bytes) {
-            acc.flush_into(sections, pool, span_pool);
-            sections.push(Section::HorizontalRule);
-            return Accumulator::Empty;
-        }
-
-        if let Some((marker, item_offset)) = Self::try_parse_unordered_item_bytes(line_bytes) {
-            // SAFETY: item_offset is after ASCII marker + space.
-            let item = unsafe { str_from_range(input, pos + item_offset, line_end) };
-            return Self::fold_unordered_list(sections, pool, span_pool, acc, marker, item);
-        }
-
-        if let Some((num, delim, item_offset)) = Self::try_parse_ordered_item_bytes(line_bytes) {
-            // SAFETY: item_offset is after ASCII digits + delimiter + space.
-            let item = unsafe { str_from_range(input, pos + item_offset, line_end) };
-            return Self::fold_ordered_list(sections, pool, span_pool, acc, num, delim, item);
-        }
-
-        Self::fold_paragraph(input, sections, pool, span_pool, acc, pos, line_end)
-    }
-
-    #[inline]
-    fn fold_unordered_list(
-        sections: &mut Vec<Section<'src>>,
-        pool: &mut Vec<Inline<'src>>,
-        span_pool: &mut Vec<InlineSpan>,
-        acc: Accumulator<'src>,
-        marker: SpecialChar,
-        item: &'src str,
-    ) -> Accumulator<'src> {
-        if let Accumulator::InUnorderedList {
-            marker: m,
-            mut items,
-        } = acc
-        {
-            if m == marker {
-                items.push(item);
-                return Accumulator::InUnorderedList { marker, items };
-            }
-            Accumulator::InUnorderedList { marker: m, items }
-                .flush_into(sections, pool, span_pool);
-            return Accumulator::InUnorderedList {
-                marker,
-                items: vec_with_first(item),
-            };
-        }
-        acc.flush_into(sections, pool, span_pool);
-        Accumulator::InUnorderedList {
-            marker,
-            items: vec_with_first(item),
-        }
-    }
-
-    #[inline]
-    fn fold_ordered_list(
-        sections: &mut Vec<Section<'src>>,
-        pool: &mut Vec<Inline<'src>>,
-        span_pool: &mut Vec<InlineSpan>,
-        acc: Accumulator<'src>,
-        num: u32,
-        delim: OrderedListDelimiter,
-        item: &'src str,
-    ) -> Accumulator<'src> {
-        if let Accumulator::InOrderedList {
-            start,
-            delimiter,
-            mut items,
-        } = acc
-        {
-            if delimiter == delim {
-                items.push(item);
-                return Accumulator::InOrderedList {
-                    start,
-                    delimiter,
-                    items,
-                };
-            }
-            Accumulator::InOrderedList {
-                start,
-                delimiter,
-                items,
-            }
-            .flush_into(sections, pool, span_pool);
-            return Accumulator::InOrderedList {
-                start: num,
-                delimiter: delim,
-                items: vec_with_first(item),
-            };
-        }
-        acc.flush_into(sections, pool, span_pool);
-        Accumulator::InOrderedList {
-            start: num,
-            delimiter: delim,
-            items: vec_with_first(item),
-        }
-    }
-
-    #[inline]
-    fn fold_paragraph(
-        input: &'src str,
-        sections: &mut Vec<Section<'src>>,
-        pool: &mut Vec<Inline<'src>>,
-        span_pool: &mut Vec<InlineSpan>,
-        acc: Accumulator<'src>,
-        pos: usize,
-        line_end: usize,
-    ) -> Accumulator<'src> {
-        // SAFETY: pos and line_end are at newline boundaries.
-        let line_str = unsafe { str_from_range(input, pos, line_end) };
-        if let Accumulator::InParagraph { content } = acc {
-            return Self::merge_slices(input, content, line_str).map_or_else(
-                || {
-                    sections.push(Section::Paragraph {
-                        content: Inline::parse(content, pool),
-                    });
-                    Accumulator::InParagraph { content: line_str }
-                },
-                |merged| Accumulator::InParagraph { content: merged },
-            );
-        }
-        acc.flush_into(sections, pool, span_pool);
-        Accumulator::InParagraph { content: line_str }
-    }
 
     // -----------------------------------------------------------------------
     // Byte-level classification helpers — no &str involved
@@ -585,21 +320,25 @@ impl<'src> MarkdownFile<'src> {
     /// (`CommonMark` §4.1): three or more matching `-`, `*`, or `_` characters,
     /// optionally separated by spaces, with nothing else on the line.
     fn is_horizontal_rule_bytes(line: &[u8]) -> bool {
-        let first = line.iter().find(|b| !b.is_ascii_whitespace());
-        let Some(&first_byte) = first else {
-            return false;
-        };
-        let Some(rule_char) = SpecialChar::from_byte(first_byte).filter(|sc| sc.is_rule_char())
-        else {
-            return false;
-        };
+        let mut rule_byte = 0u8;
         let mut count = 0u32;
         for &b in line {
-            if b == rule_char {
-                count += 1;
-            } else if !b.is_ascii_whitespace() {
+            if b.is_ascii_whitespace() {
+                continue;
+            }
+            if rule_byte == 0 {
+                if b != SpecialChar::Dash
+                    && b != SpecialChar::Asterisk
+                    && b != SpecialChar::Underscore
+                {
+                    return false;
+                }
+                rule_byte = b;
+            }
+            if b != rule_byte {
                 return false;
             }
+            count += 1;
         }
         count >= 3
     }
@@ -711,5 +450,276 @@ impl<'src> MarkdownFile<'src> {
         // SAFETY: a and b are subslices of base (verified above), so the
         // range a_start..b_end is valid UTF-8 within base.
         Some(unsafe { str_from_range(base, a_start - base_start, b_end - base_start) })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ParseCtx methods — line-level fold logic
+// ---------------------------------------------------------------------------
+
+impl<'src> ParseCtx<'src> {
+    /// Process one line given as byte range `[pos..line_end)`.
+    /// Operates on `&[u8]` throughout; converts to `&str` only when storing.
+    fn fold_line(
+        &mut self,
+        acc: Accumulator<'src>,
+        pos: usize,
+        line_end: usize,
+    ) -> Accumulator<'src> {
+        if let Accumulator::InCodeBlock {
+            language,
+            content,
+            fence_len,
+        } = acc
+        {
+            return self.fold_code_block(language, content, fence_len, pos, line_end);
+        }
+
+        let first = self.bytes.get(pos).copied().unwrap_or(SpecialChar::Space.byte());
+
+        if first.is_ascii_whitespace() && is_blank_line(self.bytes, pos, line_end) {
+            acc.flush_into(self);
+            return Accumulator::Empty;
+        }
+
+        // Code fence opening is already handled by parse()'s fast-path before
+        // fold_line is called, so no need to re-check here.
+
+        // ATX headings (CommonMark §4.2): only if line starts with '#'.
+        if first == SpecialChar::Hash.byte()
+            && let Some(section) = MarkdownFile::try_parse_heading_bytes(
+                self.input,
+                &self.bytes[pos..line_end],
+                pos,
+                &mut self.pool,
+            )
+        {
+            acc.flush_into(self);
+            self.sections.push(section);
+            return Accumulator::Empty;
+        }
+
+        self.fold_block_element(acc, pos, line_end)
+    }
+
+    #[inline]
+    fn fold_code_block(
+        &mut self,
+        language: Option<&'src str>,
+        content: Option<&'src str>,
+        fence_len: usize,
+        pos: usize,
+        line_end: usize,
+    ) -> Accumulator<'src> {
+        // Guard: only check for closing fence if first byte could be a backtick
+        // or whitespace (indented fence). Avoids calling code_fence_len on
+        // every code block content line.
+        let first = self.bytes.get(pos).copied().unwrap_or(0);
+        if (first == SpecialChar::Backtick.byte() || first.is_ascii_whitespace())
+            && MarkdownFile::code_fence_len_bytes(&self.bytes[pos..line_end]) >= fence_len
+        {
+            self.sections.push(Section::CodeBlock {
+                language,
+                code: content.unwrap_or(""),
+            });
+            return Accumulator::Empty;
+        }
+        // SAFETY: pos and line_end are at newline boundaries.
+        let line_str = unsafe { str_from_range(self.input, pos, line_end) };
+        let content = content.map_or(line_str, |existing| {
+            MarkdownFile::merge_slices(self.input, existing, line_str)
+                .expect("merge_slices failed in code block: slices not from same input")
+        });
+        Accumulator::InCodeBlock {
+            language,
+            content: Some(content),
+            fence_len,
+        }
+    }
+
+    #[inline]
+    fn fold_block_element(
+        &mut self,
+        acc: Accumulator<'src>,
+        pos: usize,
+        line_end: usize,
+    ) -> Accumulator<'src> {
+        let line_bytes = &self.bytes[pos..line_end];
+
+        // Fast-path: if we're in a paragraph and the line can't start a block
+        // element, skip all the block-level checks and extend the paragraph.
+        if let Accumulator::InParagraph { .. } = acc
+            && !line_bytes.is_empty()
+            && !MarkdownFile::<'src>::COULD_START_BLOCK[line_bytes[0] as usize]
+        {
+            return self.fold_paragraph(acc, pos, line_end);
+        }
+
+        if line_bytes.first() == SpecialChar::GreaterThan {
+            // SAFETY: pos+1 is after '>', which is ASCII.
+            let content_start = pos + 1;
+            let content = if self.bytes.get(content_start) == SpecialChar::Space {
+                // SAFETY: pos+2 is after '> ', both ASCII.
+                unsafe { str_from_range(self.input, content_start + 1, line_end) }
+            } else {
+                unsafe { str_from_range(self.input, content_start, line_end) }
+            };
+            if let Accumulator::InBlockquote { mut lines } = acc {
+                lines.push(content);
+                return Accumulator::InBlockquote { lines };
+            }
+            acc.flush_into(self);
+            return Accumulator::InBlockquote {
+                lines: vec_with_first(content),
+            };
+        }
+
+        // Blockquote lazy continuation (CommonMark §5.1): a non-blank line
+        // that doesn't start a new block-level construct continues the
+        // current blockquote.
+        let acc = if let Accumulator::InBlockquote { mut lines } = acc {
+            if !MarkdownFile::is_horizontal_rule_bytes(line_bytes)
+                && MarkdownFile::try_parse_heading_bytes(
+                    self.input,
+                    line_bytes,
+                    pos,
+                    &mut self.pool,
+                )
+                .is_none()
+                && MarkdownFile::<'src>::code_fence_len_bytes(line_bytes) == 0
+                && MarkdownFile::<'src>::try_parse_unordered_item_bytes(line_bytes).is_none()
+                && MarkdownFile::<'src>::try_parse_ordered_item_bytes(line_bytes).is_none()
+            {
+                // SAFETY: pos and line_end are at newline boundaries.
+                lines.push(unsafe { str_from_range(self.input, pos, line_end) });
+                return Accumulator::InBlockquote { lines };
+            }
+            // Line starts a new block — flush the blockquote and fall through.
+            Accumulator::InBlockquote { lines }.flush_into(self);
+            Accumulator::Empty
+        } else {
+            acc
+        };
+
+        // Horizontal rules (CommonMark §4.1): three or more -, *, or _
+        // characters (optionally with spaces) on a line by themselves.
+        if MarkdownFile::is_horizontal_rule_bytes(line_bytes) {
+            acc.flush_into(self);
+            self.sections.push(Section::HorizontalRule);
+            return Accumulator::Empty;
+        }
+
+        if let Some((marker, item_offset)) =
+            MarkdownFile::<'src>::try_parse_unordered_item_bytes(line_bytes)
+        {
+            // SAFETY: item_offset is after ASCII marker + space.
+            let item = unsafe { str_from_range(self.input, pos + item_offset, line_end) };
+            return self.fold_unordered_list(acc, marker, item);
+        }
+
+        if let Some((num, delim, item_offset)) =
+            MarkdownFile::<'src>::try_parse_ordered_item_bytes(line_bytes)
+        {
+            // SAFETY: item_offset is after ASCII digits + delimiter + space.
+            let item = unsafe { str_from_range(self.input, pos + item_offset, line_end) };
+            return self.fold_ordered_list(acc, num, delim, item);
+        }
+
+        self.fold_paragraph(acc, pos, line_end)
+    }
+
+    #[inline]
+    fn fold_unordered_list(
+        &mut self,
+        acc: Accumulator<'src>,
+        marker: SpecialChar,
+        item: &'src str,
+    ) -> Accumulator<'src> {
+        if let Accumulator::InUnorderedList {
+            marker: m,
+            mut items,
+        } = acc
+        {
+            if m == marker {
+                items.push(item);
+                return Accumulator::InUnorderedList { marker, items };
+            }
+            Accumulator::InUnorderedList { marker: m, items }.flush_into(self);
+            return Accumulator::InUnorderedList {
+                marker,
+                items: vec_with_first(item),
+            };
+        }
+        acc.flush_into(self);
+        Accumulator::InUnorderedList {
+            marker,
+            items: vec_with_first(item),
+        }
+    }
+
+    #[inline]
+    fn fold_ordered_list(
+        &mut self,
+        acc: Accumulator<'src>,
+        num: u32,
+        delim: OrderedListDelimiter,
+        item: &'src str,
+    ) -> Accumulator<'src> {
+        if let Accumulator::InOrderedList {
+            start,
+            delimiter,
+            mut items,
+        } = acc
+        {
+            if delimiter == delim {
+                items.push(item);
+                return Accumulator::InOrderedList {
+                    start,
+                    delimiter,
+                    items,
+                };
+            }
+            Accumulator::InOrderedList {
+                start,
+                delimiter,
+                items,
+            }
+            .flush_into(self);
+            return Accumulator::InOrderedList {
+                start: num,
+                delimiter: delim,
+                items: vec_with_first(item),
+            };
+        }
+        acc.flush_into(self);
+        Accumulator::InOrderedList {
+            start: num,
+            delimiter: delim,
+            items: vec_with_first(item),
+        }
+    }
+
+    #[inline]
+    fn fold_paragraph(
+        &mut self,
+        acc: Accumulator<'src>,
+        pos: usize,
+        line_end: usize,
+    ) -> Accumulator<'src> {
+        // SAFETY: pos and line_end are at newline boundaries.
+        let line_str = unsafe { str_from_range(self.input, pos, line_end) };
+        if let Accumulator::InParagraph { content } = acc {
+            return MarkdownFile::merge_slices(self.input, content, line_str).map_or_else(
+                || {
+                    self.sections.push(Section::Paragraph {
+                        content: Inline::parse(content, &mut self.pool),
+                    });
+                    Accumulator::InParagraph { content: line_str }
+                },
+                |merged| Accumulator::InParagraph { content: merged },
+            );
+        }
+        acc.flush_into(self);
+        Accumulator::InParagraph { content: line_str }
     }
 }
