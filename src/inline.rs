@@ -57,6 +57,18 @@ impl CharClass {
             Self::Other
         }
     }
+
+    /// Fast classification for ASCII bytes, avoiding UTF-8 decode.
+    #[inline]
+    const fn of_ascii(b: u8) -> Self {
+        if b.is_ascii_whitespace() {
+            Self::Whitespace
+        } else if b.is_ascii_punctuation() {
+            Self::Punctuation
+        } else {
+            Self::Other
+        }
+    }
 }
 
 /// Check if a character is Unicode punctuation (general categories P or S)
@@ -185,6 +197,15 @@ impl<'src> Inline<'src> {
     #[must_use]
     pub fn parse(input: &'src str) -> Vec<Self> {
         let bytes = input.as_bytes();
+        // Fast path: if no special bytes exist, the entire input is plain text.
+        // Avoids Vec preallocation, emphasis pre-scan, and the full parse loop.
+        if !bytes.iter().any(|&b| SPECIAL[b as usize]) {
+            return if input.is_empty() {
+                Vec::new()
+            } else {
+                vec![Self::Text(input)]
+            };
+        }
         let emph = if bytes.len() < Self::EMPH_SCAN_THRESHOLD {
             EmphasisState::assume_both()
         } else {
@@ -208,6 +229,13 @@ impl<'src> Inline<'src> {
     /// allocations when building blockquotes or list items.
     pub fn parse_into(input: &'src str, out: &mut Vec<Self>) {
         let bytes = input.as_bytes();
+        // Fast path: no special bytes means plain text, skip the full parser.
+        if !bytes.iter().any(|&b| SPECIAL[b as usize]) {
+            if !input.is_empty() {
+                out.push(Self::Text(input));
+            }
+            return;
+        }
         let emph = if bytes.len() < Self::EMPH_SCAN_THRESHOLD {
             EmphasisState::assume_both()
         } else {
@@ -225,12 +253,15 @@ impl<'src> Inline<'src> {
         let mut plain_start = 0;
         let mut i = 0;
 
-        while let Some(&b) = bytes.get(i) {
-            // Fast-skip non-special bytes via lookup table
-            if !SPECIAL[b as usize] {
-                i += 1;
-                continue;
+        loop {
+            // Scan forward to the next special byte in a tight loop that
+            // LLVM can auto-vectorize, avoiding per-byte dispatch overhead.
+            let next = bytes[i..].iter().position(|&b| SPECIAL[b as usize]);
+            match next {
+                Some(offset) => i += offset,
+                None => break,
             }
+            let b = bytes[i];
 
             if b == SpecialChar::Newline {
                 Self::emit_line_break(input, bytes, plain_start, i, result);
@@ -361,15 +392,10 @@ impl<'src> Inline<'src> {
         b: u8,
         emph: &mut EmphasisState,
     ) -> Option<(Self, usize)> {
-        let is_emphasis = matches!(
-            SpecialChar::from_byte(b),
-            Some(sc) if sc.is_emphasis_char()
-        );
-        if !is_emphasis {
+        let is_star = b == SpecialChar::Asterisk;
+        if !is_star && b != SpecialChar::Underscore {
             return None;
         }
-
-        let is_star = b == SpecialChar::Asterisk;
         let avail = emph.avail_mut(is_star);
 
         // Bold: ** or __
@@ -528,9 +554,15 @@ impl<'src> Inline<'src> {
 
     /// Classify the character before a position for flanking delimiter rules.
     /// Returns `CharClass::Whitespace` at start-of-input (treated as if preceded by newline).
+    #[inline]
     fn char_class_before(bytes: &[u8], pos: usize) -> CharClass {
         if pos == 0 {
             return CharClass::Whitespace;
+        }
+        let b = bytes[pos - 1];
+        // Fast path: ASCII bytes need no UTF-8 decoding.
+        if b < 0x80 {
+            return CharClass::of_ascii(b);
         }
         // Walk back to find UTF-8 codepoint start.
         let mut start = pos - 1;
@@ -546,9 +578,15 @@ impl<'src> Inline<'src> {
 
     /// Classify the character after a position for flanking delimiter rules.
     /// Returns `CharClass::Whitespace` at end-of-input (treated as if followed by newline).
+    #[inline]
     fn char_class_after(bytes: &[u8], pos: usize) -> CharClass {
         if pos >= bytes.len() {
             return CharClass::Whitespace;
+        }
+        let b = bytes[pos];
+        // Fast path: ASCII bytes need no UTF-8 decoding.
+        if b < 0x80 {
+            return CharClass::of_ascii(b);
         }
         // Decode the UTF-8 codepoint starting at `pos`.
         let ch = std::str::from_utf8(&bytes[pos..])

@@ -84,9 +84,11 @@ impl<'src> MarkdownFile<'src> {
         // Rough heuristic: ~50 bytes per section on average.
         let mut sections = Vec::with_capacity(input.len() / 50 + 1);
         let mut acc = Accumulator::Empty;
+
         for line in input.lines() {
             acc = Self::fold_line(input, &mut sections, acc, line);
         }
+
         acc.flush_into(&mut sections);
         Self { sections }
     }
@@ -106,27 +108,37 @@ impl<'src> MarkdownFile<'src> {
             return Self::fold_code_block(input, sections, language, content, fence_len, line);
         }
 
-        if line.trim().is_empty() {
+        let bytes = line.as_bytes();
+        let first = bytes.first().copied().unwrap_or(b' ');
+
+        if first.is_ascii_whitespace() && line.trim().is_empty() {
             acc.flush_into(sections);
             return Accumulator::Empty;
         }
 
         // Code fences (CommonMark §4.5): 3+ backticks open a fenced code block.
-        let fence_len = Self::code_fence_len(line);
-        if fence_len > 0 {
-            let language = Self::extract_code_language(line, fence_len);
-            acc.flush_into(sections);
-            return Accumulator::InCodeBlock {
-                language,
-                content: None,
-                fence_len,
-            };
+        // Guard: only worth checking if the first byte is a backtick or
+        // whitespace (indented fence).
+        if first == SpecialChar::Backtick.byte() || first.is_ascii_whitespace() {
+            let fence_len = Self::code_fence_len(line);
+            if fence_len > 0 {
+                let language = Self::extract_code_language(line, fence_len);
+                acc.flush_into(sections);
+                return Accumulator::InCodeBlock {
+                    language,
+                    content: None,
+                    fence_len,
+                };
+            }
         }
 
-        if let Some(section) = Self::try_parse_heading(line) {
-            acc.flush_into(sections);
-            sections.push(section);
-            return Accumulator::Empty;
+        // ATX headings (CommonMark §4.2): only if line starts with '#'.
+        if first == SpecialChar::Hash.byte() {
+            if let Some(section) = Self::try_parse_heading(line) {
+                acc.flush_into(sections);
+                sections.push(section);
+                return Accumulator::Empty;
+            }
         }
 
         Self::fold_block_element(input, sections, acc, line)
@@ -141,7 +153,13 @@ impl<'src> MarkdownFile<'src> {
         fence_len: usize,
         line: &'src str,
     ) -> Accumulator<'src> {
-        if Self::code_fence_len(line) >= fence_len {
+        // Guard: only check for closing fence if first byte could be a backtick
+        // or whitespace (indented fence). Avoids calling code_fence_len on
+        // every code block content line.
+        let first = line.as_bytes().first().copied().unwrap_or(0);
+        if (first == SpecialChar::Backtick.byte() || first.is_ascii_whitespace())
+            && Self::code_fence_len(line) >= fence_len
+        {
             sections.push(Section::CodeBlock {
                 language,
                 code: content.unwrap_or(""),
@@ -159,21 +177,22 @@ impl<'src> MarkdownFile<'src> {
         }
     }
 
-    /// Returns true if the first byte of `line` could start a block-level
-    /// element (blockquote, list marker, or HR character). Used to fast-path
-    /// paragraph continuations.
-    const fn could_start_block(first: u8) -> bool {
-        matches!(
-            SpecialChar::from_byte(first),
-            Some(
-                SpecialChar::GreaterThan
-                    | SpecialChar::Dash
-                    | SpecialChar::Asterisk
-                    | SpecialChar::Plus
-                    | SpecialChar::Underscore
-            )
-        ) || first.is_ascii_digit()
-    }
+    /// Lookup table: true for bytes that could start a block-level element
+    /// (blockquote, list marker, HR character, or digit for ordered lists).
+    const COULD_START_BLOCK: [bool; 256] = {
+        let mut table = [false; 256];
+        table[SpecialChar::GreaterThan.byte() as usize] = true;
+        table[SpecialChar::Dash.byte() as usize] = true;
+        table[SpecialChar::Asterisk.byte() as usize] = true;
+        table[SpecialChar::Plus.byte() as usize] = true;
+        table[SpecialChar::Underscore.byte() as usize] = true;
+        let mut d = b'0';
+        while d <= b'9' {
+            table[d as usize] = true;
+            d += 1;
+        }
+        table
+    };
 
     #[inline]
     fn fold_block_element(
@@ -186,7 +205,7 @@ impl<'src> MarkdownFile<'src> {
         // element, skip all the block-level checks and extend the paragraph.
         if let Accumulator::InParagraph { .. } = acc
             && let Some(&first) = line.as_bytes().first()
-            && !Self::could_start_block(first)
+            && !Self::COULD_START_BLOCK[first as usize]
         {
             return Self::fold_paragraph(input, sections, acc, line);
         }
@@ -318,22 +337,26 @@ impl<'src> MarkdownFile<'src> {
     /// Returns the fence length (number of backticks) if the line is a valid
     /// code fence (`CommonMark` §4.5), or 0 if it is not. A valid fence has 3+
     /// backticks with no backticks in the info string.
+    #[inline]
     fn code_fence_len(line: &str) -> usize {
         let bytes = line.as_bytes();
+        // Skip leading whitespace.
+        let mut first = 0;
+        while first < bytes.len() && bytes[first].is_ascii_whitespace() {
+            first += 1;
+        }
         // Quick reject: first non-whitespace byte must be a backtick.
-        let first = bytes
-            .iter()
-            .position(|b| !b.is_ascii_whitespace())
-            .unwrap_or(0);
-        if bytes.get(first) != SpecialChar::Backtick {
+        let backtick = SpecialChar::Backtick.byte();
+        if first >= bytes.len() || bytes[first] != backtick {
             return 0;
         }
         // Count backticks directly from the offset we already found.
-        let len = bytes[first..]
-            .iter()
-            .take_while(|&&b| b == SpecialChar::Backtick)
-            .count();
-        if len >= 3 && !bytes[first + len..].contains(&SpecialChar::Backtick.byte()) {
+        let mut end = first + 1;
+        while end < bytes.len() && bytes[end] == backtick {
+            end += 1;
+        }
+        let len = end - first;
+        if len >= 3 && !bytes[end..].contains(&backtick) {
             len
         } else {
             0
