@@ -78,8 +78,14 @@ impl SpecialChar {
     #[inline]
     #[must_use]
     pub fn count_leading(self, s: &str) -> usize {
+        self.count_leading_bytes(s.as_bytes())
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn count_leading_bytes(self, bytes: &[u8]) -> usize {
         let byte = self.byte();
-        s.as_bytes().iter().take_while(|&&b| b == byte).count()
+        bytes.iter().take_while(|&&b| b == byte).count()
     }
 }
 
