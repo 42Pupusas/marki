@@ -153,7 +153,7 @@ fn count_leading_byte(bytes: &[u8], needle: u8) -> usize {
 /// Expects leading indentation to already be stripped by the caller.
 fn code_fence_opening(bytes: &[u8]) -> Option<(u8, usize)> {
     let &first = bytes.first()?;
-    if first != SpecialChar::Backtick && first != b'~' {
+    if first != SpecialChar::Backtick && first != SpecialChar::Tilde {
         return None;
     }
     let len = count_leading_byte(bytes, first);
@@ -182,6 +182,12 @@ fn is_closing_fence(bytes: &[u8], fence_char: u8, min_len: usize) -> bool {
 /// `bytes` is the line with leading indentation already stripped.
 /// `fence_len` is the number of fence characters.
 fn extract_language<'src>(input: &'src str, bytes: &[u8], fence_len: usize) -> Option<&'src str> {
+    debug_assert!(
+        bytes.as_ptr() as usize >= input.as_ptr() as usize
+            && bytes.as_ptr() as usize + bytes.len()
+                <= input.as_ptr() as usize + input.len(),
+        "bytes must be a subslice of input"
+    );
     let mut i = fence_len;
     while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
         i += 1;
@@ -355,7 +361,7 @@ impl BlockBytes for [u8] {
     /// Check whether this byte slice is an ATX heading (`CommonMark` §4.2).
     /// Returns `(level, text)` without performing any inline parsing.
     fn try_parse_heading<'src>(&self, input: &'src str, line_offset: usize) -> Option<(u8, &'src str)> {
-        let level = SpecialChar::Hash.count_leading_bytes(self);
+        let level = count_leading_byte(self, SpecialChar::Hash.byte());
         if !(1..=6).contains(&level) || self.get(level) != SpecialChar::Space {
             return None;
         }
@@ -522,32 +528,30 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
             // CommonMark §4.5: a code fence can be indented 0-3 spaces, so we
             // check if a backtick or tilde appears within the first 4 bytes.
             let first = bytes.get(pos).copied();
-            if first == SpecialChar::Backtick
-                || first == Some(b'~')
+            if (first == SpecialChar::Backtick
+                || first == SpecialChar::Tilde
                 || (first == SpecialChar::Space
                     && bytes[pos..line_end].get(..4).is_some_and(|w| {
-                        w.contains(&SpecialChar::Backtick.byte()) || w.contains(&b'~')
-                    }))
+                        w.contains(&SpecialChar::Backtick.byte())
+                            || w.contains(&SpecialChar::Tilde.byte())
+                    })))
+                && let Some(indent) = strip_indent(&bytes[pos..line_end])
+                && let Some((fence_char, fence_len)) =
+                    code_fence_opening(&bytes[pos + indent..line_end])
             {
-                if let Some(indent) = strip_indent(&bytes[pos..line_end]) {
-                    let spos = pos + indent;
-                    if let Some((fence_char, fence_len)) =
-                        code_fence_opening(&bytes[spos..line_end])
-                    {
-                        let language =
-                            extract_language(input, &bytes[spos..line_end], fence_len);
-                        acc.flush_into(&mut ctx);
-                        let content_start = line_end + 1;
-                        let (code, resume) = scan_code_block_fast(
-                            input, bytes, content_start, fence_len, fence_char,
-                        );
-                        ctx.sections
-                            .push(RawSection::CodeBlock { language, code });
-                        pos = resume;
-                        acc = Accumulator::Empty;
-                        continue;
-                    }
-                }
+                let spos = pos + indent;
+                let language =
+                    extract_language(input, &bytes[spos..line_end], fence_len);
+                acc.flush_into(&mut ctx);
+                let content_start = line_end + 1;
+                let (code, resume) = scan_code_block_fast(
+                    input, bytes, content_start, fence_len, fence_char,
+                );
+                ctx.sections
+                    .push(RawSection::CodeBlock { language, code });
+                pos = resume;
+                acc = Accumulator::Empty;
+                continue;
             }
 
             acc = ctx.fold_line(acc, pos, line_end);
@@ -584,6 +588,7 @@ impl<'src> ParseCtx<'src> {
     ///
     /// Code fence opening is handled by the fast-path in `parse()` before this
     /// method is called, so no code-block state is tracked here.
+    #[inline]
     fn fold_line(
         &mut self,
         acc: Accumulator<'src>,

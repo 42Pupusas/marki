@@ -21,6 +21,7 @@ pub enum SpecialChar {
     Backslash = b'\\',
     CloseBracket = b']',
     Underscore = b'_',
+    Tilde = b'~',
     Backtick = b'`',
 }
 
@@ -48,6 +49,7 @@ static FROM_BYTE: [Option<SpecialChar>; 256] = {
     table[b'\\' as usize] = Some(S::Backslash);
     table[b']' as usize] = Some(S::CloseBracket);
     table[b'_' as usize] = Some(S::Underscore);
+    table[b'~' as usize] = Some(S::Tilde);
     table[b'`' as usize] = Some(S::Backtick);
     table
 };
@@ -69,26 +71,8 @@ impl SpecialChar {
 
     #[inline]
     #[must_use]
-    pub const fn is_rule_char(self) -> bool {
-        matches!(self, Self::Dash | Self::Asterisk | Self::Underscore)
-    }
-
-    #[inline]
-    #[must_use]
     pub const fn is_list_char(self) -> bool {
         matches!(self, Self::Dash | Self::Asterisk | Self::Plus)
-    }
-
-    #[inline]
-    #[must_use]
-    pub const fn is_emphasis_char(self) -> bool {
-        matches!(self, Self::Asterisk | Self::Underscore)
-    }
-
-    #[inline]
-    #[must_use]
-    pub fn count_leading(self, s: &str) -> usize {
-        self.count_leading_bytes(s.as_bytes())
     }
 
     #[inline]
@@ -121,7 +105,7 @@ use std::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-#[allow(clippy::cast_ptr_alignment)]
+#[allow(clippy::cast_ptr_alignment, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 unsafe fn count_leading_sse2(bytes: &[u8], needle: u8) -> usize {
     let len = bytes.len();
     let ptr = bytes.as_ptr();

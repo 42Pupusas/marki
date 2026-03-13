@@ -4,6 +4,17 @@ use crate::SpecialChar;
 use crate::section::InlineSpan;
 use crate::simd::{ByteSet, find_byte, find_byte_set};
 
+/// Count consecutive occurrences of `needle` at the start of `bytes`.
+/// Scalar loop — faster than SIMD for short runs (inline code backticks are typically 1-3).
+#[inline]
+fn count_leading_byte(bytes: &[u8], needle: u8) -> usize {
+    let mut n = 0;
+    while n < bytes.len() && bytes[n] == needle {
+        n += 1;
+    }
+    n
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Inline<'src> {
     Text(&'src str),
@@ -880,7 +891,7 @@ impl<'src> Inline<'src> {
         bytes: &[u8],
         start: usize,
     ) -> Option<(&'src str, usize)> {
-        let backtick_count = SpecialChar::Backtick.count_leading_bytes(&bytes[start..]);
+        let backtick_count = count_leading_byte(&bytes[start..], SpecialChar::Backtick.byte());
         if backtick_count == 0 {
             return None;
         }
@@ -892,7 +903,7 @@ impl<'src> Inline<'src> {
             i = find_byte(bytes, i, SpecialChar::Backtick.byte())?;
 
             // Count consecutive backticks
-            let close_count = SpecialChar::Backtick.count_leading_bytes(&bytes[i..]);
+            let close_count = count_leading_byte(&bytes[i..], SpecialChar::Backtick.byte());
 
             if close_count == backtick_count {
                 // CommonMark §6.1: strip one leading and one trailing space
