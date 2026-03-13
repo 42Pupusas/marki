@@ -10,7 +10,7 @@ mod tests;
 use std::borrow::Cow;
 
 pub use inline::Inline;
-pub use section::{InlineSpan, OrderedListDelimiter, Section};
+pub use section::{InlineSpan, OrderedListDelimiter, Section, SpanSlice};
 pub use special_char::SpecialChar;
 
 /// Normalize line endings for parsing. Returns the input borrowed if it
@@ -40,6 +40,7 @@ pub fn normalize(input: &str) -> Cow<'_, str> {
 pub struct MarkdownFile<'src> {
     pub sections: Vec<Section<'src>>,
     pool: Vec<Inline<'src>>,
+    span_pool: Vec<InlineSpan>,
 }
 
 impl<'src> MarkdownFile<'src> {
@@ -47,6 +48,12 @@ impl<'src> MarkdownFile<'src> {
     #[must_use]
     pub fn inlines(&self, span: InlineSpan) -> &[Inline<'src>] {
         &self[span]
+    }
+
+    /// Get the item spans referenced by a `SpanSlice` (list items).
+    #[must_use]
+    pub fn item_spans(&self, slice: SpanSlice) -> &[InlineSpan] {
+        &self[slice]
     }
 }
 
@@ -57,5 +64,15 @@ impl<'src> std::ops::Index<InlineSpan> for MarkdownFile<'src> {
         let start = span.start as usize;
         let end = start + span.len as usize;
         &self.pool[start..end]
+    }
+}
+
+impl std::ops::Index<SpanSlice> for MarkdownFile<'_> {
+    type Output = [InlineSpan];
+
+    fn index(&self, slice: SpanSlice) -> &[InlineSpan] {
+        let start = slice.start as usize;
+        let end = start + slice.len as usize;
+        &self.span_pool[start..end]
     }
 }

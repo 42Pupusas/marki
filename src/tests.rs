@@ -156,6 +156,7 @@ fn test_unordered_list() {
     assert_eq!(md.sections.len(), 1);
     match &md.sections[0] {
         Section::UnorderedList { items } => {
+            let items = &md[*items];
             assert_eq!(items.len(), 3);
             assert_content(&md, items[0], &text("one"));
             assert_content(&md, items[1], &text("two"));
@@ -170,6 +171,7 @@ fn test_unordered_list_plus() {
     let md = MarkdownFile::parse("+ one\n+ two\n+ three");
     match &md.sections[0] {
         Section::UnorderedList { items } => {
+            let items = &md[*items];
             assert_eq!(items.len(), 3);
             assert_content(&md, items[0], &text("one"));
         }
@@ -186,6 +188,7 @@ fn test_ordered_list() {
             delimiter,
             items,
         } if *delimiter == OrderedListDelimiter::Dot => {
+            let items = &md[*items];
             assert_eq!(items.len(), 3);
             assert_content(&md, items[0], &text("first"));
             assert_content(&md, items[1], &text("second"));
@@ -237,6 +240,7 @@ fn test_mixed_document() {
     }
     match &md.sections[2] {
         Section::UnorderedList { items } => {
+            let items = &md[*items];
             assert_content(&md, items[0], &text("a"));
             assert_content(&md, items[1], &text("b"));
         }
@@ -407,6 +411,7 @@ fn test_inline_in_list() {
     let md = MarkdownFile::parse("- *italic item*\n- **bold item**");
     match &md.sections[0] {
         Section::UnorderedList { items } => {
+            let items = &md[*items];
             assert_content(&md, items[0], &[Expect::Italic(text("italic item"))]);
             assert_content(&md, items[1], &[Expect::Bold(text("bold item"))]);
         }
@@ -532,6 +537,7 @@ fn test_ordered_list_paren_delimiter() {
             delimiter,
             items,
         } if *delimiter == OrderedListDelimiter::Paren => {
+            let items = &md[*items];
             assert_content(&md, items[0], &text("first"));
             assert_content(&md, items[1], &text("second"));
         }
@@ -549,6 +555,7 @@ fn test_ordered_list_different_delimiters_split() {
             delimiter,
             items,
         } if *delimiter == OrderedListDelimiter::Dot => {
+            let items = &md[*items];
             assert_content(&md, items[0], &text("dot"));
         }
         other => panic!("expected ordered list dot, got {other:?}"),
@@ -559,6 +566,7 @@ fn test_ordered_list_different_delimiters_split() {
             delimiter,
             items,
         } if *delimiter == OrderedListDelimiter::Paren => {
+            let items = &md[*items];
             assert_content(&md, items[0], &text("paren"));
         }
         other => panic!("expected ordered list paren, got {other:?}"),
@@ -574,6 +582,7 @@ fn test_ordered_list_paren_custom_start() {
             delimiter,
             items,
         } if *delimiter == OrderedListDelimiter::Paren => {
+            let items = &md[*items];
             assert_content(&md, items[0], &text("fifth"));
             assert_content(&md, items[1], &text("sixth"));
         }
@@ -813,6 +822,7 @@ fn test_blockquote_lazy_stops_at_list() {
     }
     match &md.sections[1] {
         Section::UnorderedList { items } => {
+            let items = &md[*items];
             assert_content(&md, items[0], &text("item"));
         }
         other => panic!("expected list, got {other:?}"),

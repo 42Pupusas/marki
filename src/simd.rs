@@ -76,7 +76,8 @@ use std::arch::x86_64::{
 
 /// Reinterpret a `u8` as `i8` (bit-preserving cast for SSE2 intrinsics).
 #[cfg(target_arch = "x86_64")]
-#[inline]
+#[allow(clippy::inline_always)]
+#[inline(always)]
 const fn as_i8(b: u8) -> i8 {
     i8::from_ne_bytes([b])
 }
@@ -85,7 +86,8 @@ const fn as_i8(b: u8) -> i8 {
 /// `_mm_movemask_epi8` returns an `i32` with only bits 0..15 set, so the
 /// bitwise AND is lossless.
 #[cfg(target_arch = "x86_64")]
-#[inline]
+#[allow(clippy::inline_always)]
+#[inline(always)]
 const fn movemask_to_u32(mask: i32) -> u32 {
     // Movemask returns 0..=0xFFFF. Reinterpret the low two bytes as u16,
     // then widen losslessly. No sign or truncation issues.

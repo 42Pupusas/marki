@@ -1,3 +1,5 @@
+use std::mem::MaybeUninit;
+
 use crate::SpecialChar;
 use crate::section::InlineSpan;
 use crate::simd::{ByteSet, find_byte, find_byte_set};
@@ -37,6 +39,27 @@ static SPECIAL_SET: ByteSet = ByteSet::new(&[
     SpecialChar::ExclamationMark.byte(),
     SpecialChar::Backslash.byte(),
     SpecialChar::Backtick.byte(),
+]);
+
+/// Pre-computed byte sets for `find_matching_close` — avoids rebuilding
+/// the 256-byte lookup table on every call.
+static BRACKET_CLOSE_SET: ByteSet = ByteSet::new(&[
+    SpecialChar::OpenBracket.byte(),
+    SpecialChar::CloseBracket.byte(),
+    SpecialChar::Backslash.byte(),
+]);
+static PAREN_CLOSE_SET: ByteSet = ByteSet::new(&[
+    SpecialChar::OpenParen.byte(),
+    SpecialChar::CloseParen.byte(),
+    SpecialChar::Backslash.byte(),
+]);
+
+/// Pre-computed byte sets for `try_parse_delimited` — one per delimiter type.
+static STAR_DELIM_SET: ByteSet =
+    ByteSet::new(&[SpecialChar::Asterisk.byte(), SpecialChar::Backslash.byte()]);
+static UNDER_DELIM_SET: ByteSet = ByteSet::new(&[
+    SpecialChar::Underscore.byte(),
+    SpecialChar::Backslash.byte(),
 ]);
 
 /// Character classification for `CommonMark` emphasis flanking rules.
@@ -195,8 +218,9 @@ impl EmphasisState {
 const STACK_CAP: usize = 32;
 
 /// Stack-allocated buffer for collecting inline elements without heap allocation.
+/// Uses `MaybeUninit` to avoid zeroing the 32-element stack array on every parse call.
 struct InlineBuf<'src> {
-    stack: [Inline<'src>; STACK_CAP],
+    stack: [MaybeUninit<Inline<'src>>; STACK_CAP],
     len: usize,
     overflow: Vec<Inline<'src>>,
 }
@@ -205,32 +229,51 @@ impl<'src> InlineBuf<'src> {
     #[inline]
     const fn new() -> Self {
         Self {
-            stack: [Inline::SoftBreak; STACK_CAP],
+            // SAFETY: An array of MaybeUninit does not require initialization.
+            stack: [const { MaybeUninit::uninit() }; STACK_CAP],
             len: 0,
             overflow: Vec::new(),
         }
     }
 
-    #[inline]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn push(&mut self, item: Inline<'src>) {
         if self.overflow.is_empty() && self.len < STACK_CAP {
-            self.stack[self.len] = item;
+            self.stack[self.len] = MaybeUninit::new(item);
             self.len += 1;
         } else {
-            if self.overflow.is_empty() {
-                // Spill stack to heap
-                self.overflow = Vec::with_capacity(STACK_CAP * 2);
-                self.overflow.extend_from_slice(&self.stack[..self.len]);
-            }
-            self.overflow.push(item);
+            self.push_slow(item);
         }
+    }
+
+    #[cold]
+    fn push_slow(&mut self, item: Inline<'src>) {
+        if self.overflow.is_empty() {
+            // Spill stack to heap
+            self.overflow = Vec::with_capacity(STACK_CAP * 2);
+            // SAFETY: elements 0..self.len were initialized via push.
+            // Use a raw pointer to avoid borrow conflict with self.overflow.
+            let len = self.len;
+            let ptr = self.stack.as_ptr().cast::<Inline>();
+            let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+            self.overflow.extend_from_slice(slice);
+        }
+        self.overflow.push(item);
+    }
+
+    /// Get initialized stack elements as a slice.
+    #[inline]
+    const fn initialized_stack(&self) -> &[Inline<'src>] {
+        // SAFETY: all elements 0..self.len have been initialized via push.
+        unsafe { std::slice::from_raw_parts(self.stack.as_ptr().cast::<Inline>(), self.len) }
     }
 
     #[inline]
     fn flush_to_pool(self, pool: &mut Vec<Inline<'src>>) -> InlineSpan {
         let start = pool_offset(pool.len());
         if self.overflow.is_empty() {
-            pool.extend_from_slice(&self.stack[..self.len]);
+            pool.extend_from_slice(self.initialized_stack());
             InlineSpan::new(start, pool_offset(self.len))
         } else {
             let len = pool_offset(self.overflow.len());
@@ -242,7 +285,8 @@ impl<'src> InlineBuf<'src> {
 
 /// Pool index as `u32`. Panics if the pool exceeds 4 GiB of elements
 /// (unreachable in practice — that would require billions of inline nodes).
-#[inline]
+#[allow(clippy::inline_always)]
+#[inline(always)]
 pub fn pool_offset(pool_len: usize) -> u32 {
     u32::try_from(pool_len).expect("inline pool exceeded u32::MAX elements")
 }
@@ -310,7 +354,7 @@ impl<'src> Inline<'src> {
         Self::parse_into_buf(input, bytes, emph, pool, &mut buf);
         // Flush buf directly to pool (not wrapped in a span).
         if buf.overflow.is_empty() {
-            pool.extend_from_slice(&buf.stack[..buf.len]);
+            pool.extend_from_slice(buf.initialized_stack());
         } else {
             pool.extend(buf.overflow);
         }
@@ -421,6 +465,7 @@ impl<'src> Inline<'src> {
 
     /// Emit a hard or soft line break at a newline position.
     /// Hard break if preceded by trailing `\` or 2+ spaces; soft break otherwise.
+    #[inline]
     fn emit_line_break(
         input: &'src str,
         bytes: &[u8],
@@ -432,11 +477,13 @@ impl<'src> Inline<'src> {
         let (trim_end, is_hard) = if preceding.last() == SpecialChar::Backslash {
             (newline_pos - 1, true)
         } else {
-            let spaces = preceding
-                .iter()
-                .rev()
-                .take_while(|&&b| b == SpecialChar::Space)
-                .count();
+            // Count trailing spaces with a simple backward loop.
+            let mut spaces = 0;
+            let mut j = preceding.len();
+            while j > 0 && preceding[j - 1] == b' ' {
+                spaces += 1;
+                j -= 1;
+            }
             if spaces >= 2 {
                 (newline_pos - spaces, true)
             } else {
@@ -497,12 +544,16 @@ impl<'src> Inline<'src> {
         open: SpecialChar,
         close: SpecialChar,
     ) -> Option<usize> {
-        // SIMD byte set: only stop at open, close, or backslash.
-        let bracket_set = ByteSet::new(&[open.byte(), close.byte(), SpecialChar::Backslash.byte()]);
+        // Select pre-computed static ByteSet instead of building one each call.
+        let set = if open == SpecialChar::OpenBracket {
+            &BRACKET_CLOSE_SET
+        } else {
+            &PAREN_CLOSE_SET
+        };
         let mut depth = 0u32;
         let mut j = start;
         loop {
-            let pos = find_byte_set(bytes, j, &bracket_set)?;
+            let pos = find_byte_set(bytes, j, set)?;
             let b = bytes[pos];
             if b == SpecialChar::Backslash
                 && bytes.get(pos + 1).is_some_and(u8::is_ascii_punctuation)
@@ -704,13 +755,16 @@ impl<'src> Inline<'src> {
             }
         }
 
-        // SIMD byte set: scan for marker or backslash (the only two bytes
-        // that require action inside a delimited span).
-        let delim_set = ByteSet::new(&[marker, SpecialChar::Backslash.byte()]);
+        // Select pre-computed static ByteSet instead of building one each call.
+        let delim_set = if is_star {
+            &STAR_DELIM_SET
+        } else {
+            &UNDER_DELIM_SET
+        };
 
         let mut i = inner_start;
         loop {
-            let Some(pos) = find_byte_set(bytes, i, &delim_set) else {
+            let Some(pos) = find_byte_set(bytes, i, delim_set) else {
                 break;
             };
             i = pos;
