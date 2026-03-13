@@ -8,4 +8,9 @@ pedantic = "warn"
 perf = "warn"
 nursery = "warn"
 
-[dependencies]
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "parse"
+harness = false
