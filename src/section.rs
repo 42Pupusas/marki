@@ -1,4 +1,23 @@
-use crate::Inline;
+/// A range of inline elements stored contiguously in the inline pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InlineSpan {
+    pub start: u32,
+    pub len: u32,
+}
+
+impl InlineSpan {
+    pub const EMPTY: Self = Self { start: 0, len: 0 };
+
+    #[inline]
+    pub const fn new(start: u32, len: u32) -> Self {
+        Self { start, len }
+    }
+
+    #[inline]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -39,25 +58,25 @@ impl PartialEq<OrderedListDelimiter> for u8 {
 pub enum Section<'src> {
     Heading {
         level: u8,
-        content: Vec<Inline<'src>>,
+        content: InlineSpan,
     },
     Paragraph {
-        content: Vec<Inline<'src>>,
+        content: InlineSpan,
     },
     CodeBlock {
         language: Option<&'src str>,
         code: &'src str,
     },
     UnorderedList {
-        items: Vec<Vec<Inline<'src>>>,
+        items: Vec<InlineSpan>,
     },
     OrderedList {
         start: u32,
         delimiter: OrderedListDelimiter,
-        items: Vec<Vec<Inline<'src>>>,
+        items: Vec<InlineSpan>,
     },
     Blockquote {
-        content: Vec<Inline<'src>>,
+        content: InlineSpan,
     },
     HorizontalRule,
 }

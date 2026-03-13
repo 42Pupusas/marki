@@ -10,7 +10,7 @@ mod tests;
 use std::borrow::Cow;
 
 pub use inline::Inline;
-pub use section::{OrderedListDelimiter, Section};
+pub use section::{InlineSpan, OrderedListDelimiter, Section};
 pub use special_char::SpecialChar;
 
 /// Normalize line endings for parsing. Returns the input borrowed if it
@@ -36,4 +36,23 @@ pub fn normalize(input: &str) -> Cow<'_, str> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownFile<'src> {
     pub sections: Vec<Section<'src>>,
+    pool: Vec<Inline<'src>>,
+}
+
+impl<'src> MarkdownFile<'src> {
+    /// Get the inline elements referenced by a span.
+    #[must_use]
+    pub fn inlines(&self, span: InlineSpan) -> &[Inline<'src>] {
+        &self[span]
+    }
+}
+
+impl<'src> std::ops::Index<InlineSpan> for MarkdownFile<'src> {
+    type Output = [Inline<'src>];
+
+    fn index(&self, span: InlineSpan) -> &[Inline<'src>] {
+        let start = span.start as usize;
+        let end = start + span.len as usize;
+        &self.pool[start..end]
+    }
 }
