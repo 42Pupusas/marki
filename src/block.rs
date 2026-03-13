@@ -113,21 +113,6 @@ fn lines_offset(len: usize) -> u32 {
     u32::try_from(len).expect("lines pool exceeds u32::MAX elements")
 }
 
-/// Convert a byte range from the input into a `&str` without char-boundary
-/// checks. All call sites split at ASCII byte boundaries (newlines, spaces,
-/// digits, punctuation), so the invariant is guaranteed.
-///
-/// # Safety
-/// `start` and `end` must lie on UTF-8 char boundaries within `input`.
-#[allow(clippy::inline_always)]
-#[inline(always)]
-unsafe fn str_from_range(input: &str, start: usize, end: usize) -> &str {
-    debug_assert!(start <= end && end <= input.len());
-    debug_assert!(input.is_char_boundary(start));
-    debug_assert!(input.is_char_boundary(end));
-    unsafe { input.get_unchecked(start..end) }
-}
-
 /// Check whether every byte in `bytes[start..end]` is ASCII whitespace.
 #[inline]
 fn is_blank_line(bytes: &[u8], start: usize, end: usize) -> bool {
@@ -143,8 +128,8 @@ fn is_blank_line(bytes: &[u8], start: usize, end: usize) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Convert raw sections from pass 1 into final sections with inline parsing.
-/// All inline parsing happens here, improving instruction cache locality by
-/// keeping block and inline parsing in separate phases.
+/// Separating passes lets us pre-size the output pools from the raw section
+/// count and avoid interleaving block and inline allocation patterns.
 fn resolve_inlines<'src>(
     raw: Vec<RawSection<'src>>,
     lines: &[&'src str],
@@ -318,9 +303,7 @@ impl<'src> MarkdownFile<'src> {
             {
                 // Content is everything between opening and closing fence.
                 let code = if start < pos {
-                    // Trim the trailing newline before the closing fence.
-                    // SAFETY: start is after a newline, pos-1 is before a newline.
-                    unsafe { str_from_range(input, start, pos - 1) }
+                    &input[start..pos - 1]
                 } else {
                     ""
                 };
@@ -330,8 +313,7 @@ impl<'src> MarkdownFile<'src> {
         }
         // Unclosed code block: content runs to end of input.
         let code = if start < bytes.len() {
-            // SAFETY: start is after a newline.
-            unsafe { str_from_range(input, start, bytes.len()) }
+            &input[start..bytes.len()]
         } else {
             ""
         };
@@ -413,8 +395,7 @@ impl<'src> MarkdownFile<'src> {
             // Compute the absolute offset into input. line is a subslice of
             // input.as_bytes(), so pointer arithmetic gives us the offset.
             let line_offset = line.as_ptr() as usize - input.as_ptr() as usize;
-            // SAFETY: i..end are within the ASCII prefix/suffix we just trimmed.
-            Some(unsafe { str_from_range(input, line_offset + i, line_offset + end) })
+            Some(&input[line_offset + i..line_offset + end])
         }
     }
 
@@ -483,8 +464,7 @@ impl<'src> MarkdownFile<'src> {
                 end -= 1;
             }
         }
-        // SAFETY: start and end are within the ASCII heading prefix/suffix.
-        let text = unsafe { str_from_range(input, line_offset + start, line_offset + end) };
+        let text = &input[line_offset + start..line_offset + end];
         let level = u8::try_from(level).expect("heading level already validated 1..=6");
         Some((level, text))
     }
@@ -546,9 +526,7 @@ impl<'src> MarkdownFile<'src> {
             return None;
         }
 
-        // SAFETY: a and b are subslices of base (verified above), so the
-        // range a_start..b_end is valid UTF-8 within base.
-        Some(unsafe { str_from_range(base, a_start - base_start, b_end - base_start) })
+        Some(&base[a_start - base_start..b_end - base_start])
     }
 }
 
@@ -610,13 +588,11 @@ impl<'src> ParseCtx<'src> {
         }
 
         if line_bytes.first() == SpecialChar::GreaterThan {
-            // SAFETY: pos+1 is after '>', which is ASCII.
             let content_start = pos + 1;
             let content = if self.bytes.get(content_start) == SpecialChar::Space {
-                // SAFETY: pos+2 is after '> ', both ASCII.
-                unsafe { str_from_range(self.input, content_start + 1, line_end) }
+                &self.input[content_start + 1..line_end]
             } else {
-                unsafe { str_from_range(self.input, content_start, line_end) }
+                &self.input[content_start..line_end]
             };
             if let Accumulator::InBlockquote { lines_start } = acc {
                 self.lines.push(content);
@@ -646,9 +622,7 @@ impl<'src> ParseCtx<'src> {
                     && MarkdownFile::<'src>::try_parse_ordered_item_bytes(line_bytes).is_none()
             };
             if continues {
-                // SAFETY: pos and line_end are at newline boundaries.
-                self.lines
-                    .push(unsafe { str_from_range(self.input, pos, line_end) });
+                self.lines.push(&self.input[pos..line_end]);
                 return Accumulator::InBlockquote { lines_start };
             }
             // Line starts a new block — flush the blockquote and fall through.
@@ -669,16 +643,14 @@ impl<'src> ParseCtx<'src> {
         if let Some((marker, item_offset)) =
             MarkdownFile::<'src>::try_parse_unordered_item_bytes(line_bytes)
         {
-            // SAFETY: item_offset is after ASCII marker + space.
-            let item = unsafe { str_from_range(self.input, pos + item_offset, line_end) };
+            let item = &self.input[pos + item_offset..line_end];
             return self.fold_unordered_list(acc, marker, item);
         }
 
         if let Some((num, delim, item_offset)) =
             MarkdownFile::<'src>::try_parse_ordered_item_bytes(line_bytes)
         {
-            // SAFETY: item_offset is after ASCII digits + delimiter + space.
-            let item = unsafe { str_from_range(self.input, pos + item_offset, line_end) };
+            let item = &self.input[pos + item_offset..line_end];
             return self.fold_ordered_list(acc, num, delim, item);
         }
 
@@ -764,8 +736,7 @@ impl<'src> ParseCtx<'src> {
         pos: usize,
         line_end: usize,
     ) -> Accumulator<'src> {
-        // SAFETY: pos and line_end are at newline boundaries.
-        let line_str = unsafe { str_from_range(self.input, pos, line_end) };
+        let line_str = &self.input[pos..line_end];
         if let Accumulator::InParagraph { content } = acc {
             return MarkdownFile::merge_slices(self.input, content, line_str).map_or_else(
                 || {
