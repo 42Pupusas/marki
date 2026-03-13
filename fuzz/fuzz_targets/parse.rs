@@ -3,7 +3,7 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &str| {
-    let md = marki::MarkdownFile::parse(data);
+    let md: marki::MarkdownFile<'_> = marki::MarkdownFile::parse(data);
     // Walk all sections to exercise index operations and catch panics.
     for section in &md.sections {
         match section {

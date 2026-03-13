@@ -1048,3 +1048,281 @@ fn test_bold_star_intraword() {
         other => panic!("expected paragraph, got {other:?}"),
     }
 }
+
+// -----------------------------------------------------------------------
+// Indentation (0-3 spaces) — CommonMark §4
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_heading_indented_1_space() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse(" # Hello");
+    match &md.sections[0] {
+        Section::Heading { level: 1, content } => assert_content(&md, *content, &text("Hello")),
+        other => panic!("expected heading, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_heading_indented_3_spaces() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("   ## World");
+    match &md.sections[0] {
+        Section::Heading { level: 2, content } => assert_content(&md, *content, &text("World")),
+        other => panic!("expected heading, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_heading_indented_4_spaces_is_paragraph() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("    # Not a heading");
+    match &md.sections[0] {
+        Section::Paragraph { .. } => {}
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_hr_indented_3_spaces() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("   ---");
+    assert_eq!(md.sections, vec![Section::HorizontalRule]);
+}
+
+#[test]
+fn test_hr_indented_4_spaces_is_paragraph() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("    ---");
+    match &md.sections[0] {
+        Section::Paragraph { .. } => {}
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_unordered_list_indented_2_spaces() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("  - one\n  - two");
+    match &md.sections[0] {
+        Section::UnorderedList { items } => {
+            let items = &md[*items];
+            assert_eq!(items.len(), 2);
+            assert_content(&md, items[0], &text("one"));
+            assert_content(&md, items[1], &text("two"));
+        }
+        other => panic!("expected list, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_unordered_list_indented_4_spaces_is_paragraph() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("    - not a list");
+    match &md.sections[0] {
+        Section::Paragraph { .. } => {}
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_ordered_list_indented_1_space() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse(" 1. first\n 2. second");
+    match &md.sections[0] {
+        Section::OrderedList { start: 1, items, .. } => {
+            let items = &md[*items];
+            assert_eq!(items.len(), 2);
+            assert_content(&md, items[0], &text("first"));
+        }
+        other => panic!("expected ordered list, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_blockquote_indented_3_spaces() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("   > quoted");
+    match &md.sections[0] {
+        Section::Blockquote { content } => {
+            assert_content(&md, *content, &text("quoted"));
+        }
+        other => panic!("expected blockquote, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_blockquote_indented_4_spaces_is_paragraph() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("    > not a quote");
+    match &md.sections[0] {
+        Section::Paragraph { .. } => {}
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_code_fence_indented_3_spaces() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("   ```\nhello\n   ```");
+    assert_eq!(
+        md.sections[0],
+        Section::CodeBlock {
+            language: None,
+            code: "hello",
+        }
+    );
+}
+
+#[test]
+fn test_code_fence_indented_4_spaces_is_paragraph() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("    ```\nnot code\n    ```");
+    // 4-space indent: not a code fence, treated as paragraph text
+    match &md.sections[0] {
+        Section::Paragraph { .. } => {}
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+}
+
+// -----------------------------------------------------------------------
+// Tilde code fences — CommonMark §4.5
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_tilde_code_fence() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("~~~\nhello\n~~~");
+    assert_eq!(
+        md.sections[0],
+        Section::CodeBlock {
+            language: None,
+            code: "hello",
+        }
+    );
+}
+
+#[test]
+fn test_tilde_code_fence_with_language() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("~~~python\nprint('hi')\n~~~");
+    assert_eq!(
+        md.sections[0],
+        Section::CodeBlock {
+            language: Some("python"),
+            code: "print('hi')",
+        }
+    );
+}
+
+#[test]
+fn test_tilde_code_fence_longer_close() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("~~~\nhello\n~~~~~");
+    assert_eq!(
+        md.sections[0],
+        Section::CodeBlock {
+            language: None,
+            code: "hello",
+        }
+    );
+}
+
+#[test]
+fn test_tilde_fence_not_closed_by_backticks() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("~~~\nhello\n```\n~~~");
+    assert_eq!(
+        md.sections[0],
+        Section::CodeBlock {
+            language: None,
+            code: "hello\n```",
+        }
+    );
+}
+
+#[test]
+fn test_backtick_fence_not_closed_by_tildes() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("```\nhello\n~~~\n```");
+    assert_eq!(
+        md.sections[0],
+        Section::CodeBlock {
+            language: None,
+            code: "hello\n~~~",
+        }
+    );
+}
+
+#[test]
+fn test_tilde_fence_backticks_in_info_string() {
+    // Tilde fences allow backticks in the info string (CommonMark §4.5)
+    let md: MarkdownFile<'_> = MarkdownFile::parse("~~~ aa ```\nhello\n~~~");
+    assert_eq!(
+        md.sections[0],
+        Section::CodeBlock {
+            language: Some("aa ```"),
+            code: "hello",
+        }
+    );
+}
+
+#[test]
+fn test_tilde_fence_indented() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("  ~~~\nhello\n  ~~~");
+    assert_eq!(
+        md.sections[0],
+        Section::CodeBlock {
+            language: None,
+            code: "hello",
+        }
+    );
+}
+
+// -----------------------------------------------------------------------
+// Empty ordered list items
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_ordered_list_empty_item() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("1. \n2. second");
+    match &md.sections[0] {
+        Section::OrderedList { start: 1, items, .. } => {
+            let items = &md[*items];
+            assert_eq!(items.len(), 2);
+            assert_content(&md, items[0], &[]);
+            assert_content(&md, items[1], &text("second"));
+        }
+        other => panic!("expected ordered list, got {other:?}"),
+    }
+}
+
+// -----------------------------------------------------------------------
+// normalize: bare \r handling
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_normalize_bare_cr_becomes_newline() {
+    let input = "hello\rworld";
+    let normalized = normalize(input);
+    assert_eq!(&*normalized, "hello\nworld");
+}
+
+#[test]
+fn test_normalize_mixed_cr_crlf() {
+    let input = "a\rb\r\nc\r";
+    let normalized = normalize(input);
+    assert_eq!(&*normalized, "a\nb\nc\n");
+}
+
+// -----------------------------------------------------------------------
+// Closing fence indentation
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_closing_fence_indented_3_spaces() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("```\nhello\n   ```");
+    assert_eq!(
+        md.sections[0],
+        Section::CodeBlock {
+            language: None,
+            code: "hello",
+        }
+    );
+}
+
+#[test]
+fn test_closing_fence_indented_4_spaces_not_closing() {
+    // 4-space indent on closing fence means it's content, not a close.
+    let md: MarkdownFile<'_> = MarkdownFile::parse("```\nhello\n    ```");
+    assert_eq!(
+        md.sections[0],
+        Section::CodeBlock {
+            language: None,
+            code: "hello\n    ```",
+        }
+    );
+}

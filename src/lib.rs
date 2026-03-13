@@ -15,8 +15,9 @@ pub use inline::Inline;
 pub use section::{InlineSpan, OrderedListDelimiter, Section, SpanSlice};
 pub use special_char::SpecialChar;
 
-/// Normalize line endings for parsing. Returns the input borrowed if it
-/// contains no carriage returns, or an owned copy with `\r` stripped otherwise.
+/// Normalize line endings for parsing. Converts `\r\n` to `\n` and bare `\r`
+/// (classic Mac) to `\n`. Returns the input borrowed if no carriage returns
+/// are found.
 ///
 /// Use this before [`MarkdownFile::parse`] when the input may contain CRLF
 /// line endings:
@@ -28,11 +29,27 @@ pub use special_char::SpecialChar;
 /// ```
 #[must_use]
 pub fn normalize(input: &str) -> Cow<'_, str> {
-    if simd::find_byte(input.as_bytes(), 0, SpecialChar::CarriageReturn.byte()).is_some() {
-        Cow::Owned(input.replace('\r', ""))
-    } else {
-        Cow::Borrowed(input)
+    let bytes = input.as_bytes();
+    if simd::find_byte(bytes, 0, SpecialChar::CarriageReturn.byte()).is_none() {
+        return Cow::Borrowed(input);
     }
+    // Single-pass: copy chunks between \r characters, replacing each \r with
+    // \n and consuming the following \n in \r\n pairs.
+    let mut out = String::with_capacity(input.len());
+    let mut start = 0;
+    while let Some(cr) =
+        simd::find_byte(bytes, start, SpecialChar::CarriageReturn.byte())
+    {
+        out.push_str(&input[start..cr]);
+        out.push('\n');
+        start = cr + 1;
+        // Consume the \n in a \r\n pair so it doesn't become a double newline.
+        if bytes.get(start) == Some(&SpecialChar::Newline.byte()) {
+            start += 1;
+        }
+    }
+    out.push_str(&input[start..]);
+    Cow::Owned(out)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

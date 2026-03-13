@@ -8,5 +8,5 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let normalized = marki::normalize(&s);
-    let _ = marki::MarkdownFile::parse(&normalized);
+    let _: marki::MarkdownFile<'_> = marki::MarkdownFile::parse(&normalized);
 });
