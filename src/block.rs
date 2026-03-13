@@ -158,7 +158,8 @@ fn resolve_inlines<'src>(
                 items_len,
             } => {
                 let raw_items =
-                    &lines[items_start as usize..(items_start + items_len) as usize];
+                    lines.get(items_start as usize..(items_start + items_len) as usize)
+                        .unwrap_or(&[]);
                 let start = pool_offset(span_pool.len());
                 for item in raw_items {
                     let span = Inline::parse(item, pool);
@@ -176,7 +177,8 @@ fn resolve_inlines<'src>(
                 items_len,
             } => {
                 let raw_items =
-                    &lines[items_start as usize..(items_start + items_len) as usize];
+                    lines.get(items_start as usize..(items_start + items_len) as usize)
+                        .unwrap_or(&[]);
                 let sp_start = pool_offset(span_pool.len());
                 for item in raw_items {
                     let span = Inline::parse(item, pool);
@@ -193,8 +195,9 @@ fn resolve_inlines<'src>(
                 lines_start,
                 lines_len,
             } => {
-                let raw_lines =
-                    &lines[lines_start as usize..(lines_start + lines_len) as usize];
+                let raw_lines = lines
+                    .get(lines_start as usize..(lines_start + lines_len) as usize)
+                    .unwrap_or(&[]);
                 let start = pool_offset(pool.len());
                 for (i, line) in raw_lines.iter().enumerate() {
                     if i > 0 {
@@ -303,7 +306,7 @@ impl<'src> MarkdownFile<'src> {
             {
                 // Content is everything between opening and closing fence.
                 let code = if start < pos {
-                    &input[start..pos - 1]
+                    input.get(start..pos - 1).unwrap_or("")
                 } else {
                     ""
                 };
@@ -312,11 +315,7 @@ impl<'src> MarkdownFile<'src> {
             pos = line_end + 1;
         }
         // Unclosed code block: content runs to end of input.
-        let code = if start < bytes.len() {
-            &input[start..bytes.len()]
-        } else {
-            ""
-        };
+        let code = input.get(start..).unwrap_or("");
         (code, bytes.len())
     }
 
@@ -395,7 +394,7 @@ impl<'src> MarkdownFile<'src> {
             // Compute the absolute offset into input. line is a subslice of
             // input.as_bytes(), so pointer arithmetic gives us the offset.
             let line_offset = line.as_ptr() as usize - input.as_ptr() as usize;
-            Some(&input[line_offset + i..line_offset + end])
+            input.get(line_offset + i..line_offset + end)
         }
     }
 
@@ -464,7 +463,7 @@ impl<'src> MarkdownFile<'src> {
                 end -= 1;
             }
         }
-        let text = &input[line_offset + start..line_offset + end];
+        let text = input.get(line_offset + start..line_offset + end)?;
         let level = u8::try_from(level).expect("heading level already validated 1..=6");
         Some((level, text))
     }
@@ -526,7 +525,7 @@ impl<'src> MarkdownFile<'src> {
             return None;
         }
 
-        Some(&base[a_start - base_start..b_end - base_start])
+        base.get(a_start - base_start..b_end - base_start)
     }
 }
 
@@ -590,9 +589,9 @@ impl<'src> ParseCtx<'src> {
         if line_bytes.first() == SpecialChar::GreaterThan {
             let content_start = pos + 1;
             let content = if self.bytes.get(content_start) == SpecialChar::Space {
-                &self.input[content_start + 1..line_end]
+                self.input.get(content_start + 1..line_end).unwrap_or("")
             } else {
-                &self.input[content_start..line_end]
+                self.input.get(content_start..line_end).unwrap_or("")
             };
             if let Accumulator::InBlockquote { lines_start } = acc {
                 self.lines.push(content);
@@ -622,7 +621,8 @@ impl<'src> ParseCtx<'src> {
                     && MarkdownFile::<'src>::try_parse_ordered_item_bytes(line_bytes).is_none()
             };
             if continues {
-                self.lines.push(&self.input[pos..line_end]);
+                self.lines
+                    .push(self.input.get(pos..line_end).unwrap_or(""));
                 return Accumulator::InBlockquote { lines_start };
             }
             // Line starts a new block — flush the blockquote and fall through.
@@ -643,14 +643,14 @@ impl<'src> ParseCtx<'src> {
         if let Some((marker, item_offset)) =
             MarkdownFile::<'src>::try_parse_unordered_item_bytes(line_bytes)
         {
-            let item = &self.input[pos + item_offset..line_end];
+            let item = self.input.get(pos + item_offset..line_end).unwrap_or("");
             return self.fold_unordered_list(acc, marker, item);
         }
 
         if let Some((num, delim, item_offset)) =
             MarkdownFile::<'src>::try_parse_ordered_item_bytes(line_bytes)
         {
-            let item = &self.input[pos + item_offset..line_end];
+            let item = self.input.get(pos + item_offset..line_end).unwrap_or("");
             return self.fold_ordered_list(acc, num, delim, item);
         }
 
@@ -736,7 +736,7 @@ impl<'src> ParseCtx<'src> {
         pos: usize,
         line_end: usize,
     ) -> Accumulator<'src> {
-        let line_str = &self.input[pos..line_end];
+        let line_str = self.input.get(pos..line_end).unwrap_or("");
         if let Accumulator::InParagraph { content } = acc {
             return MarkdownFile::merge_slices(self.input, content, line_str).map_or_else(
                 || {
