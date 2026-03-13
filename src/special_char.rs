@@ -1,13 +1,18 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SpecialChar {
+    Tab = b'\t',
     Newline = b'\n',
+    CarriageReturn = b'\r',
+    Space = b' ',
     ExclamationMark = b'!',
+    DoubleQuote = b'"',
     Hash = b'#',
+    SingleQuote = b'\'',
     OpenParen = b'(',
     CloseParen = b')',
-    Plus = b'+',
     Asterisk = b'*',
+    Plus = b'+',
     Dash = b'-',
     GreaterThan = b'>',
     OpenBracket = b'[',
@@ -18,23 +23,34 @@ pub enum SpecialChar {
 }
 
 impl SpecialChar {
+    /// Returns the `u8` value of this character.
+    #[must_use]
+    pub const fn byte(self) -> u8 {
+        self as u8
+    }
+
     #[must_use]
     pub const fn from_byte(b: u8) -> Option<Self> {
         match b {
+            b'\t' => Some(Self::Tab),
             b'\n' => Some(Self::Newline),
-            b'#' => Some(Self::Hash),
-            b'+' => Some(Self::Plus),
-            b'-' => Some(Self::Dash),
-            b'*' => Some(Self::Asterisk),
-            b'_' => Some(Self::Underscore),
-            b'>' => Some(Self::GreaterThan),
-            b'`' => Some(Self::Backtick),
+            b'\r' => Some(Self::CarriageReturn),
+            b' ' => Some(Self::Space),
             b'!' => Some(Self::ExclamationMark),
-            b'[' => Some(Self::OpenBracket),
-            b']' => Some(Self::CloseBracket),
+            b'"' => Some(Self::DoubleQuote),
+            b'#' => Some(Self::Hash),
+            b'\'' => Some(Self::SingleQuote),
             b'(' => Some(Self::OpenParen),
             b')' => Some(Self::CloseParen),
+            b'*' => Some(Self::Asterisk),
+            b'+' => Some(Self::Plus),
+            b'-' => Some(Self::Dash),
+            b'>' => Some(Self::GreaterThan),
+            b'[' => Some(Self::OpenBracket),
             b'\\' => Some(Self::Backslash),
+            b']' => Some(Self::CloseBracket),
+            b'_' => Some(Self::Underscore),
+            b'`' => Some(Self::Backtick),
             _ => None,
         }
     }
@@ -56,25 +72,37 @@ impl SpecialChar {
 
     #[must_use]
     pub fn count_leading(self, s: &str) -> usize {
-        let byte = self as u8;
+        let byte = self.byte();
         s.as_bytes().iter().take_while(|&&b| b == byte).count()
     }
 }
 
 impl PartialEq<u8> for SpecialChar {
     fn eq(&self, other: &u8) -> bool {
-        *self as u8 == *other
+        self.byte() == *other
     }
 }
 
 impl PartialEq<SpecialChar> for u8 {
     fn eq(&self, other: &SpecialChar) -> bool {
-        *self == *other as Self
+        *self == other.byte()
+    }
+}
+
+impl PartialEq<SpecialChar> for Option<&u8> {
+    fn eq(&self, other: &SpecialChar) -> bool {
+        matches!(self, Some(b) if **b == other.byte())
+    }
+}
+
+impl PartialEq<SpecialChar> for Option<u8> {
+    fn eq(&self, other: &SpecialChar) -> bool {
+        matches!(self, Some(b) if *b == other.byte())
     }
 }
 
 impl std::fmt::Display for SpecialChar {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", *self as u8 as char)
+        write!(f, "{}", self.byte() as char)
     }
 }

@@ -191,7 +191,7 @@ impl<'src> MarkdownFile<'src> {
             return Self::fold_paragraph(input, sections, acc, line);
         }
 
-        if line.as_bytes().first().copied() == Some(SpecialChar::GreaterThan as u8) {
+        if line.as_bytes().first() == SpecialChar::GreaterThan {
             let rest = &line[1..];
             let content = rest.strip_prefix(' ').unwrap_or(rest);
             if let Accumulator::InBlockquote { mut lines } = acc {
@@ -325,7 +325,7 @@ impl<'src> MarkdownFile<'src> {
             .iter()
             .position(|b| !b.is_ascii_whitespace())
             .unwrap_or(0);
-        if bytes.get(first).copied() != Some(SpecialChar::Backtick as u8) {
+        if bytes.get(first) != SpecialChar::Backtick {
             return 0;
         }
         // Count backticks directly from the offset we already found.
@@ -333,7 +333,7 @@ impl<'src> MarkdownFile<'src> {
             .iter()
             .take_while(|&&b| b == SpecialChar::Backtick)
             .count();
-        if len >= 3 && !bytes[first + len..].contains(&(SpecialChar::Backtick as u8)) {
+        if len >= 3 && !bytes[first + len..].contains(&SpecialChar::Backtick.byte()) {
             len
         } else {
             0
@@ -351,14 +351,17 @@ impl<'src> MarkdownFile<'src> {
     #[allow(clippy::cast_possible_truncation)]
     fn try_parse_heading(line: &str) -> Option<Section<'_>> {
         let level = SpecialChar::Hash.count_leading(line);
-        if (1..=6).contains(&level) && line.as_bytes().get(level) == Some(&b' ') {
+        if (1..=6).contains(&level) && line.as_bytes().get(level) == SpecialChar::Space {
             let text = line[level..].trim();
             // Strip optional closing # sequence per CommonMark §4.2:
             // trailing #s are removed only if preceded by whitespace (or they
             // are the entire content after the opening).
             let stripped = text.trim_end_matches('#');
             let text = if stripped.is_empty()
-                || stripped.as_bytes().last().is_some_and(|&b| b == b' ' || b == b'\t')
+                || stripped
+                    .as_bytes()
+                    .last()
+                    .is_some_and(|&b| b == SpecialChar::Space || b == SpecialChar::Tab)
             {
                 stripped.trim_end()
             } else {
@@ -424,12 +427,8 @@ impl<'src> MarkdownFile<'src> {
         if digits == 0 {
             return None;
         }
-        let delimiter = match bytes.get(digits).copied() {
-            Some(b'.') => OrderedListDelimiter::Dot,
-            Some(b')') => OrderedListDelimiter::Paren,
-            _ => return None,
-        };
-        if bytes.get(digits + 1).copied() != Some(b' ') {
+        let delimiter = OrderedListDelimiter::from_byte(bytes.get(digits).copied()?)?;
+        if bytes.get(digits + 1) != SpecialChar::Space {
             return None;
         }
         let rest = line.get(digits + 2..)?;

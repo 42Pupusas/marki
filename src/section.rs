@@ -7,15 +7,31 @@ pub enum OrderedListDelimiter {
     Paren = b')',
 }
 
+impl OrderedListDelimiter {
+    #[must_use]
+    pub const fn byte(self) -> u8 {
+        self as u8
+    }
+
+    #[must_use]
+    pub const fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            b'.' => Some(Self::Dot),
+            b')' => Some(Self::Paren),
+            _ => None,
+        }
+    }
+}
+
 impl PartialEq<u8> for OrderedListDelimiter {
     fn eq(&self, other: &u8) -> bool {
-        *self as u8 == *other
+        self.byte() == *other
     }
 }
 
 impl PartialEq<OrderedListDelimiter> for u8 {
     fn eq(&self, other: &OrderedListDelimiter) -> bool {
-        *self == *other as Self
+        *self == other.byte()
     }
 }
 

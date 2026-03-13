@@ -29,13 +29,13 @@ impl<'src> From<&'src str> for Inline<'src> {
 /// Lookup table: true for bytes that can start an inline element.
 static SPECIAL: [bool; 256] = {
     let mut table = [false; 256];
-    table[SpecialChar::Newline as u8 as usize] = true;
-    table[SpecialChar::Asterisk as u8 as usize] = true;
-    table[SpecialChar::Underscore as u8 as usize] = true;
-    table[SpecialChar::OpenBracket as u8 as usize] = true;
-    table[SpecialChar::ExclamationMark as u8 as usize] = true;
-    table[SpecialChar::Backslash as u8 as usize] = true;
-    table[SpecialChar::Backtick as u8 as usize] = true;
+    table[SpecialChar::Newline.byte() as usize] = true;
+    table[SpecialChar::Asterisk.byte() as usize] = true;
+    table[SpecialChar::Underscore.byte() as usize] = true;
+    table[SpecialChar::OpenBracket.byte() as usize] = true;
+    table[SpecialChar::ExclamationMark.byte() as usize] = true;
+    table[SpecialChar::Backslash.byte() as usize] = true;
+    table[SpecialChar::Backtick.byte() as usize] = true;
     table
 };
 
@@ -268,7 +268,7 @@ impl<'src> Inline<'src> {
 
             // Image: ![alt](url "title")
             if b == SpecialChar::ExclamationMark
-                && bytes.get(i + 1).copied() == Some(SpecialChar::OpenBracket as u8)
+                && bytes.get(i + 1) == SpecialChar::OpenBracket
                 && let Some((alt, url, title, end)) =
                     Self::try_parse_bracket_paren(input, bytes, i + 1)
             {
@@ -329,13 +329,13 @@ impl<'src> Inline<'src> {
     ) {
         let preceding = &bytes[plain_start..newline_pos];
         let (trim_end, is_hard) =
-            if preceding.last() == Some(&(SpecialChar::Backslash as u8)) {
+            if preceding.last() == SpecialChar::Backslash {
                 (newline_pos - 1, true)
             } else {
                 let spaces = preceding
                     .iter()
                     .rev()
-                    .take_while(|&&b| b == b' ')
+                    .take_while(|&&b| b == SpecialChar::Space)
                     .count();
                 if spaces >= 2 {
                     (newline_pos - spaces, true)
@@ -427,7 +427,7 @@ impl<'src> Inline<'src> {
         bytes: &[u8],
         start: usize,
     ) -> Option<(&'src str, &'src str, Option<&'src str>, usize)> {
-        if bytes.get(start).copied() != Some(SpecialChar::OpenBracket as u8) {
+        if bytes.get(start) != SpecialChar::OpenBracket {
             return None;
         }
 
@@ -440,7 +440,7 @@ impl<'src> Inline<'src> {
         )?;
 
         let paren_pos = bracket_end + 1;
-        if bytes.get(paren_pos).copied() != Some(SpecialChar::OpenParen as u8) {
+        if bytes.get(paren_pos) != SpecialChar::OpenParen {
             return None;
         }
 
@@ -486,10 +486,10 @@ impl<'src> Inline<'src> {
 
         let bytes = trimmed.as_bytes();
         let last = bytes[bytes.len() - 1];
-        let (open, close) = match last {
-            b'"' => (b'"', b'"'),
-            b'\'' => (b'\'', b'\''),
-            b')' => (b'(', b')'),
+        let (open, close) = match SpecialChar::from_byte(last) {
+            Some(SpecialChar::DoubleQuote) => (SpecialChar::DoubleQuote, SpecialChar::DoubleQuote),
+            Some(SpecialChar::SingleQuote) => (SpecialChar::SingleQuote, SpecialChar::SingleQuote),
+            Some(SpecialChar::CloseParen) => (SpecialChar::OpenParen, SpecialChar::CloseParen),
             // No trailing title delimiter — the entire content is the URL.
             _ => return (trimmed, None),
         };
@@ -681,7 +681,9 @@ impl<'src> Inline<'src> {
                 // when the content both starts and ends with a space.
                 let mut cs = content_start;
                 let mut ce = i;
-                if ce - cs >= 2 && bytes.get(cs) == Some(&b' ') && bytes.get(ce - 1) == Some(&b' ')
+                if ce - cs >= 2
+                    && bytes.get(cs) == SpecialChar::Space
+                    && bytes.get(ce - 1) == SpecialChar::Space
                 {
                     cs += 1;
                     ce -= 1;
