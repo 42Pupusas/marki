@@ -5,7 +5,7 @@ mod special_char;
 use std::borrow::Cow;
 
 pub use inline::Inline;
-pub use section::Section;
+pub use section::{OrderedListDelimiter, Section};
 pub use special_char::SpecialChar;
 
 /// Normalize line endings for parsing. Returns the input borrowed if it
@@ -49,6 +49,7 @@ enum Accumulator<'src> {
     },
     InOrderedList {
         start: u32,
+        delimiter: OrderedListDelimiter,
         items: Vec<&'src str>,
     },
     InParagraph {
@@ -79,8 +80,13 @@ impl<'src> Accumulator<'src> {
             Self::InUnorderedList { items, .. } => Some(Section::UnorderedList {
                 items: items.into_iter().map(Inline::parse).collect(),
             }),
-            Self::InOrderedList { start, items } => Some(Section::OrderedList {
+            Self::InOrderedList {
                 start,
+                delimiter,
+                items,
+            } => Some(Section::OrderedList {
+                start,
+                delimiter,
                 items: items.into_iter().map(Inline::parse).collect(),
             }),
             Self::InParagraph { content } => Some(Section::Paragraph {
@@ -173,13 +179,8 @@ impl<'src> MarkdownFile<'src> {
             return Accumulator::Empty;
         }
         let content = content.map_or(line, |existing| {
-            Self::merge_slices(input, existing, line).unwrap_or_else(|| {
-                debug_assert!(
-                    false,
-                    "merge_slices failed in code block: slices not from same base"
-                );
-                existing
-            })
+            Self::merge_slices(input, existing, line)
+                .expect("merge_slices failed in code block: slices not from same input")
         });
         Accumulator::InCodeBlock {
             language,
@@ -233,6 +234,25 @@ impl<'src> MarkdownFile<'src> {
             };
         }
 
+        // Blockquote lazy continuation: a non-blank line that doesn't start a
+        // new block-level construct continues the current blockquote.
+        let acc = if let Accumulator::InBlockquote { mut lines } = acc {
+            if !Self::is_horizontal_rule(line)
+                && Self::try_parse_heading(line).is_none()
+                && Self::code_fence_len(line) == 0
+                && Self::try_parse_unordered_item(line).is_none()
+                && Self::try_parse_ordered_item(line).is_none()
+            {
+                lines.push(line);
+                return Accumulator::InBlockquote { lines };
+            }
+            // Line starts a new block — flush the blockquote and fall through.
+            Accumulator::InBlockquote { lines }.flush_into(sections);
+            Accumulator::Empty
+        } else {
+            acc
+        };
+
         if Self::is_horizontal_rule(line) {
             acc.flush_into(sections);
             sections.push(Section::HorizontalRule);
@@ -262,14 +282,37 @@ impl<'src> MarkdownFile<'src> {
             };
         }
 
-        if let Some((num, item)) = Self::try_parse_ordered_item(line) {
-            if let Accumulator::InOrderedList { start, mut items } = acc {
-                items.push(item);
-                return Accumulator::InOrderedList { start, items };
+        if let Some((num, delim, item)) = Self::try_parse_ordered_item(line) {
+            if let Accumulator::InOrderedList {
+                start,
+                delimiter,
+                mut items,
+            } = acc
+            {
+                if delimiter == delim {
+                    items.push(item);
+                    return Accumulator::InOrderedList {
+                        start,
+                        delimiter,
+                        items,
+                    };
+                }
+                Accumulator::InOrderedList {
+                    start,
+                    delimiter,
+                    items,
+                }
+                .flush_into(sections);
+                return Accumulator::InOrderedList {
+                    start: num,
+                    delimiter: delim,
+                    items: vec_with_first(item),
+                };
             }
             acc.flush_into(sections);
             return Accumulator::InOrderedList {
                 start: num,
+                delimiter: delim,
                 items: vec_with_first(item),
             };
         }
@@ -334,9 +377,20 @@ impl<'src> MarkdownFile<'src> {
     fn try_parse_heading(line: &str) -> Option<Section<'_>> {
         let level = SpecialChar::Hash.count_leading(line);
         if (1..=6).contains(&level) && line.as_bytes().get(level) == Some(&b' ') {
+            let text = line[level..].trim();
+            // Strip optional closing # sequence per CommonMark 4.2.
+            // Only strip if the #s are preceded by whitespace (or are the entire content).
+            let stripped = text.trim_end_matches('#');
+            let text = if stripped.is_empty()
+                || stripped.as_bytes().last().is_some_and(|&b| b == b' ' || b == b'\t')
+            {
+                stripped.trim_end()
+            } else {
+                text
+            };
             Some(Section::Heading {
                 level: level as u8,
-                content: Inline::parse(line[level..].trim()),
+                content: Inline::parse(text),
             })
         } else {
             None
@@ -373,7 +427,7 @@ impl<'src> MarkdownFile<'src> {
         rest.strip_prefix(' ').map(|item| (first, item))
     }
 
-    fn try_parse_ordered_item(line: &str) -> Option<(u32, &str)> {
+    fn try_parse_ordered_item(line: &str) -> Option<(u32, OrderedListDelimiter, &str)> {
         let bytes = line.as_bytes();
         let mut num: u32 = 0;
         let mut digits = 0usize;
@@ -391,16 +445,19 @@ impl<'src> MarkdownFile<'src> {
         if digits == 0 {
             return None;
         }
-        // Expect ". " after the digits, then non-empty item text.
-        if bytes.get(digits).copied() != Some(b'.') || bytes.get(digits + 1).copied() != Some(b' ')
-        {
+        let delimiter = match bytes.get(digits).copied() {
+            Some(b'.') => OrderedListDelimiter::Dot,
+            Some(b')') => OrderedListDelimiter::Paren,
+            _ => return None,
+        };
+        if bytes.get(digits + 1).copied() != Some(b' ') {
             return None;
         }
         let rest = line.get(digits + 2..)?;
         if rest.is_empty() {
             return None;
         }
-        Some((num, rest))
+        Some((num, delimiter, rest))
     }
 
     /// Merge two subslices of `base` into one contiguous slice spanning from the
@@ -450,7 +507,11 @@ mod tests {
         assert_eq!(
             md.sections,
             vec![Section::Paragraph {
-                content: text("This is a paragraph.\nWith two lines.")
+                content: vec![
+                    Inline::Text("This is a paragraph."),
+                    Inline::SoftBreak,
+                    Inline::Text("With two lines."),
+                ]
             }]
         );
     }
@@ -508,6 +569,7 @@ mod tests {
             md.sections,
             vec![Section::OrderedList {
                 start: 1,
+                delimiter: OrderedListDelimiter::Dot,
                 items: vec![text("first"), text("second"), text("third")],
             }]
         );
@@ -644,6 +706,7 @@ mod tests {
                     Inline::Link {
                         text: vec![Inline::Text("here")],
                         url: "https://example.com",
+                        title: None,
                     },
                     Inline::Text(" now"),
                 ],
@@ -660,6 +723,7 @@ mod tests {
                 content: vec![Inline::Image {
                     alt: "alt text",
                     url: "image.png",
+                    title: None,
                 }],
             }]
         );
@@ -674,6 +738,7 @@ mod tests {
                 content: vec![Inline::Link {
                     text: vec![Inline::Bold(vec![Inline::Text("bold link")])],
                     url: "url",
+                    title: None,
                 }],
             }]
         );
@@ -803,10 +868,12 @@ mod tests {
                         vec![Inline::Link {
                             text: vec![Inline::Text("Links")],
                             url: "https://example.com",
+                            title: None,
                         }],
                         vec![Inline::Image {
                             alt: "Images",
                             url: "image.png",
+                            title: None,
                         }],
                         text("Backslash escapes"),
                     ],
@@ -892,7 +959,11 @@ mod tests {
         assert_eq!(
             md.sections,
             vec![Section::Paragraph {
-                content: text("line one\nline two"),
+                content: vec![
+                    Inline::Text("line one"),
+                    Inline::SoftBreak,
+                    Inline::Text("line two"),
+                ],
             }]
         );
     }
@@ -932,16 +1003,545 @@ mod tests {
     }
 
     #[test]
-    fn test_emphasis_close_after_escaped_space() {
-        // Backslash-escaped space before closing delimiter should still close
+    fn test_emphasis_backslash_space_no_close() {
+        // Backslash before space is NOT an escape (space isn't ASCII punctuation).
+        // The space before closing `*` prevents it from being a valid closer,
+        // so no emphasis is produced — the whole thing is literal text.
         let md = MarkdownFile::parse(r"*test\ *");
         assert_eq!(
             md.sections,
             vec![Section::Paragraph {
-                content: vec![Inline::Italic(vec![
-                    Inline::Text("test"),
-                    Inline::Text(" "),
-                ])],
+                content: vec![Inline::Text(r"*test\ *")],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_backslash_escape_punctuation() {
+        // Backslash before punctuation: backslash consumed, punctuation is literal
+        let md = MarkdownFile::parse(r"hello \*world\*");
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![
+                    Inline::Text("hello "),
+                    Inline::Text("*world"),
+                    Inline::Text("*"),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_backslash_escape_non_punctuation() {
+        // Backslash before non-punctuation: backslash kept as literal text
+        let md = MarkdownFile::parse(r"hello \n world");
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![Inline::Text(r"hello \n world")],
+            }]
+        );
+    }
+
+    // ── Ordered list `)` delimiter ──────────────────────────────────
+
+    #[test]
+    fn test_ordered_list_paren_delimiter() {
+        let md = MarkdownFile::parse("1) first\n2) second");
+        assert_eq!(
+            md.sections,
+            vec![Section::OrderedList {
+                start: 1,
+                delimiter: OrderedListDelimiter::Paren,
+                items: vec![text("first"), text("second")],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_ordered_list_different_delimiters_split() {
+        // Dot and paren delimiters produce separate lists.
+        let md = MarkdownFile::parse("1. dot\n2) paren");
+        assert_eq!(
+            md.sections,
+            vec![
+                Section::OrderedList {
+                    start: 1,
+                    delimiter: OrderedListDelimiter::Dot,
+                    items: vec![text("dot")],
+                },
+                Section::OrderedList {
+                    start: 2,
+                    delimiter: OrderedListDelimiter::Paren,
+                    items: vec![text("paren")],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ordered_list_paren_custom_start() {
+        let md = MarkdownFile::parse("5) fifth\n6) sixth");
+        assert_eq!(
+            md.sections,
+            vec![Section::OrderedList {
+                start: 5,
+                delimiter: OrderedListDelimiter::Paren,
+                items: vec![text("fifth"), text("sixth")],
+            }]
+        );
+    }
+
+    // ── ATX heading closing # ───────────────────────────────────────
+
+    #[test]
+    fn test_heading_closing_hashes() {
+        let md = MarkdownFile::parse("# Heading #");
+        assert_eq!(
+            md.sections,
+            vec![Section::Heading {
+                level: 1,
+                content: text("Heading"),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_heading_closing_multiple_hashes() {
+        let md = MarkdownFile::parse("## Heading ##");
+        assert_eq!(
+            md.sections,
+            vec![Section::Heading {
+                level: 2,
+                content: text("Heading"),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_heading_closing_mismatched_hashes() {
+        // Closing count doesn't need to match opening — still stripped.
+        let md = MarkdownFile::parse("# Heading ####");
+        assert_eq!(
+            md.sections,
+            vec![Section::Heading {
+                level: 1,
+                content: text("Heading"),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_heading_hash_no_space_not_stripped() {
+        // No space before trailing #, so it's part of the content.
+        let md = MarkdownFile::parse("# Heading#");
+        assert_eq!(
+            md.sections,
+            vec![Section::Heading {
+                level: 1,
+                content: text("Heading#"),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_heading_only_hashes() {
+        // `# ###` → empty heading (all trailing # stripped).
+        let md = MarkdownFile::parse("# ###");
+        assert_eq!(
+            md.sections,
+            vec![Section::Heading {
+                level: 1,
+                content: vec![],
+            }]
+        );
+    }
+
+    // ── Soft line breaks ────────────────────────────────────────────
+
+    #[test]
+    fn test_soft_break_in_paragraph() {
+        let md = MarkdownFile::parse("line one\nline two\nline three");
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![
+                    Inline::Text("line one"),
+                    Inline::SoftBreak,
+                    Inline::Text("line two"),
+                    Inline::SoftBreak,
+                    Inline::Text("line three"),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_soft_break_single_trailing_space() {
+        // One trailing space is NOT a hard break, still a soft break.
+        let md = MarkdownFile::parse("line one \nline two");
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![
+                    Inline::Text("line one "),
+                    Inline::SoftBreak,
+                    Inline::Text("line two"),
+                ],
+            }]
+        );
+    }
+
+    // ── Hard line breaks ────────────────────────────────────────────
+
+    #[test]
+    fn test_hard_break_two_trailing_spaces() {
+        let md = MarkdownFile::parse("line one  \nline two");
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![
+                    Inline::Text("line one"),
+                    Inline::HardBreak,
+                    Inline::Text("line two"),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_hard_break_many_trailing_spaces() {
+        let md = MarkdownFile::parse("line one     \nline two");
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![
+                    Inline::Text("line one"),
+                    Inline::HardBreak,
+                    Inline::Text("line two"),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_hard_break_trailing_backslash() {
+        let md = MarkdownFile::parse("line one\\\nline two");
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![
+                    Inline::Text("line one"),
+                    Inline::HardBreak,
+                    Inline::Text("line two"),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_hard_break_with_inline() {
+        let md = MarkdownFile::parse("**bold**  \nnext line");
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![
+                    Inline::Bold(vec![Inline::Text("bold")]),
+                    Inline::HardBreak,
+                    Inline::Text("next line"),
+                ],
+            }]
+        );
+    }
+
+    // ── Blockquote lazy continuation ────────────────────────────────
+
+    #[test]
+    fn test_blockquote_lazy_continuation() {
+        let md = MarkdownFile::parse("> line one\ncontinuation");
+        assert_eq!(
+            md.sections,
+            vec![Section::Blockquote {
+                content: vec![
+                    Inline::Text("line one"),
+                    Inline::Text("\n"),
+                    Inline::Text("continuation"),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_blockquote_lazy_multiple_lines() {
+        let md = MarkdownFile::parse("> first\nsecond\nthird");
+        assert_eq!(
+            md.sections,
+            vec![Section::Blockquote {
+                content: vec![
+                    Inline::Text("first"),
+                    Inline::Text("\n"),
+                    Inline::Text("second"),
+                    Inline::Text("\n"),
+                    Inline::Text("third"),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_blockquote_lazy_stops_at_heading() {
+        let md = MarkdownFile::parse("> quoted\n# Heading");
+        assert_eq!(
+            md.sections,
+            vec![
+                Section::Blockquote {
+                    content: text("quoted"),
+                },
+                Section::Heading {
+                    level: 1,
+                    content: text("Heading"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_blockquote_lazy_stops_at_hr() {
+        let md = MarkdownFile::parse("> quoted\n---");
+        assert_eq!(
+            md.sections,
+            vec![
+                Section::Blockquote {
+                    content: text("quoted"),
+                },
+                Section::HorizontalRule,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_blockquote_lazy_stops_at_list() {
+        let md = MarkdownFile::parse("> quoted\n- item");
+        assert_eq!(
+            md.sections,
+            vec![
+                Section::Blockquote {
+                    content: text("quoted"),
+                },
+                Section::UnorderedList {
+                    items: vec![text("item")],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_blockquote_lazy_stops_at_code_fence() {
+        let md = MarkdownFile::parse("> quoted\n```\ncode\n```");
+        assert_eq!(
+            md.sections,
+            vec![
+                Section::Blockquote {
+                    content: text("quoted"),
+                },
+                Section::CodeBlock {
+                    language: None,
+                    code: "code",
+                },
+            ]
+        );
+    }
+
+    // ── Link titles ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_link_with_double_quote_title() {
+        let md = MarkdownFile::parse(r#"[text](url "a title")"#);
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![Inline::Link {
+                    text: vec![Inline::Text("text")],
+                    url: "url",
+                    title: Some("a title"),
+                }],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_link_with_single_quote_title() {
+        let md = MarkdownFile::parse("[text](url 'a title')");
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![Inline::Link {
+                    text: vec![Inline::Text("text")],
+                    url: "url",
+                    title: Some("a title"),
+                }],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_link_with_paren_title() {
+        let md = MarkdownFile::parse("[text](url (a title))");
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![Inline::Link {
+                    text: vec![Inline::Text("text")],
+                    url: "url",
+                    title: Some("a title"),
+                }],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_link_no_title() {
+        let md = MarkdownFile::parse("[text](url)");
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![Inline::Link {
+                    text: vec![Inline::Text("text")],
+                    url: "url",
+                    title: None,
+                }],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_image_with_title() {
+        let md = MarkdownFile::parse(r#"![alt](img.png "photo")"#);
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![Inline::Image {
+                    alt: "alt",
+                    url: "img.png",
+                    title: Some("photo"),
+                }],
+            }]
+        );
+    }
+
+    // ── Emphasis flanking rules ─────────────────────────────────────
+
+    #[test]
+    fn test_emphasis_star_intraword() {
+        // * can open/close intraword.
+        let md = MarkdownFile::parse("foo*bar*baz");
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![
+                    Inline::Text("foo"),
+                    Inline::Italic(vec![Inline::Text("bar")]),
+                    Inline::Text("baz"),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_emphasis_underscore_no_intraword() {
+        // _ cannot open/close intraword emphasis.
+        let md = MarkdownFile::parse("foo_bar_baz");
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: text("foo_bar_baz"),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_emphasis_underscore_word_boundaries() {
+        // _ works at word boundaries.
+        let md = MarkdownFile::parse("_foo_ bar _baz_");
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![
+                    Inline::Italic(vec![Inline::Text("foo")]),
+                    Inline::Text(" bar "),
+                    Inline::Italic(vec![Inline::Text("baz")]),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_bold_underscore_no_intraword() {
+        let md = MarkdownFile::parse("foo__bar__baz");
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: text("foo__bar__baz"),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_emphasis_star_after_punctuation() {
+        // * can open after punctuation.
+        let md = MarkdownFile::parse("(*foo*)");
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![
+                    Inline::Text("("),
+                    Inline::Italic(vec![Inline::Text("foo")]),
+                    Inline::Text(")"),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_emphasis_underscore_after_punctuation() {
+        // _ can open after punctuation.
+        let md = MarkdownFile::parse("(_foo_)");
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![
+                    Inline::Text("("),
+                    Inline::Italic(vec![Inline::Text("foo")]),
+                    Inline::Text(")"),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_emphasis_not_opened_by_whitespace_after() {
+        // Delimiter followed by whitespace cannot open.
+        let md = MarkdownFile::parse("a * not emphasis * b");
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: text("a * not emphasis * b"),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_bold_star_intraword() {
+        let md = MarkdownFile::parse("foo**bar**baz");
+        assert_eq!(
+            md.sections,
+            vec![Section::Paragraph {
+                content: vec![
+                    Inline::Text("foo"),
+                    Inline::Bold(vec![Inline::Text("bar")]),
+                    Inline::Text("baz"),
+                ],
             }]
         );
     }

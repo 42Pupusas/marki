@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SpecialChar {
+    Newline = b'\n',
     ExclamationMark = b'!',
     Hash = b'#',
     OpenParen = b'(',
@@ -20,6 +21,7 @@ impl SpecialChar {
     #[must_use]
     pub const fn from_byte(b: u8) -> Option<Self> {
         match b {
+            b'\n' => Some(Self::Newline),
             b'#' => Some(Self::Hash),
             b'+' => Some(Self::Plus),
             b'-' => Some(Self::Dash),
