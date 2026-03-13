@@ -4,7 +4,7 @@
 /// asserting that the parser does not panic or crash.
 
 fn parse_and_walk(input: &str) {
-    let md = crate::MarkdownFile::parse(input);
+    let md: crate::MarkdownFile<'_> = crate::MarkdownFile::parse(input);
     for section in &md.sections {
         match section {
             crate::Section::UnorderedList { items } => {

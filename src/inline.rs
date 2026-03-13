@@ -213,28 +213,22 @@ impl EmphasisState {
     }
 }
 
-/// Maximum recursion depth for inline parsing (emphasis nesting).
-/// Deeper nesting is treated as plain text to prevent stack overflow.
-const MAX_INLINE_DEPTH: u8 = 16;
-
-/// Maximum inline elements per parse level stored on the stack.
-/// Falls back to heap if exceeded (extremely rare — 32 inlines on one line).
-const STACK_CAP: usize = 32;
-
 /// Stack-allocated buffer for collecting inline elements without heap allocation.
-/// Uses `MaybeUninit` to avoid zeroing the 32-element stack array on every parse call.
-struct InlineBuf<'src> {
-    stack: [MaybeUninit<Inline<'src>>; STACK_CAP],
+/// Uses `MaybeUninit` to avoid zeroing the stack array on every parse call.
+/// The capacity `CAP` is configurable via `MarkdownFile`'s `INLINE_STACK_CAP`
+/// const generic — falls back to heap if exceeded.
+struct InlineBuf<'src, const CAP: usize> {
+    stack: [MaybeUninit<Inline<'src>>; CAP],
     len: usize,
     overflow: Vec<Inline<'src>>,
 }
 
-impl<'src> InlineBuf<'src> {
+impl<'src, const CAP: usize> InlineBuf<'src, CAP> {
     #[inline]
     const fn new() -> Self {
         Self {
             // SAFETY: An array of MaybeUninit does not require initialization.
-            stack: [const { MaybeUninit::uninit() }; STACK_CAP],
+            stack: [const { MaybeUninit::uninit() }; CAP],
             len: 0,
             overflow: Vec::new(),
         }
@@ -243,7 +237,7 @@ impl<'src> InlineBuf<'src> {
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn push(&mut self, item: Inline<'src>) {
-        if self.len < STACK_CAP {
+        if self.len < CAP {
             self.stack[self.len] = MaybeUninit::new(item);
             self.len += 1;
         } else {
@@ -255,7 +249,7 @@ impl<'src> InlineBuf<'src> {
     fn push_slow(&mut self, item: Inline<'src>) {
         if self.overflow.is_empty() {
             // Spill stack to heap
-            self.overflow = Vec::with_capacity(STACK_CAP * 2);
+            self.overflow = Vec::with_capacity(CAP * 2);
             // SAFETY: elements 0..self.len were initialized via push.
             // Use a raw pointer to avoid borrow conflict with self.overflow.
             let len = self.len;
@@ -300,8 +294,19 @@ impl<'src> Inline<'src> {
     const EMPH_SCAN_THRESHOLD: usize = 256;
 
     /// Parse inline elements and store them in the pool. Returns a span.
+    ///
+    /// Uses default limits (`MAX_INLINE_DEPTH = 16`, `INLINE_STACK_CAP = 32`).
+    /// For custom limits, use [`MarkdownFile::parse`] with const generics.
     #[must_use]
     pub fn parse(input: &'src str, pool: &mut Vec<Self>) -> InlineSpan {
+        Self::parse_configured::<16, 32>(input, pool)
+    }
+
+    /// Parse inline elements with configurable depth and stack limits.
+    pub(crate) fn parse_configured<const MAX_DEPTH: u8, const CAP: usize>(
+        input: &'src str,
+        pool: &mut Vec<Self>,
+    ) -> InlineSpan {
         let bytes = input.as_bytes();
         // Fast path: if no special bytes exist, the entire input is plain text.
         if find_byte_set(bytes, 0, &SPECIAL_SET).is_none() {
@@ -317,30 +322,51 @@ impl<'src> Inline<'src> {
         } else {
             EmphasisState::from_bytes(bytes)
         };
-        Self::parse_with_emph(input, bytes, emph, pool, 0)
+        Self::parse_with_emph::<MAX_DEPTH, CAP>(input, bytes, emph, pool, 0)
     }
 
-    fn parse_inner(input: &'src str, pool: &mut Vec<Self>, depth: u8) -> InlineSpan {
+    fn parse_inner<const MAX_DEPTH: u8, const CAP: usize>(
+        input: &'src str,
+        pool: &mut Vec<Self>,
+        depth: u8,
+    ) -> InlineSpan {
         let bytes = input.as_bytes();
-        Self::parse_with_emph(input, bytes, EmphasisState::assume_both(), pool, depth)
+        Self::parse_with_emph::<MAX_DEPTH, CAP>(
+            input,
+            bytes,
+            EmphasisState::assume_both(),
+            pool,
+            depth,
+        )
     }
 
-    fn parse_with_emph(
+    fn parse_with_emph<const MAX_DEPTH: u8, const CAP: usize>(
         input: &'src str,
         bytes: &[u8],
         emph: EmphasisState,
         pool: &mut Vec<Self>,
         depth: u8,
     ) -> InlineSpan {
-        let mut buf = InlineBuf::new();
-        Self::parse_into_buf(input, bytes, emph, pool, &mut buf, depth);
+        let mut buf = InlineBuf::<CAP>::new();
+        Self::parse_into_buf::<MAX_DEPTH, CAP>(input, bytes, emph, pool, &mut buf, depth);
         buf.flush_to_pool(pool)
     }
 
     /// Push parsed inline elements directly into the pool without wrapping
     /// in a span. Used for blockquote multi-line accumulation where the caller
     /// manages span boundaries.
+    ///
+    /// Uses default limits (`MAX_INLINE_DEPTH = 16`, `INLINE_STACK_CAP = 32`).
+    /// For custom limits, use [`MarkdownFile::parse`] with const generics.
     pub fn parse_flat_into(input: &'src str, pool: &mut Vec<Self>) {
+        Self::parse_flat_into_configured::<16, 32>(input, pool);
+    }
+
+    /// Push parsed inline elements with configurable depth and stack limits.
+    pub(crate) fn parse_flat_into_configured<const MAX_DEPTH: u8, const CAP: usize>(
+        input: &'src str,
+        pool: &mut Vec<Self>,
+    ) {
         let bytes = input.as_bytes();
         // Fast path: no special bytes means plain text.
         if find_byte_set(bytes, 0, &SPECIAL_SET).is_none() {
@@ -355,8 +381,8 @@ impl<'src> Inline<'src> {
             EmphasisState::from_bytes(bytes)
         };
         // Parse directly into a buf that flushes to pool (flat, no span wrapper).
-        let mut buf = InlineBuf::new();
-        Self::parse_into_buf(input, bytes, emph, pool, &mut buf, 0);
+        let mut buf = InlineBuf::<CAP>::new();
+        Self::parse_into_buf::<MAX_DEPTH, CAP>(input, bytes, emph, pool, &mut buf, 0);
         // Flush buf directly to pool (not wrapped in a span).
         if buf.overflow.is_empty() {
             pool.extend_from_slice(buf.initialized_stack());
@@ -365,12 +391,12 @@ impl<'src> Inline<'src> {
         }
     }
 
-    fn parse_into_buf(
+    fn parse_into_buf<const MAX_DEPTH: u8, const CAP: usize>(
         input: &'src str,
         bytes: &[u8],
         mut emph: EmphasisState,
         pool: &mut Vec<Self>,
-        buf: &mut InlineBuf<'src>,
+        buf: &mut InlineBuf<'src, CAP>,
         depth: u8,
     ) {
         let mut plain_start = 0;
@@ -382,7 +408,7 @@ impl<'src> Inline<'src> {
             let b = bytes[i];
 
             if b == SpecialChar::Newline {
-                Self::emit_line_break(input, bytes, plain_start, i, buf);
+                Self::emit_line_break::<CAP>(input, bytes, plain_start, i, buf);
                 plain_start = i + 1;
                 i = plain_start;
                 continue;
@@ -446,7 +472,8 @@ impl<'src> Inline<'src> {
                 {
                     buf.push(Self::Text(text));
                 }
-                let text_span = Self::parse_inner(text_str, pool, depth.saturating_add(1));
+                let text_span =
+                    Self::parse_inner::<MAX_DEPTH, CAP>(text_str, pool, depth.saturating_add(1));
                 buf.push(Self::Link {
                     text: text_span,
                     url,
@@ -458,7 +485,7 @@ impl<'src> Inline<'src> {
             }
 
             // Bold/Italic: ** __ * _
-            if let Some((elem, end)) = Self::try_parse_emphasis(input, bytes, i, b, &mut emph, pool, depth)
+            if let Some((elem, end)) = Self::try_parse_emphasis::<MAX_DEPTH, CAP>(input, bytes, i, b, &mut emph, pool, depth)
             {
                 if let Some(text) = input.get(plain_start..i)
                     && !text.is_empty()
@@ -484,12 +511,12 @@ impl<'src> Inline<'src> {
     /// Emit a hard or soft line break at a newline position.
     /// Hard break if preceded by trailing `\` or 2+ spaces; soft break otherwise.
     #[inline]
-    fn emit_line_break(
+    fn emit_line_break<const CAP: usize>(
         input: &'src str,
         bytes: &[u8],
         plain_start: usize,
         newline_pos: usize,
-        buf: &mut InlineBuf<'src>,
+        buf: &mut InlineBuf<'src, CAP>,
     ) {
         let preceding = bytes.get(plain_start..newline_pos).unwrap_or_default();
         let (trim_end, is_hard) = if preceding.last() == SpecialChar::Backslash {
@@ -498,7 +525,7 @@ impl<'src> Inline<'src> {
             // Count trailing spaces with a simple backward loop.
             let mut spaces = 0;
             let mut j = preceding.len();
-            while j > 0 && preceding[j - 1] == b' ' {
+            while j > 0 && preceding[j - 1] == SpecialChar::Space {
                 spaces += 1;
                 j -= 1;
             }
@@ -521,7 +548,7 @@ impl<'src> Inline<'src> {
     }
 
     #[inline]
-    fn try_parse_emphasis(
+    fn try_parse_emphasis<const MAX_DEPTH: u8, const CAP: usize>(
         input: &'src str,
         bytes: &[u8],
         i: usize,
@@ -535,7 +562,7 @@ impl<'src> Inline<'src> {
             return None;
         }
         // Depth limit: treat as plain text to prevent stack overflow.
-        if depth >= MAX_INLINE_DEPTH {
+        if depth >= MAX_DEPTH {
             return None;
         }
         let avail = emph.avail_mut(is_star);
@@ -543,7 +570,7 @@ impl<'src> Inline<'src> {
         // Bold: ** or __
         if avail.can_bold() && bytes.get(i + 1) == Some(&b) {
             if let Some((inner, end)) = Self::try_parse_delimited(input, bytes, i, b, 2) {
-                let span = Self::parse_inner(inner, pool, depth + 1);
+                let span = Self::parse_inner::<MAX_DEPTH, CAP>(inner, pool, depth + 1);
                 return Some((Self::Bold(span), end));
             }
             avail.bold_failed();
@@ -552,7 +579,7 @@ impl<'src> Inline<'src> {
         // Italic: * or _
         if avail.can_italic() {
             if let Some((inner, end)) = Self::try_parse_delimited(input, bytes, i, b, 1) {
-                let span = Self::parse_inner(inner, pool, depth + 1);
+                let span = Self::parse_inner::<MAX_DEPTH, CAP>(inner, pool, depth + 1);
                 return Some((Self::Italic(span), end));
             }
             avail.italic_failed();
@@ -853,11 +880,7 @@ impl<'src> Inline<'src> {
         bytes: &[u8],
         start: usize,
     ) -> Option<(&'src str, usize)> {
-        let backtick = SpecialChar::Backtick.byte();
-        let mut backtick_count = 0;
-        while bytes.get(start + backtick_count).copied() == Some(backtick) {
-            backtick_count += 1;
-        }
+        let backtick_count = SpecialChar::Backtick.count_leading_bytes(&bytes[start..]);
         if backtick_count == 0 {
             return None;
         }
@@ -866,13 +889,10 @@ impl<'src> Inline<'src> {
         let mut i = content_start;
         while i < bytes.len() {
             // SIMD-accelerated backtick scan.
-            i = find_byte(bytes, i, backtick)?;
+            i = find_byte(bytes, i, SpecialChar::Backtick.byte())?;
 
             // Count consecutive backticks
-            let mut close_count = 0;
-            while bytes.get(i + close_count).copied() == Some(backtick) {
-                close_count += 1;
-            }
+            let close_count = SpecialChar::Backtick.count_leading_bytes(&bytes[i..]);
 
             if close_count == backtick_count {
                 // CommonMark §6.1: strip one leading and one trailing space

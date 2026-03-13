@@ -24,14 +24,11 @@ pub use special_char::SpecialChar;
 /// ```
 /// let input = "# Hello\r\nWorld";
 /// let normalized = marki::normalize(input);
-/// let md = marki::MarkdownFile::parse(&normalized);
+/// let md: marki::MarkdownFile<'_> = marki::MarkdownFile::parse(&normalized);
 /// ```
 #[must_use]
 pub fn normalize(input: &str) -> Cow<'_, str> {
-    if input
-        .as_bytes()
-        .contains(&SpecialChar::CarriageReturn.byte())
-    {
+    if simd::find_byte(input.as_bytes(), 0, SpecialChar::CarriageReturn.byte()).is_some() {
         Cow::Owned(input.replace('\r', ""))
     } else {
         Cow::Borrowed(input)
@@ -39,13 +36,19 @@ pub fn normalize(input: &str) -> Cow<'_, str> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MarkdownFile<'src> {
+pub struct MarkdownFile<
+    'src,
+    const MAX_INLINE_DEPTH: u8 = 16,
+    const INLINE_STACK_CAP: usize = 32,
+> {
     pub sections: Vec<Section<'src>>,
     pool: Vec<Inline<'src>>,
     span_pool: Vec<InlineSpan>,
 }
 
-impl<'src> MarkdownFile<'src> {
+impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
+    MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP>
+{
     /// Get the inline elements referenced by a span.
     #[must_use]
     pub fn inlines(&self, span: InlineSpan) -> &[Inline<'src>] {
@@ -59,7 +62,9 @@ impl<'src> MarkdownFile<'src> {
     }
 }
 
-impl<'src> std::ops::Index<InlineSpan> for MarkdownFile<'src> {
+impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
+    std::ops::Index<InlineSpan> for MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP>
+{
     type Output = [Inline<'src>];
 
     fn index(&self, span: InlineSpan) -> &[Inline<'src>] {
@@ -69,7 +74,9 @@ impl<'src> std::ops::Index<InlineSpan> for MarkdownFile<'src> {
     }
 }
 
-impl std::ops::Index<SpanSlice> for MarkdownFile<'_> {
+impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
+    std::ops::Index<SpanSlice> for MarkdownFile<'_, MAX_INLINE_DEPTH, INLINE_STACK_CAP>
+{
     type Output = [InlineSpan];
 
     fn index(&self, slice: SpanSlice) -> &[InlineSpan] {

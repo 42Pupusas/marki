@@ -50,28 +50,28 @@ fn bench_individual_sections(c: &mut Criterion) {
     let mut group = c.benchmark_group("section");
 
     group.bench_function("heading", |b| {
-        b.iter(|| MarkdownFile::parse(black_box(HEADING)));
+        b.iter(|| MarkdownFile::<'_, 16, 32>::parse(black_box(HEADING)));
     });
     group.bench_function("paragraph", |b| {
-        b.iter(|| MarkdownFile::parse(black_box(PARAGRAPH)));
+        b.iter(|| MarkdownFile::<'_, 16, 32>::parse(black_box(PARAGRAPH)));
     });
     group.bench_function("inline_rich", |b| {
-        b.iter(|| MarkdownFile::parse(black_box(INLINE_RICH)));
+        b.iter(|| MarkdownFile::<'_, 16, 32>::parse(black_box(INLINE_RICH)));
     });
     group.bench_function("code_block", |b| {
-        b.iter(|| MarkdownFile::parse(black_box(CODE_BLOCK)));
+        b.iter(|| MarkdownFile::<'_, 16, 32>::parse(black_box(CODE_BLOCK)));
     });
     group.bench_function("unordered_list", |b| {
-        b.iter(|| MarkdownFile::parse(black_box(UNORDERED_LIST)));
+        b.iter(|| MarkdownFile::<'_, 16, 32>::parse(black_box(UNORDERED_LIST)));
     });
     group.bench_function("ordered_list", |b| {
-        b.iter(|| MarkdownFile::parse(black_box(ORDERED_LIST)));
+        b.iter(|| MarkdownFile::<'_, 16, 32>::parse(black_box(ORDERED_LIST)));
     });
     group.bench_function("blockquote", |b| {
-        b.iter(|| MarkdownFile::parse(black_box(BLOCKQUOTE)));
+        b.iter(|| MarkdownFile::<'_, 16, 32>::parse(black_box(BLOCKQUOTE)));
     });
     group.bench_function("horizontal_rule", |b| {
-        b.iter(|| MarkdownFile::parse(black_box(HORIZONTAL_RULE)));
+        b.iter(|| MarkdownFile::<'_, 16, 32>::parse(black_box(HORIZONTAL_RULE)));
     });
 
     group.finish();
@@ -80,7 +80,7 @@ fn bench_individual_sections(c: &mut Criterion) {
 fn bench_mixed_document(c: &mut Criterion) {
     let doc = mixed_document();
     c.bench_function("mixed_document", |b| {
-        b.iter(|| MarkdownFile::parse(black_box(&doc)));
+        b.iter(|| MarkdownFile::<'_, 16, 32>::parse(black_box(&doc)));
     });
 }
 
@@ -90,7 +90,7 @@ fn bench_scaling(c: &mut Criterion) {
     for reps in [1, 10, 100] {
         let doc = large_document(reps);
         group.bench_with_input(BenchmarkId::from_parameter(reps), &doc, |b, doc| {
-            b.iter(|| MarkdownFile::parse(black_box(doc)));
+            b.iter(|| MarkdownFile::<'_, 16, 32>::parse(black_box(doc)));
         });
     }
 
@@ -102,7 +102,7 @@ fn bench_fixtures(c: &mut Criterion) {
 
     for &(name, content) in FIXTURES {
         group.bench_with_input(BenchmarkId::from_parameter(name), &content, |b, doc| {
-            b.iter(|| MarkdownFile::parse(black_box(doc)));
+            b.iter(|| MarkdownFile::<'_, 16, 32>::parse(black_box(doc)));
         });
     }
 

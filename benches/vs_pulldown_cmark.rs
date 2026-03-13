@@ -22,7 +22,7 @@ fn bench_vs(c: &mut Criterion) {
         let mut group = c.benchmark_group(name);
 
         group.bench_with_input(BenchmarkId::new("marki", ""), &content, |b, doc| {
-            b.iter(|| MarkdownFile::parse(black_box(doc)));
+            b.iter(|| MarkdownFile::<'_, 16, 32>::parse(black_box(doc)));
         });
 
         group.bench_with_input(

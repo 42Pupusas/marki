@@ -95,7 +95,7 @@ fn assert_content(md: &MarkdownFile, span: InlineSpan, expected: &[Expect]) {
 
 #[test]
 fn test_heading() {
-    let md = MarkdownFile::parse("# Hello\n## World");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("# Hello\n## World");
     assert_eq!(md.sections.len(), 2);
     match &md.sections[0] {
         Section::Heading { level: 1, content } => assert_content(&md, *content, &text("Hello")),
@@ -109,7 +109,7 @@ fn test_heading() {
 
 #[test]
 fn test_paragraph() {
-    let md = MarkdownFile::parse("This is a paragraph.\nWith two lines.");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("This is a paragraph.\nWith two lines.");
     assert_eq!(md.sections.len(), 1);
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(
@@ -127,7 +127,7 @@ fn test_paragraph() {
 
 #[test]
 fn test_code_block() {
-    let md = MarkdownFile::parse("```rust\nfn main() {}\n```");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("```rust\nfn main() {}\n```");
     assert_eq!(md.sections.len(), 1);
     assert_eq!(
         md.sections[0],
@@ -140,7 +140,7 @@ fn test_code_block() {
 
 #[test]
 fn test_code_block_no_language() {
-    let md = MarkdownFile::parse("```\nhello\n```");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("```\nhello\n```");
     assert_eq!(
         md.sections[0],
         Section::CodeBlock {
@@ -152,7 +152,7 @@ fn test_code_block_no_language() {
 
 #[test]
 fn test_unordered_list() {
-    let md = MarkdownFile::parse("- one\n- two\n- three");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("- one\n- two\n- three");
     assert_eq!(md.sections.len(), 1);
     match &md.sections[0] {
         Section::UnorderedList { items } => {
@@ -168,7 +168,7 @@ fn test_unordered_list() {
 
 #[test]
 fn test_unordered_list_plus() {
-    let md = MarkdownFile::parse("+ one\n+ two\n+ three");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("+ one\n+ two\n+ three");
     match &md.sections[0] {
         Section::UnorderedList { items } => {
             let items = &md[*items];
@@ -181,7 +181,7 @@ fn test_unordered_list_plus() {
 
 #[test]
 fn test_ordered_list() {
-    let md = MarkdownFile::parse("1. first\n2. second\n3. third");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("1. first\n2. second\n3. third");
     match &md.sections[0] {
         Section::OrderedList {
             start: 1,
@@ -200,7 +200,7 @@ fn test_ordered_list() {
 
 #[test]
 fn test_blockquote() {
-    let md = MarkdownFile::parse("> line one\n> line two");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("> line one\n> line two");
     match &md.sections[0] {
         Section::Blockquote { content } => assert_content(
             &md,
@@ -217,13 +217,13 @@ fn test_blockquote() {
 
 #[test]
 fn test_horizontal_rule() {
-    let md = MarkdownFile::parse("---");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("---");
     assert_eq!(md.sections, vec![Section::HorizontalRule]);
 }
 
 #[test]
 fn test_mixed_document() {
-    let md = MarkdownFile::parse(
+    let md: MarkdownFile<'_> = MarkdownFile::parse(
         "# Title\n\nSome text.\n\n- a\n- b\n\n> quote\n\n---\n\n```\ncode\n```",
     );
     assert_eq!(md.sections.len(), 6);
@@ -264,7 +264,7 @@ fn test_mixed_document() {
 
 #[test]
 fn test_heading_without_blank_line() {
-    let md = MarkdownFile::parse("some text\n# Heading");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("some text\n# Heading");
     assert_eq!(md.sections.len(), 2);
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(&md, *content, &text("some text")),
@@ -280,7 +280,7 @@ fn test_heading_without_blank_line() {
 
 #[test]
 fn test_bold() {
-    let md = MarkdownFile::parse("This is **bold** text");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("This is **bold** text");
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(
             &md,
@@ -297,7 +297,7 @@ fn test_bold() {
 
 #[test]
 fn test_italic() {
-    let md = MarkdownFile::parse("This is *italic* text");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("This is *italic* text");
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(
             &md,
@@ -314,7 +314,7 @@ fn test_italic() {
 
 #[test]
 fn test_bold_underscore() {
-    let md = MarkdownFile::parse("__bold__");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("__bold__");
     match &md.sections[0] {
         Section::Paragraph { content } => {
             assert_content(&md, *content, &[Expect::Bold(text("bold"))]);
@@ -325,7 +325,7 @@ fn test_bold_underscore() {
 
 #[test]
 fn test_italic_underscore() {
-    let md = MarkdownFile::parse("_italic_");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("_italic_");
     match &md.sections[0] {
         Section::Paragraph { content } => {
             assert_content(&md, *content, &[Expect::Italic(text("italic"))]);
@@ -336,7 +336,7 @@ fn test_italic_underscore() {
 
 #[test]
 fn test_link() {
-    let md = MarkdownFile::parse("Click [here](https://example.com) now");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("Click [here](https://example.com) now");
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(
             &md,
@@ -357,7 +357,7 @@ fn test_link() {
 
 #[test]
 fn test_image() {
-    let md = MarkdownFile::parse("![alt text](image.png)");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("![alt text](image.png)");
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(
             &md,
@@ -374,7 +374,7 @@ fn test_image() {
 
 #[test]
 fn test_bold_inside_link() {
-    let md = MarkdownFile::parse("[**bold link**](url)");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("[**bold link**](url)");
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(
             &md,
@@ -391,7 +391,7 @@ fn test_bold_inside_link() {
 
 #[test]
 fn test_inline_in_heading() {
-    let md = MarkdownFile::parse("# A **bold** heading");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("# A **bold** heading");
     match &md.sections[0] {
         Section::Heading { level: 1, content } => assert_content(
             &md,
@@ -408,7 +408,7 @@ fn test_inline_in_heading() {
 
 #[test]
 fn test_inline_in_list() {
-    let md = MarkdownFile::parse("- *italic item*\n- **bold item**");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("- *italic item*\n- **bold item**");
     match &md.sections[0] {
         Section::UnorderedList { items } => {
             let items = &md[*items];
@@ -422,7 +422,7 @@ fn test_inline_in_list() {
 #[test]
 fn test_parse_readme_file() {
     let content = std::fs::read_to_string("README.md").unwrap();
-    let md = MarkdownFile::parse(&content);
+    let md: MarkdownFile<'_> = MarkdownFile::parse(&content);
     // Verify structure at a high level — detailed span content checked by other tests.
     assert!(md.sections.len() > 10, "README should have many sections");
     match &md.sections[0] {
@@ -450,7 +450,7 @@ fn test_normalize_crlf_strips_cr() {
 #[test]
 fn test_crlf_paragraph() {
     let input = normalize("line one\r\nline two\r\n");
-    let md = MarkdownFile::parse(&input);
+    let md: MarkdownFile<'_> = MarkdownFile::parse(&input);
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(
             &md,
@@ -468,7 +468,7 @@ fn test_crlf_paragraph() {
 #[test]
 fn test_crlf_code_block() {
     let input = normalize("```rust\r\nfn main() {}\r\nlet x = 1;\r\n```\r\n");
-    let md = MarkdownFile::parse(&input);
+    let md: MarkdownFile<'_> = MarkdownFile::parse(&input);
     assert_eq!(
         md.sections[0],
         Section::CodeBlock {
@@ -481,7 +481,7 @@ fn test_crlf_code_block() {
 #[test]
 fn test_crlf_mixed_document() {
     let input = normalize("# Title\r\n\r\nSome text.\r\n\r\n- a\r\n- b\r\n");
-    let md = MarkdownFile::parse(&input);
+    let md: MarkdownFile<'_> = MarkdownFile::parse(&input);
     assert_eq!(md.sections.len(), 3);
     match &md.sections[0] {
         Section::Heading { level: 1, content } => assert_content(&md, *content, &text("Title")),
@@ -491,7 +491,7 @@ fn test_crlf_mixed_document() {
 
 #[test]
 fn test_emphasis_backslash_space_no_close() {
-    let md = MarkdownFile::parse(r"*test\ *");
+    let md: MarkdownFile<'_> = MarkdownFile::parse(r"*test\ *");
     match &md.sections[0] {
         Section::Paragraph { content } => {
             assert_content(&md, *content, &[Expect::Text(r"*test\ *")]);
@@ -502,7 +502,7 @@ fn test_emphasis_backslash_space_no_close() {
 
 #[test]
 fn test_backslash_escape_punctuation() {
-    let md = MarkdownFile::parse(r"hello \*world\*");
+    let md: MarkdownFile<'_> = MarkdownFile::parse(r"hello \*world\*");
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(
             &md,
@@ -519,7 +519,7 @@ fn test_backslash_escape_punctuation() {
 
 #[test]
 fn test_backslash_escape_non_punctuation() {
-    let md = MarkdownFile::parse(r"hello \n world");
+    let md: MarkdownFile<'_> = MarkdownFile::parse(r"hello \n world");
     match &md.sections[0] {
         Section::Paragraph { content } => {
             assert_content(&md, *content, &[Expect::Text(r"hello \n world")]);
@@ -530,7 +530,7 @@ fn test_backslash_escape_non_punctuation() {
 
 #[test]
 fn test_ordered_list_paren_delimiter() {
-    let md = MarkdownFile::parse("1) first\n2) second");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("1) first\n2) second");
     match &md.sections[0] {
         Section::OrderedList {
             start: 1,
@@ -547,7 +547,7 @@ fn test_ordered_list_paren_delimiter() {
 
 #[test]
 fn test_ordered_list_different_delimiters_split() {
-    let md = MarkdownFile::parse("1. dot\n2) paren");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("1. dot\n2) paren");
     assert_eq!(md.sections.len(), 2);
     match &md.sections[0] {
         Section::OrderedList {
@@ -575,7 +575,7 @@ fn test_ordered_list_different_delimiters_split() {
 
 #[test]
 fn test_ordered_list_paren_custom_start() {
-    let md = MarkdownFile::parse("5) fifth\n6) sixth");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("5) fifth\n6) sixth");
     match &md.sections[0] {
         Section::OrderedList {
             start: 5,
@@ -592,7 +592,7 @@ fn test_ordered_list_paren_custom_start() {
 
 #[test]
 fn test_heading_closing_hashes() {
-    let md = MarkdownFile::parse("# Heading #");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("# Heading #");
     match &md.sections[0] {
         Section::Heading { level: 1, content } => {
             assert_content(&md, *content, &text("Heading"));
@@ -603,7 +603,7 @@ fn test_heading_closing_hashes() {
 
 #[test]
 fn test_heading_closing_multiple_hashes() {
-    let md = MarkdownFile::parse("## Heading ##");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("## Heading ##");
     match &md.sections[0] {
         Section::Heading { level: 2, content } => {
             assert_content(&md, *content, &text("Heading"));
@@ -614,7 +614,7 @@ fn test_heading_closing_multiple_hashes() {
 
 #[test]
 fn test_heading_closing_mismatched_hashes() {
-    let md = MarkdownFile::parse("# Heading ####");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("# Heading ####");
     match &md.sections[0] {
         Section::Heading { level: 1, content } => {
             assert_content(&md, *content, &text("Heading"));
@@ -625,7 +625,7 @@ fn test_heading_closing_mismatched_hashes() {
 
 #[test]
 fn test_heading_hash_no_space_not_stripped() {
-    let md = MarkdownFile::parse("# Heading#");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("# Heading#");
     match &md.sections[0] {
         Section::Heading { level: 1, content } => {
             assert_content(&md, *content, &text("Heading#"));
@@ -636,7 +636,7 @@ fn test_heading_hash_no_space_not_stripped() {
 
 #[test]
 fn test_heading_only_hashes() {
-    let md = MarkdownFile::parse("# ###");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("# ###");
     match &md.sections[0] {
         Section::Heading { level: 1, content } => {
             assert_content(&md, *content, &[]);
@@ -647,7 +647,7 @@ fn test_heading_only_hashes() {
 
 #[test]
 fn test_soft_break_in_paragraph() {
-    let md = MarkdownFile::parse("line one\nline two\nline three");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("line one\nline two\nline three");
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(
             &md,
@@ -666,7 +666,7 @@ fn test_soft_break_in_paragraph() {
 
 #[test]
 fn test_soft_break_single_trailing_space() {
-    let md = MarkdownFile::parse("line one \nline two");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("line one \nline two");
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(
             &md,
@@ -683,7 +683,7 @@ fn test_soft_break_single_trailing_space() {
 
 #[test]
 fn test_hard_break_two_trailing_spaces() {
-    let md = MarkdownFile::parse("line one  \nline two");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("line one  \nline two");
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(
             &md,
@@ -700,7 +700,7 @@ fn test_hard_break_two_trailing_spaces() {
 
 #[test]
 fn test_hard_break_many_trailing_spaces() {
-    let md = MarkdownFile::parse("line one     \nline two");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("line one     \nline two");
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(
             &md,
@@ -717,7 +717,7 @@ fn test_hard_break_many_trailing_spaces() {
 
 #[test]
 fn test_hard_break_trailing_backslash() {
-    let md = MarkdownFile::parse("line one\\\nline two");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("line one\\\nline two");
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(
             &md,
@@ -734,7 +734,7 @@ fn test_hard_break_trailing_backslash() {
 
 #[test]
 fn test_hard_break_with_inline() {
-    let md = MarkdownFile::parse("**bold**  \nnext line");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("**bold**  \nnext line");
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(
             &md,
@@ -751,7 +751,7 @@ fn test_hard_break_with_inline() {
 
 #[test]
 fn test_blockquote_lazy_continuation() {
-    let md = MarkdownFile::parse("> line one\ncontinuation");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("> line one\ncontinuation");
     match &md.sections[0] {
         Section::Blockquote { content } => assert_content(
             &md,
@@ -768,7 +768,7 @@ fn test_blockquote_lazy_continuation() {
 
 #[test]
 fn test_blockquote_lazy_multiple_lines() {
-    let md = MarkdownFile::parse("> first\nsecond\nthird");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("> first\nsecond\nthird");
     match &md.sections[0] {
         Section::Blockquote { content } => assert_content(
             &md,
@@ -787,7 +787,7 @@ fn test_blockquote_lazy_multiple_lines() {
 
 #[test]
 fn test_blockquote_lazy_stops_at_heading() {
-    let md = MarkdownFile::parse("> quoted\n# Heading");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("> quoted\n# Heading");
     assert_eq!(md.sections.len(), 2);
     match &md.sections[0] {
         Section::Blockquote { content } => assert_content(&md, *content, &text("quoted")),
@@ -803,7 +803,7 @@ fn test_blockquote_lazy_stops_at_heading() {
 
 #[test]
 fn test_blockquote_lazy_stops_at_hr() {
-    let md = MarkdownFile::parse("> quoted\n---");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("> quoted\n---");
     assert_eq!(md.sections.len(), 2);
     match &md.sections[0] {
         Section::Blockquote { content } => assert_content(&md, *content, &text("quoted")),
@@ -814,7 +814,7 @@ fn test_blockquote_lazy_stops_at_hr() {
 
 #[test]
 fn test_blockquote_lazy_stops_at_list() {
-    let md = MarkdownFile::parse("> quoted\n- item");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("> quoted\n- item");
     assert_eq!(md.sections.len(), 2);
     match &md.sections[0] {
         Section::Blockquote { content } => assert_content(&md, *content, &text("quoted")),
@@ -831,7 +831,7 @@ fn test_blockquote_lazy_stops_at_list() {
 
 #[test]
 fn test_blockquote_lazy_stops_at_code_fence() {
-    let md = MarkdownFile::parse("> quoted\n```\ncode\n```");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("> quoted\n```\ncode\n```");
     assert_eq!(md.sections.len(), 2);
     match &md.sections[0] {
         Section::Blockquote { content } => assert_content(&md, *content, &text("quoted")),
@@ -848,7 +848,7 @@ fn test_blockquote_lazy_stops_at_code_fence() {
 
 #[test]
 fn test_link_with_double_quote_title() {
-    let md = MarkdownFile::parse(r#"[text](url "a title")"#);
+    let md: MarkdownFile<'_> = MarkdownFile::parse(r#"[text](url "a title")"#);
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(
             &md,
@@ -865,7 +865,7 @@ fn test_link_with_double_quote_title() {
 
 #[test]
 fn test_link_with_single_quote_title() {
-    let md = MarkdownFile::parse("[text](url 'a title')");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("[text](url 'a title')");
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(
             &md,
@@ -882,7 +882,7 @@ fn test_link_with_single_quote_title() {
 
 #[test]
 fn test_link_with_paren_title() {
-    let md = MarkdownFile::parse("[text](url (a title))");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("[text](url (a title))");
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(
             &md,
@@ -899,7 +899,7 @@ fn test_link_with_paren_title() {
 
 #[test]
 fn test_link_no_title() {
-    let md = MarkdownFile::parse("[text](url)");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("[text](url)");
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(
             &md,
@@ -916,7 +916,7 @@ fn test_link_no_title() {
 
 #[test]
 fn test_image_with_title() {
-    let md = MarkdownFile::parse(r#"![alt](img.png "photo")"#);
+    let md: MarkdownFile<'_> = MarkdownFile::parse(r#"![alt](img.png "photo")"#);
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(
             &md,
@@ -933,7 +933,7 @@ fn test_image_with_title() {
 
 #[test]
 fn test_emphasis_star_intraword() {
-    let md = MarkdownFile::parse("foo*bar*baz");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("foo*bar*baz");
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(
             &md,
@@ -950,7 +950,7 @@ fn test_emphasis_star_intraword() {
 
 #[test]
 fn test_emphasis_underscore_no_intraword() {
-    let md = MarkdownFile::parse("foo_bar_baz");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("foo_bar_baz");
     match &md.sections[0] {
         Section::Paragraph { content } => {
             assert_content(&md, *content, &text("foo_bar_baz"));
@@ -961,7 +961,7 @@ fn test_emphasis_underscore_no_intraword() {
 
 #[test]
 fn test_emphasis_underscore_word_boundaries() {
-    let md = MarkdownFile::parse("_foo_ bar _baz_");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("_foo_ bar _baz_");
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(
             &md,
@@ -978,7 +978,7 @@ fn test_emphasis_underscore_word_boundaries() {
 
 #[test]
 fn test_bold_underscore_no_intraword() {
-    let md = MarkdownFile::parse("foo__bar__baz");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("foo__bar__baz");
     match &md.sections[0] {
         Section::Paragraph { content } => {
             assert_content(&md, *content, &text("foo__bar__baz"));
@@ -989,7 +989,7 @@ fn test_bold_underscore_no_intraword() {
 
 #[test]
 fn test_emphasis_star_after_punctuation() {
-    let md = MarkdownFile::parse("(*foo*)");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("(*foo*)");
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(
             &md,
@@ -1006,7 +1006,7 @@ fn test_emphasis_star_after_punctuation() {
 
 #[test]
 fn test_emphasis_underscore_after_punctuation() {
-    let md = MarkdownFile::parse("(_foo_)");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("(_foo_)");
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(
             &md,
@@ -1023,7 +1023,7 @@ fn test_emphasis_underscore_after_punctuation() {
 
 #[test]
 fn test_emphasis_not_opened_by_whitespace_after() {
-    let md = MarkdownFile::parse("a * not emphasis * b");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("a * not emphasis * b");
     match &md.sections[0] {
         Section::Paragraph { content } => {
             assert_content(&md, *content, &text("a * not emphasis * b"));
@@ -1034,7 +1034,7 @@ fn test_emphasis_not_opened_by_whitespace_after() {
 
 #[test]
 fn test_bold_star_intraword() {
-    let md = MarkdownFile::parse("foo**bar**baz");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("foo**bar**baz");
     match &md.sections[0] {
         Section::Paragraph { content } => assert_content(
             &md,

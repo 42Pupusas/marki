@@ -130,7 +130,7 @@ fn is_blank_line(bytes: &[u8], start: usize, end: usize) -> bool {
 /// Convert raw sections from pass 1 into final sections with inline parsing.
 /// Separating passes lets us pre-size the output pools from the raw section
 /// count and avoid interleaving block and inline allocation patterns.
-fn resolve_inlines<'src>(
+fn resolve_inlines<'src, const MAX_DEPTH: u8, const CAP: usize>(
     raw: Vec<RawSection<'src>>,
     lines: &[&'src str],
     pool: &mut Vec<Inline<'src>>,
@@ -142,12 +142,12 @@ fn resolve_inlines<'src>(
             RawSection::Heading { level, text } => {
                 sections.push(Section::Heading {
                     level,
-                    content: Inline::parse(text, pool),
+                    content: Inline::parse_configured::<MAX_DEPTH, CAP>(text, pool),
                 });
             }
             RawSection::Paragraph { text } => {
                 sections.push(Section::Paragraph {
-                    content: Inline::parse(text, pool),
+                    content: Inline::parse_configured::<MAX_DEPTH, CAP>(text, pool),
                 });
             }
             RawSection::CodeBlock { language, code } => {
@@ -162,7 +162,7 @@ fn resolve_inlines<'src>(
                         .unwrap_or(&[]);
                 let start = pool_offset(span_pool.len());
                 for item in raw_items {
-                    let span = Inline::parse(item, pool);
+                    let span = Inline::parse_configured::<MAX_DEPTH, CAP>(item, pool);
                     span_pool.push(span);
                 }
                 let len = pool_offset(span_pool.len()) - start;
@@ -181,7 +181,7 @@ fn resolve_inlines<'src>(
                         .unwrap_or(&[]);
                 let sp_start = pool_offset(span_pool.len());
                 for item in raw_items {
-                    let span = Inline::parse(item, pool);
+                    let span = Inline::parse_configured::<MAX_DEPTH, CAP>(item, pool);
                     span_pool.push(span);
                 }
                 let sp_len = pool_offset(span_pool.len()) - sp_start;
@@ -203,7 +203,7 @@ fn resolve_inlines<'src>(
                     if i > 0 {
                         pool.push(Inline::Text("\n"));
                     }
-                    Inline::parse_flat_into(line, pool);
+                    Inline::parse_flat_into_configured::<MAX_DEPTH, CAP>(line, pool);
                 }
                 let len = pool_offset(pool.len()) - start;
                 sections.push(Section::Blockquote {
@@ -219,192 +219,67 @@ fn resolve_inlines<'src>(
 }
 
 // ---------------------------------------------------------------------------
-// MarkdownFile: public API and static helpers
+// BlockBytes trait — block-level helpers on byte slices.
 // ---------------------------------------------------------------------------
 
-impl<'src> MarkdownFile<'src> {
-    #[must_use]
-    pub fn parse(input: &'src str) -> Self {
-        let bytes = input.as_bytes();
-
-        // --- Pass 1: block-level parsing (no inline work) ---
-        let mut ctx = ParseCtx {
-            input,
-            bytes,
-            // Rough heuristic: ~50 bytes per section on average.
-            sections: Vec::with_capacity(input.len() / 50 + 1),
-            lines: Vec::with_capacity(input.len() / 80 + 1),
-        };
-        let mut acc = Accumulator::Empty;
-        let mut pos = 0;
-
-        while pos < bytes.len() {
-            let line_end = find_byte(bytes, pos, b'\n').unwrap_or(bytes.len());
-
-            // Fast-path: when we detect a code fence opening, scan ahead for
-            // the closing fence in one shot instead of processing line-by-line.
-            // CommonMark §4.5: a code fence can be indented 0-3 spaces, so we
-            // only need to check if a backtick appears within the first 4 bytes.
-            let first = bytes.get(pos).copied().unwrap_or(SpecialChar::Space.byte());
-            let backtick = SpecialChar::Backtick.byte();
-            if first == backtick
-                || (first == SpecialChar::Space
-                    && bytes[pos..line_end]
-                        .get(..4)
-                        .is_some_and(|w| w.contains(&backtick)))
-            {
-                let fence_len = Self::code_fence_len_bytes(&bytes[pos..line_end]);
-                if fence_len > 0 {
-                    let language =
-                        Self::extract_code_language_bytes(input, &bytes[pos..line_end]);
-                    acc.flush_into(&mut ctx);
-                    let content_start = line_end + 1;
-                    let (code, resume) =
-                        Self::scan_code_block_fast(input, bytes, content_start, fence_len);
-                    ctx.sections
-                        .push(RawSection::CodeBlock { language, code });
-                    pos = resume;
-                    acc = Accumulator::Empty;
-                    continue;
-                }
-            }
-
-            acc = ctx.fold_line(acc, pos, line_end);
-            pos = line_end + 1;
-        }
-
-        acc.flush_into(&mut ctx);
-
-        // --- Pass 2: inline parsing ---
-        let mut pool = Vec::with_capacity(input.len() / 20);
-        let mut span_pool = Vec::with_capacity(input.len() / 100 + 1);
-        let sections = resolve_inlines(ctx.sections, &ctx.lines, &mut pool, &mut span_pool);
-
-        Self {
-            sections,
-            pool,
-            span_pool,
-        }
+/// Lookup table: true for bytes that could start a block-level element
+/// (blockquote, list marker, HR character, or digit for ordered lists).
+const COULD_START_BLOCK: [bool; 256] = {
+    let mut table = [false; 256];
+    table[SpecialChar::GreaterThan.byte() as usize] = true;
+    table[SpecialChar::Dash.byte() as usize] = true;
+    table[SpecialChar::Asterisk.byte() as usize] = true;
+    table[SpecialChar::Plus.byte() as usize] = true;
+    table[SpecialChar::Underscore.byte() as usize] = true;
+    let mut d = SpecialChar::Zero.byte();
+    while d <= b'9' {
+        table[d as usize] = true;
+        d += 1;
     }
+    table
+};
 
-    /// Scan forward from `start` to find a closing code fence of at least
-    /// `fence_len` backticks. Returns `(code_content, resume_position)`.
-    fn scan_code_block_fast(
-        input: &'src str,
-        bytes: &[u8],
-        start: usize,
-        fence_len: usize,
-    ) -> (&'src str, usize) {
-        let mut pos = start;
-        while pos < bytes.len() {
-            let line_end = find_byte(bytes, pos, b'\n').unwrap_or(bytes.len());
+trait BlockBytes {
+    fn code_fence_len(&self) -> usize;
+    fn is_horizontal_rule(&self) -> bool;
+    fn try_parse_heading<'src>(&self, input: &'src str, line_offset: usize) -> Option<(u8, &'src str)>;
+    fn extract_code_language<'src>(&self, input: &'src str) -> Option<&'src str>;
+    fn try_parse_unordered_item(&self) -> Option<(SpecialChar, usize)>;
+    fn try_parse_ordered_item(&self) -> Option<(u32, OrderedListDelimiter, usize)>;
+    fn could_start_block(&self) -> bool;
+}
 
-            // Check for closing fence: first non-whitespace byte must be backtick.
-            let first = bytes.get(pos).copied().unwrap_or(0);
-            if (first == SpecialChar::Backtick.byte() || first.is_ascii_whitespace())
-                && Self::code_fence_len_bytes(&bytes[pos..line_end]) >= fence_len
-            {
-                // Content is everything between opening and closing fence.
-                let code = if start < pos {
-                    input.get(start..pos - 1).unwrap_or("")
-                } else {
-                    ""
-                };
-                return (code, line_end + 1);
-            }
-            pos = line_end + 1;
-        }
-        // Unclosed code block: content runs to end of input.
-        let code = input.get(start..).unwrap_or("");
-        (code, bytes.len())
-    }
-
-    /// Lookup table: true for bytes that could start a block-level element
-    /// (blockquote, list marker, HR character, or digit for ordered lists).
-    const COULD_START_BLOCK: [bool; 256] = {
-        let mut table = [false; 256];
-        table[SpecialChar::GreaterThan.byte() as usize] = true;
-        table[SpecialChar::Dash.byte() as usize] = true;
-        table[SpecialChar::Asterisk.byte() as usize] = true;
-        table[SpecialChar::Plus.byte() as usize] = true;
-        table[SpecialChar::Underscore.byte() as usize] = true;
-        let mut d = b'0';
-        while d <= b'9' {
-            table[d as usize] = true;
-            d += 1;
-        }
-        table
-    };
-
-    // -----------------------------------------------------------------------
-    // Byte-level classification helpers — no &str involved
-    // -----------------------------------------------------------------------
-
-    #[inline]
-    /// Returns the fence length (number of backticks) if the line bytes are a
+impl BlockBytes for [u8] {
+    /// Returns the fence length (number of backticks) if this line is a
     /// valid code fence (`CommonMark` §4.5), or 0 if not. A valid fence has 3+
     /// backticks with no backticks in the info string.
-    fn code_fence_len_bytes(line: &[u8]) -> usize {
+    #[inline]
+    fn code_fence_len(&self) -> usize {
         // Skip leading whitespace.
         let mut first = 0;
-        while first < line.len() && line[first].is_ascii_whitespace() {
+        while first < self.len() && self[first].is_ascii_whitespace() {
             first += 1;
         }
         // Quick reject: first non-whitespace byte must be a backtick.
-        let backtick = SpecialChar::Backtick.byte();
-        if first >= line.len() || line[first] != backtick {
+        if self.get(first) != SpecialChar::Backtick {
             return 0;
         }
         // Count backticks directly from the offset we already found.
-        let mut end = first + 1;
-        while end < line.len() && line[end] == backtick {
-            end += 1;
-        }
-        let len = end - first;
-        if len >= 3 && !line[end..].contains(&backtick) {
+        let len = SpecialChar::Backtick.count_leading_bytes(&self[first..]);
+        if len >= 3 && !self[first + len..].contains(&SpecialChar::Backtick.byte()) {
             len
         } else {
             0
         }
     }
 
-    /// Extract the language tag from a code fence line (bytes), returning
-    /// a `&str` slice from `input`.
-    fn extract_code_language_bytes(input: &'src str, line: &[u8]) -> Option<&'src str> {
-        // Find the start of the info string: skip whitespace then backticks.
-        let mut i = 0;
-        while i < line.len() && line[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        let backtick = SpecialChar::Backtick.byte();
-        while i < line.len() && line[i] == backtick {
-            i += 1;
-        }
-        // Trim remaining whitespace around the info string.
-        while i < line.len() && line[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        let mut end = line.len();
-        while end > i && line[end - 1].is_ascii_whitespace() {
-            end -= 1;
-        }
-        if i >= end {
-            None
-        } else {
-            // Compute the absolute offset into input. line is a subslice of
-            // input.as_bytes(), so pointer arithmetic gives us the offset.
-            let line_offset = line.as_ptr() as usize - input.as_ptr() as usize;
-            input.get(line_offset + i..line_offset + end)
-        }
-    }
-
-    /// Check whether a line (bytes) is a thematic break / horizontal rule
+    /// Check whether this line is a thematic break / horizontal rule
     /// (`CommonMark` §4.1): three or more matching `-`, `*`, or `_` characters,
     /// optionally separated by spaces, with nothing else on the line.
-    fn is_horizontal_rule_bytes(line: &[u8]) -> bool {
+    fn is_horizontal_rule(&self) -> bool {
         let mut rule_byte = 0u8;
         let mut count = 0u32;
-        for &b in line {
+        for &b in self {
             if b.is_ascii_whitespace() {
                 continue;
             }
@@ -425,41 +300,36 @@ impl<'src> MarkdownFile<'src> {
         count >= 3
     }
 
-    /// Check whether a byte slice is an ATX heading (`CommonMark` §4.2).
+    /// Check whether this byte slice is an ATX heading (`CommonMark` §4.2).
     /// Returns `(level, text)` without performing any inline parsing.
-    fn try_parse_heading_range(
-        input: &'src str,
-        line: &[u8],
-        line_offset: usize,
-    ) -> Option<(u8, &'src str)> {
-        let level = SpecialChar::Hash.count_leading_bytes(line);
-        if !(1..=6).contains(&level) || line.get(level) != SpecialChar::Space {
+    fn try_parse_heading<'src>(&self, input: &'src str, line_offset: usize) -> Option<(u8, &'src str)> {
+        let level = SpecialChar::Hash.count_leading_bytes(self);
+        if !(1..=6).contains(&level) || self.get(level) != SpecialChar::Space {
             return None;
         }
         // Trim leading whitespace after '#'s.
         let mut start = level;
-        while start < line.len() && line[start].is_ascii_whitespace() {
+        while start < self.len() && self[start].is_ascii_whitespace() {
             start += 1;
         }
-        let mut end = line.len();
-        while end > start && line[end - 1].is_ascii_whitespace() {
+        let mut end = self.len();
+        while end > start && self[end - 1].is_ascii_whitespace() {
             end -= 1;
         }
         // Strip optional closing # sequence per CommonMark §4.2:
         // trailing #s are removed only if preceded by whitespace (or they
         // are the entire content after the opening).
         let mut stripped_end = end;
-        while stripped_end > start && line[stripped_end - 1] == SpecialChar::Hash.byte() {
+        while stripped_end > start && self.get(stripped_end - 1) == SpecialChar::Hash {
             stripped_end -= 1;
         }
         if stripped_end == start
-            || line
-                .get(stripped_end - 1)
-                .is_some_and(|&b| b == SpecialChar::Space || b == SpecialChar::Tab)
+            || self.get(stripped_end - 1) == SpecialChar::Space
+            || self.get(stripped_end - 1) == SpecialChar::Tab
         {
             // Trim whitespace before the closing hashes.
             end = stripped_end;
-            while end > start && line[end - 1].is_ascii_whitespace() {
+            while end > start && self[end - 1].is_ascii_whitespace() {
                 end -= 1;
             }
         }
@@ -468,34 +338,61 @@ impl<'src> MarkdownFile<'src> {
         Some((level, text))
     }
 
-    /// Try to parse an unordered list item from a byte slice.
+    /// Extract the language tag from a code fence line, returning
+    /// a `&str` slice from `input`.
+    fn extract_code_language<'src>(&self, input: &'src str) -> Option<&'src str> {
+        // Find the start of the info string: skip whitespace then backticks.
+        let mut i = 0;
+        while self.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        i += SpecialChar::Backtick.count_leading_bytes(&self[i..]);
+        // Trim remaining whitespace around the info string.
+        while self.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        let mut end = self.len();
+        while end > i && self[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        if i >= end {
+            None
+        } else {
+            // Compute the absolute offset into input. self is a subslice of
+            // input.as_bytes(), so pointer arithmetic gives us the offset.
+            let line_offset = self.as_ptr() as usize - input.as_ptr() as usize;
+            input.get(line_offset + i..line_offset + end)
+        }
+    }
+
+    /// Try to parse an unordered list item.
     /// Returns `(marker, item_byte_offset)` where offset is relative to line start.
-    fn try_parse_unordered_item_bytes(line: &[u8]) -> Option<(SpecialChar, usize)> {
-        let &first = line.first()?;
+    fn try_parse_unordered_item(&self) -> Option<(SpecialChar, usize)> {
+        let &first = self.first()?;
         let marker = SpecialChar::from_byte(first)?;
         if !marker.is_list_char() {
             return None;
         }
-        if line.get(1) == SpecialChar::Space {
+        if self.get(1) == SpecialChar::Space {
             Some((marker, 2))
         } else {
             None
         }
     }
 
-    /// Try to parse an ordered list item from a byte slice.
+    /// Try to parse an ordered list item.
     /// Returns `(number, delimiter, item_byte_offset)` where offset is relative
     /// to line start.
-    fn try_parse_ordered_item_bytes(line: &[u8]) -> Option<(u32, OrderedListDelimiter, usize)> {
+    fn try_parse_ordered_item(&self) -> Option<(u32, OrderedListDelimiter, usize)> {
         let mut num: u32 = 0;
         let mut digits = 0usize;
-        for &b in line {
+        for &b in self {
             if b.is_ascii_digit() {
                 digits += 1;
                 if digits > 9 {
                     return None;
                 }
-                num = num * 10 + u32::from(b - b'0');
+                num = num * 10 + u32::from(b - SpecialChar::Zero.byte());
             } else {
                 break;
             }
@@ -503,29 +400,142 @@ impl<'src> MarkdownFile<'src> {
         if digits == 0 {
             return None;
         }
-        let delimiter = OrderedListDelimiter::from_byte(line.get(digits).copied()?)?;
-        if line.get(digits + 1) != SpecialChar::Space {
+        let delimiter = OrderedListDelimiter::from_byte(self.get(digits).copied()?)?;
+        if self.get(digits + 1) != SpecialChar::Space {
             return None;
         }
         let item_offset = digits + 2;
-        if item_offset >= line.len() {
+        if item_offset >= self.len() {
             return None;
         }
         Some((num, delimiter, item_offset))
     }
 
-    /// Merge two subslices of `base` into one contiguous slice spanning from the
-    /// start of `a` to the end of `b`.
-    fn merge_slices(base: &'src str, a: &str, b: &str) -> Option<&'src str> {
-        let base_start = base.as_ptr() as usize;
-        let a_start = a.as_ptr() as usize;
-        let b_end = b.as_ptr() as usize + b.len();
+    /// Check whether the first byte of this line could start a block-level element.
+    #[inline]
+    fn could_start_block(&self) -> bool {
+        self.first().is_some_and(|&b| COULD_START_BLOCK[b as usize])
+    }
+}
 
-        if a_start < base_start || b_end > base_start + base.len() || b_end < a_start {
-            return None;
+/// Scan forward from `start` to find a closing code fence of at least
+/// `fence_len` backticks. Returns `(code_content, resume_position)`.
+fn scan_code_block_fast<'src>(
+    input: &'src str,
+    bytes: &[u8],
+    start: usize,
+    fence_len: usize,
+) -> (&'src str, usize) {
+    let mut pos = start;
+    while pos < bytes.len() {
+        let line_end = find_byte(bytes, pos, SpecialChar::Newline.byte()).unwrap_or(bytes.len());
+
+        // Check for closing fence: first non-whitespace byte must be backtick.
+        let first = bytes.get(pos).copied();
+        if (first == SpecialChar::Backtick || first.is_some_and(|b| b.is_ascii_whitespace()))
+            && bytes[pos..line_end].code_fence_len() >= fence_len
+        {
+            // Content is everything between opening and closing fence.
+            let code = if start < pos {
+                input.get(start..pos - 1).unwrap_or("")
+            } else {
+                ""
+            };
+            return (code, line_end + 1);
+        }
+        pos = line_end + 1;
+    }
+    // Unclosed code block: content runs to end of input.
+    let code = input.get(start..).unwrap_or("");
+    (code, bytes.len())
+}
+
+/// Merge two subslices of `base` into one contiguous slice spanning from the
+/// start of `a` to the end of `b`.
+fn merge_slices<'src>(base: &'src str, a: &str, b: &str) -> Option<&'src str> {
+    let base_start = base.as_ptr() as usize;
+    let a_start = a.as_ptr() as usize;
+    let b_end = b.as_ptr() as usize + b.len();
+
+    if a_start < base_start || b_end > base_start + base.len() || b_end < a_start {
+        return None;
+    }
+
+    base.get(a_start - base_start..b_end - base_start)
+}
+
+// ---------------------------------------------------------------------------
+// MarkdownFile: public API
+// ---------------------------------------------------------------------------
+
+impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
+    MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP>
+{
+    #[must_use]
+    pub fn parse(input: &'src str) -> Self {
+        let bytes = input.as_bytes();
+
+        // --- Pass 1: block-level parsing (no inline work) ---
+        let mut ctx = ParseCtx {
+            input,
+            bytes,
+            // Rough heuristic: ~50 bytes per section on average.
+            sections: Vec::with_capacity(input.len() / 50 + 1),
+            lines: Vec::with_capacity(input.len() / 80 + 1),
+        };
+        let mut acc = Accumulator::Empty;
+        let mut pos = 0;
+
+        while pos < bytes.len() {
+            let line_end = find_byte(bytes, pos, SpecialChar::Newline.byte()).unwrap_or(bytes.len());
+
+            // Fast-path: when we detect a code fence opening, scan ahead for
+            // the closing fence in one shot instead of processing line-by-line.
+            // CommonMark §4.5: a code fence can be indented 0-3 spaces, so we
+            // only need to check if a backtick appears within the first 4 bytes.
+            let first = bytes.get(pos).copied();
+            if first == SpecialChar::Backtick
+                || (first == SpecialChar::Space
+                    && bytes[pos..line_end]
+                        .get(..4)
+                        .is_some_and(|w| w.contains(&SpecialChar::Backtick.byte())))
+            {
+                let fence_len = bytes[pos..line_end].code_fence_len();
+                if fence_len > 0 {
+                    let language = bytes[pos..line_end].extract_code_language(input);
+                    acc.flush_into(&mut ctx);
+                    let content_start = line_end + 1;
+                    let (code, resume) =
+                        scan_code_block_fast(input, bytes, content_start, fence_len);
+                    ctx.sections
+                        .push(RawSection::CodeBlock { language, code });
+                    pos = resume;
+                    acc = Accumulator::Empty;
+                    continue;
+                }
+            }
+
+            acc = ctx.fold_line(acc, pos, line_end);
+            pos = line_end + 1;
         }
 
-        base.get(a_start - base_start..b_end - base_start)
+        acc.flush_into(&mut ctx);
+
+        // --- Pass 2: inline parsing ---
+        let mut pool = Vec::with_capacity(input.len() / 20);
+        let mut span_pool = Vec::with_capacity(input.len() / 100 + 1);
+        let sections = resolve_inlines::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>(
+            ctx.sections,
+            &ctx.lines,
+            &mut pool,
+            &mut span_pool,
+        );
+
+        Self {
+            sections,
+            pool,
+            span_pool,
+        }
     }
 }
 
@@ -545,18 +555,17 @@ impl<'src> ParseCtx<'src> {
         pos: usize,
         line_end: usize,
     ) -> Accumulator<'src> {
-        let first = self.bytes.get(pos).copied().unwrap_or(SpecialChar::Space.byte());
+        let first = self.bytes.get(pos).copied();
 
-        if first.is_ascii_whitespace() && is_blank_line(self.bytes, pos, line_end) {
+        if first.is_some_and(|b| b.is_ascii_whitespace()) && is_blank_line(self.bytes, pos, line_end) {
             acc.flush_into(self);
             return Accumulator::Empty;
         }
 
         // ATX headings (CommonMark §4.2): only if line starts with '#'.
-        if first == SpecialChar::Hash.byte()
-            && let Some((level, text)) = MarkdownFile::try_parse_heading_range(
+        if first == SpecialChar::Hash
+            && let Some((level, text)) = self.bytes[pos..line_end].try_parse_heading(
                 self.input,
-                &self.bytes[pos..line_end],
                 pos,
             )
         {
@@ -581,7 +590,7 @@ impl<'src> ParseCtx<'src> {
         // element, skip all the block-level checks and extend the paragraph.
         if let Accumulator::InParagraph { .. } = acc
             && !line_bytes.is_empty()
-            && !MarkdownFile::<'src>::COULD_START_BLOCK[line_bytes[0] as usize]
+            && !line_bytes.could_start_block()
         {
             return self.fold_paragraph(acc, pos, line_end);
         }
@@ -609,16 +618,15 @@ impl<'src> ParseCtx<'src> {
         let acc = if let Accumulator::InBlockquote { lines_start } = acc {
             // Fast reject: if first byte can't start a block element, continue.
             let continues = if !line_bytes.is_empty()
-                && !MarkdownFile::<'src>::COULD_START_BLOCK[line_bytes[0] as usize]
+                && !line_bytes.could_start_block()
             {
                 true
             } else {
-                !MarkdownFile::is_horizontal_rule_bytes(line_bytes)
-                    && MarkdownFile::try_parse_heading_range(self.input, line_bytes, pos)
-                        .is_none()
-                    && MarkdownFile::<'src>::code_fence_len_bytes(line_bytes) == 0
-                    && MarkdownFile::<'src>::try_parse_unordered_item_bytes(line_bytes).is_none()
-                    && MarkdownFile::<'src>::try_parse_ordered_item_bytes(line_bytes).is_none()
+                !line_bytes.is_horizontal_rule()
+                    && line_bytes.try_parse_heading(self.input, pos).is_none()
+                    && line_bytes.code_fence_len() == 0
+                    && line_bytes.try_parse_unordered_item().is_none()
+                    && line_bytes.try_parse_ordered_item().is_none()
             };
             if continues {
                 self.lines
@@ -634,21 +642,21 @@ impl<'src> ParseCtx<'src> {
 
         // Horizontal rules (CommonMark §4.1): three or more -, *, or _
         // characters (optionally with spaces) on a line by themselves.
-        if MarkdownFile::is_horizontal_rule_bytes(line_bytes) {
+        if line_bytes.is_horizontal_rule() {
             acc.flush_into(self);
             self.sections.push(RawSection::HorizontalRule);
             return Accumulator::Empty;
         }
 
         if let Some((marker, item_offset)) =
-            MarkdownFile::<'src>::try_parse_unordered_item_bytes(line_bytes)
+            line_bytes.try_parse_unordered_item()
         {
             let item = self.input.get(pos + item_offset..line_end).unwrap_or("");
             return self.fold_unordered_list(acc, marker, item);
         }
 
         if let Some((num, delim, item_offset)) =
-            MarkdownFile::<'src>::try_parse_ordered_item_bytes(line_bytes)
+            line_bytes.try_parse_ordered_item()
         {
             let item = self.input.get(pos + item_offset..line_end).unwrap_or("");
             return self.fold_ordered_list(acc, num, delim, item);
@@ -738,7 +746,7 @@ impl<'src> ParseCtx<'src> {
     ) -> Accumulator<'src> {
         let line_str = self.input.get(pos..line_end).unwrap_or("");
         if let Accumulator::InParagraph { content } = acc {
-            return MarkdownFile::merge_slices(self.input, content, line_str).map_or_else(
+            return merge_slices(self.input, content, line_str).map_or_else(
                 || {
                     self.sections.push(RawSection::Paragraph { text: content });
                     Accumulator::InParagraph { content: line_str }
