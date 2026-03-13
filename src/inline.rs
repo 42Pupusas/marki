@@ -463,37 +463,49 @@ impl<'src> Inline<'src> {
         ))
     }
 
-    /// Split the content inside `(...)` into a URL and optional title.
+    /// Split the content inside `(...)` into a URL and optional title
+    /// (`CommonMark` §6.3).
+    ///
     /// Titles are delimited by `"..."`, `'...'`, or `(...)`.
+    ///
+    /// We scan **backwards** because the title, if present, is always at the
+    /// end. The algorithm:
+    ///  1. Check the last byte for a closing title delimiter (`"`, `'`, `)`).
+    ///  2. Walk backwards to find the matching opener.
+    ///  3. The opener must be preceded by whitespace — this separates the URL
+    ///     from the title. If no whitespace is found, there is no title.
+    ///  4. For **paired** delimiters (`(…)`), if the first candidate opener
+    ///     lacks preceding whitespace we keep scanning for an earlier `(`
+    ///     that does. For **same-char** delimiters (`"…"`, `'…'`), the first
+    ///     match is the only candidate (no nesting possible).
     fn split_url_title(content: &'src str) -> (&'src str, Option<&'src str>) {
         let trimmed = content.trim();
         if trimmed.is_empty() {
             return ("", None);
         }
 
-        // Find the title delimiter at the end: must be preceded by whitespace.
         let bytes = trimmed.as_bytes();
         let last = bytes[bytes.len() - 1];
         let (open, close) = match last {
             b'"' => (b'"', b'"'),
             b'\'' => (b'\'', b'\''),
             b')' => (b'(', b')'),
+            // No trailing title delimiter — the entire content is the URL.
             _ => return (trimmed, None),
         };
 
-        // Scan backwards to find the matching opening delimiter.
-        // We need to find the opening quote that has whitespace before it
-        // (separating URL from title).
+        // Scan backwards for the matching opening delimiter.
         let mut j = bytes.len() - 2;
         loop {
             if bytes[j] == open {
-                // Check that there is whitespace before this opening delimiter.
+                // Whitespace before the opener separates URL from title.
                 if j > 0 && bytes[j - 1].is_ascii_whitespace() {
                     let url = trimmed[..j].trim_end();
                     let title = &trimmed[j + 1..bytes.len() - 1];
                     return (url, Some(title));
                 }
-                // For paired delimiters like (), keep scanning for an earlier match.
+                // For paired delimiters (open != close), keep scanning for an
+                // earlier opener that *does* have preceding whitespace.
                 if open != close {
                     if j == 0 {
                         break;
@@ -501,6 +513,7 @@ impl<'src> Inline<'src> {
                     j -= 1;
                     continue;
                 }
+                // Same-char delimiter: first match is the only candidate.
                 break;
             }
             if j == 0 {
@@ -509,6 +522,7 @@ impl<'src> Inline<'src> {
             j -= 1;
         }
 
+        // No valid title found — treat entire content as URL.
         (trimmed, None)
     }
 
@@ -556,7 +570,11 @@ impl<'src> Inline<'src> {
 
         let is_star = marker == SpecialChar::Asterisk;
 
-        // Check opening delimiter run is left-flanking (and for `_`, extra rules).
+        // CommonMark §6.2 — emphasis flanking rules:
+        // A left-flanking delimiter run must not be followed by whitespace,
+        // and must not be followed by punctuation unless preceded by whitespace
+        // or punctuation. For `_`, it must also not be right-flanking (unless
+        // preceded by punctuation), preventing intra-word emphasis.
         let before_open = Self::char_class_before(bytes, start);
         let after_open = Self::char_class_after(bytes, inner_start);
 
@@ -599,7 +617,10 @@ impl<'src> Inline<'src> {
             let before_close = Self::char_class_before(bytes, i);
             let after_close = Self::char_class_after(bytes, close_end);
 
-            // Check closing delimiter run is right-flanking.
+            // CommonMark §6.2 — closing delimiter must be right-flanking:
+            // not preceded by whitespace, and not preceded by punctuation
+            // unless followed by whitespace or punctuation. For `_`, must
+            // also not be left-flanking (unless followed by punctuation).
             let right_flanking = before_close != CharClass::Whitespace
                 && (before_close != CharClass::Punctuation || after_close != CharClass::Other);
             if !right_flanking {
@@ -623,7 +644,7 @@ impl<'src> Inline<'src> {
         None
     }
 
-    /// Parse inline code: `` `code` `` or ``` ``code`` ```.
+    /// Parse inline code spans (`CommonMark` §6.1).
     /// The opening and closing backtick sequences must have the same length.
     /// Content is taken verbatim (no backslash escaping inside code spans).
     fn try_parse_inline_code(
@@ -656,7 +677,8 @@ impl<'src> Inline<'src> {
                 .count();
 
             if close_count == backtick_count {
-                // Strip single leading/trailing space per CommonMark
+                // CommonMark §6.1: strip one leading and one trailing space
+                // when the content both starts and ends with a space.
                 let mut cs = content_start;
                 let mut ce = i;
                 if ce - cs >= 2 && bytes.get(cs) == Some(&b' ') && bytes.get(ce - 1) == Some(&b' ')
