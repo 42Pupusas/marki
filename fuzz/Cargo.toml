@@ -1,0 +1,28 @@
+[package]
+name = "marki-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.marki]
+path = ".."
+
+[[bin]]
+name = "parse"
+path = "fuzz_targets/parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "normalize_and_parse"
+path = "fuzz_targets/normalize_and_parse.rs"
+test = false
+doc = false
+bench = false

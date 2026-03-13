@@ -6,6 +6,8 @@ mod special_char;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod fuzz_finds;
 
 use std::borrow::Cow;
 
