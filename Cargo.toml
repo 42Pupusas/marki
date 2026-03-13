@@ -10,7 +10,12 @@ nursery = "warn"
 
 [dev-dependencies]
 criterion = "0.5"
+pulldown-cmark = "0.12"
 
 [[bench]]
 name = "parse"
+harness = false
+
+[[bench]]
+name = "vs_pulldown_cmark"
 harness = false
