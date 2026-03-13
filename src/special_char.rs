@@ -105,7 +105,11 @@ use std::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-#[allow(clippy::cast_ptr_alignment, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_ptr_alignment,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 unsafe fn count_leading_sse2(bytes: &[u8], needle: u8) -> usize {
     let len = bytes.len();
     let ptr = bytes.as_ptr();

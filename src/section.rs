@@ -45,6 +45,7 @@ impl SpanSlice {
     }
 }
 
+/// The delimiter used after the number in an ordered list item (`1.` vs `1)`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum OrderedListDelimiter {
@@ -80,6 +81,7 @@ impl PartialEq<OrderedListDelimiter> for u8 {
     }
 }
 
+/// A block-level element of a Markdown document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section<'src> {
     Heading {

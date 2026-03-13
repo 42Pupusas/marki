@@ -15,6 +15,7 @@ fn count_leading_byte(bytes: &[u8], needle: u8) -> usize {
     n
 }
 
+/// An inline element within a Markdown block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Inline<'src> {
     Text(&'src str),
@@ -307,7 +308,7 @@ impl<'src> Inline<'src> {
     /// Parse inline elements and store them in the pool. Returns a span.
     ///
     /// Uses default limits (`MAX_INLINE_DEPTH = 16`, `INLINE_STACK_CAP = 32`).
-    /// For custom limits, use [`MarkdownFile::parse`] with const generics.
+    /// For custom limits, use [`crate::MarkdownFile::parse`] with const generics.
     #[must_use]
     pub fn parse(input: &'src str, pool: &mut Vec<Self>) -> InlineSpan {
         Self::parse_configured::<16, 32>(input, pool)
@@ -368,7 +369,7 @@ impl<'src> Inline<'src> {
     /// manages span boundaries.
     ///
     /// Uses default limits (`MAX_INLINE_DEPTH = 16`, `INLINE_STACK_CAP = 32`).
-    /// For custom limits, use [`MarkdownFile::parse`] with const generics.
+    /// For custom limits, use [`crate::MarkdownFile::parse`] with const generics.
     pub fn parse_flat_into(input: &'src str, pool: &mut Vec<Self>) {
         Self::parse_flat_into_configured::<16, 32>(input, pool);
     }
@@ -496,8 +497,9 @@ impl<'src> Inline<'src> {
             }
 
             // Bold/Italic: ** __ * _
-            if let Some((elem, end)) = Self::try_parse_emphasis::<MAX_DEPTH, CAP>(input, bytes, i, b, &mut emph, pool, depth)
-            {
+            if let Some((elem, end)) = Self::try_parse_emphasis::<MAX_DEPTH, CAP>(
+                input, bytes, i, b, &mut emph, pool, depth,
+            ) {
                 if let Some(text) = input.get(plain_start..i)
                     && !text.is_empty()
                 {

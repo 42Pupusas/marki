@@ -1,3 +1,49 @@
+//! A fast, zero-copy `CommonMark` parser with SIMD-accelerated scanning.
+//!
+//! `marki` parses Markdown into structured [`Section`] and [`Inline`] elements,
+//! borrowing directly from the input string with no intermediate allocations for
+//! text content.
+//!
+//! # Quick start
+//!
+//! ```
+//! use marki::MarkdownFile;
+//!
+//! let md: MarkdownFile<'_> = MarkdownFile::parse("# Hello\n\nSome **bold** text.");
+//! for section in &md.sections {
+//!     println!("{section:?}");
+//! }
+//! ```
+//!
+//! # CRLF input
+//!
+//! The parser operates on LF (`\n`) line endings. For input that may contain
+//! `\r\n`, call [`normalize`] first — it returns the input borrowed when no
+//! `\r` is present (zero cost):
+//!
+//! ```
+//! let input = "# Hello\r\nWorld";
+//! let normalized = marki::normalize(input);
+//! let md: marki::MarkdownFile<'_> = marki::MarkdownFile::parse(&normalized);
+//! ```
+//!
+//! # Accessing inline elements
+//!
+//! Inline elements are stored in a flat pool for cache efficiency. Use
+//! [`MarkdownFile::inlines`] and [`MarkdownFile::item_spans`] (or index with
+//! [`InlineSpan`] / [`SpanSlice`]) to retrieve them:
+//!
+//! ```
+//! use marki::{MarkdownFile, Section};
+//!
+//! let md: MarkdownFile<'_> = MarkdownFile::parse("Hello **world**");
+//! if let Some(Section::Paragraph { content }) = md.sections.first() {
+//!     for inline in md.inlines(*content) {
+//!         println!("{inline:?}");
+//!     }
+//! }
+//! ```
+
 mod block;
 mod inline;
 mod section;
@@ -5,9 +51,9 @@ pub(crate) mod simd;
 mod special_char;
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod fuzz_finds;
+#[cfg(test)]
+mod tests;
 
 use std::borrow::Cow;
 
@@ -37,9 +83,7 @@ pub fn normalize(input: &str) -> Cow<'_, str> {
     // \n and consuming the following \n in \r\n pairs.
     let mut out = String::with_capacity(input.len());
     let mut start = 0;
-    while let Some(cr) =
-        simd::find_byte(bytes, start, SpecialChar::CarriageReturn.byte())
-    {
+    while let Some(cr) = simd::find_byte(bytes, start, SpecialChar::CarriageReturn.byte()) {
         out.push_str(&input[start..cr]);
         out.push('\n');
         start = cr + 1;
@@ -52,12 +96,19 @@ pub fn normalize(input: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// A parsed Markdown document.
+///
+/// Contains the block-level [`Section`]s and the internal pools that store
+/// [`Inline`] elements. Use [`inlines`](Self::inlines) and
+/// [`item_spans`](Self::item_spans) to access inline content referenced by
+/// sections.
+///
+/// The const generics `MAX_INLINE_DEPTH` and `INLINE_STACK_CAP` control
+/// recursion depth and stack-allocation size for emphasis parsing. The
+/// defaults (`16` and `32`) are suitable for virtually all real-world input.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MarkdownFile<
-    'src,
-    const MAX_INLINE_DEPTH: u8 = 16,
-    const INLINE_STACK_CAP: usize = 32,
-> {
+pub struct MarkdownFile<'src, const MAX_INLINE_DEPTH: u8 = 16, const INLINE_STACK_CAP: usize = 32> {
+    /// The block-level sections of the document, in order.
     pub sections: Vec<Section<'src>>,
     pool: Vec<Inline<'src>>,
     span_pool: Vec<InlineSpan>,
@@ -79,8 +130,8 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     }
 }
 
-impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
-    std::ops::Index<InlineSpan> for MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP>
+impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize> std::ops::Index<InlineSpan>
+    for MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP>
 {
     type Output = [Inline<'src>];
 
@@ -91,8 +142,8 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     }
 }
 
-impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
-    std::ops::Index<SpanSlice> for MarkdownFile<'_, MAX_INLINE_DEPTH, INLINE_STACK_CAP>
+impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize> std::ops::Index<SpanSlice>
+    for MarkdownFile<'_, MAX_INLINE_DEPTH, INLINE_STACK_CAP>
 {
     type Output = [InlineSpan];
 

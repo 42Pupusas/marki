@@ -1122,7 +1122,9 @@ fn test_unordered_list_indented_4_spaces_is_paragraph() {
 fn test_ordered_list_indented_1_space() {
     let md: MarkdownFile<'_> = MarkdownFile::parse(" 1. first\n 2. second");
     match &md.sections[0] {
-        Section::OrderedList { start: 1, items, .. } => {
+        Section::OrderedList {
+            start: 1, items, ..
+        } => {
             let items = &md[*items];
             assert_eq!(items.len(), 2);
             assert_content(&md, items[0], &text("first"));
@@ -1270,7 +1272,9 @@ fn test_tilde_fence_indented() {
 fn test_ordered_list_empty_item() {
     let md: MarkdownFile<'_> = MarkdownFile::parse("1. \n2. second");
     match &md.sections[0] {
-        Section::OrderedList { start: 1, items, .. } => {
+        Section::OrderedList {
+            start: 1, items, ..
+        } => {
             let items = &md[*items];
             assert_eq!(items.len(), 2);
             assert_content(&md, items[0], &[]);

@@ -1,7 +1,7 @@
+use crate::inline::pool_offset;
 use crate::section::{InlineSpan, OrderedListDelimiter, Section, SpanSlice};
 use crate::simd::find_byte;
 use crate::special_char::SpecialChar;
-use crate::inline::pool_offset;
 use crate::{Inline, MarkdownFile};
 
 // ---------------------------------------------------------------------------
@@ -77,10 +77,7 @@ impl<'src> Accumulator<'src> {
                 lines_start,
                 lines_len: lines_pool_len - lines_start,
             }),
-            Self::InUnorderedList {
-                items_start,
-                ..
-            } => Some(RawSection::UnorderedList {
+            Self::InUnorderedList { items_start, .. } => Some(RawSection::UnorderedList {
                 items_start,
                 items_len: lines_pool_len - items_start,
             }),
@@ -184,8 +181,7 @@ fn is_closing_fence(bytes: &[u8], fence_char: u8, min_len: usize) -> bool {
 fn extract_language<'src>(input: &'src str, bytes: &[u8], fence_len: usize) -> Option<&'src str> {
     debug_assert!(
         bytes.as_ptr() as usize >= input.as_ptr() as usize
-            && bytes.as_ptr() as usize + bytes.len()
-                <= input.as_ptr() as usize + input.len(),
+            && bytes.as_ptr() as usize + bytes.len() <= input.as_ptr() as usize + input.len(),
         "bytes must be a subslice of input"
     );
     let mut i = fence_len;
@@ -239,9 +235,9 @@ fn resolve_inlines<'src, const MAX_DEPTH: u8, const CAP: usize>(
                 items_start,
                 items_len,
             } => {
-                let raw_items =
-                    lines.get(items_start as usize..(items_start + items_len) as usize)
-                        .unwrap_or(&[]);
+                let raw_items = lines
+                    .get(items_start as usize..(items_start + items_len) as usize)
+                    .unwrap_or(&[]);
                 let start = pool_offset(span_pool.len());
                 for item in raw_items {
                     let span = Inline::parse_configured::<MAX_DEPTH, CAP>(item, pool);
@@ -258,9 +254,9 @@ fn resolve_inlines<'src, const MAX_DEPTH: u8, const CAP: usize>(
                 items_start,
                 items_len,
             } => {
-                let raw_items =
-                    lines.get(items_start as usize..(items_start + items_len) as usize)
-                        .unwrap_or(&[]);
+                let raw_items = lines
+                    .get(items_start as usize..(items_start + items_len) as usize)
+                    .unwrap_or(&[]);
                 let sp_start = pool_offset(span_pool.len());
                 for item in raw_items {
                     let span = Inline::parse_configured::<MAX_DEPTH, CAP>(item, pool);
@@ -324,7 +320,11 @@ const COULD_START_BLOCK: [bool; 256] = {
 
 trait BlockBytes {
     fn is_horizontal_rule(&self) -> bool;
-    fn try_parse_heading<'src>(&self, input: &'src str, line_offset: usize) -> Option<(u8, &'src str)>;
+    fn try_parse_heading<'src>(
+        &self,
+        input: &'src str,
+        line_offset: usize,
+    ) -> Option<(u8, &'src str)>;
     fn try_parse_unordered_item(&self) -> Option<(SpecialChar, usize)>;
     fn try_parse_ordered_item(&self) -> Option<(u32, OrderedListDelimiter, usize)>;
     fn could_start_block(&self) -> bool;
@@ -360,7 +360,11 @@ impl BlockBytes for [u8] {
 
     /// Check whether this byte slice is an ATX heading (`CommonMark` §4.2).
     /// Returns `(level, text)` without performing any inline parsing.
-    fn try_parse_heading<'src>(&self, input: &'src str, line_offset: usize) -> Option<(u8, &'src str)> {
+    fn try_parse_heading<'src>(
+        &self,
+        input: &'src str,
+        line_offset: usize,
+    ) -> Option<(u8, &'src str)> {
         let level = count_leading_byte(self, SpecialChar::Hash.byte());
         if !(1..=6).contains(&level) || self.get(level) != SpecialChar::Space {
             return None;
@@ -521,7 +525,8 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         let mut pos = 0;
 
         while pos < bytes.len() {
-            let line_end = find_byte(bytes, pos, SpecialChar::Newline.byte()).unwrap_or(bytes.len());
+            let line_end =
+                find_byte(bytes, pos, SpecialChar::Newline.byte()).unwrap_or(bytes.len());
 
             // Fast-path: when we detect a code fence opening, scan ahead for
             // the closing fence in one shot instead of processing line-by-line.
@@ -540,15 +545,12 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     code_fence_opening(&bytes[pos + indent..line_end])
             {
                 let spos = pos + indent;
-                let language =
-                    extract_language(input, &bytes[spos..line_end], fence_len);
+                let language = extract_language(input, &bytes[spos..line_end], fence_len);
                 acc.flush_into(&mut ctx);
                 let content_start = line_end + 1;
-                let (code, resume) = scan_code_block_fast(
-                    input, bytes, content_start, fence_len, fence_char,
-                );
-                ctx.sections
-                    .push(RawSection::CodeBlock { language, code });
+                let (code, resume) =
+                    scan_code_block_fast(input, bytes, content_start, fence_len, fence_char);
+                ctx.sections.push(RawSection::CodeBlock { language, code });
                 pos = resume;
                 acc = Accumulator::Empty;
                 continue;
@@ -597,7 +599,9 @@ impl<'src> ParseCtx<'src> {
     ) -> Accumulator<'src> {
         let first = self.bytes.get(pos).copied();
 
-        if first.is_some_and(|b| b.is_ascii_whitespace()) && is_blank_line(self.bytes, pos, line_end) {
+        if first.is_some_and(|b| b.is_ascii_whitespace())
+            && is_blank_line(self.bytes, pos, line_end)
+        {
             acc.flush_into(self);
             return Accumulator::Empty;
         }
@@ -620,8 +624,7 @@ impl<'src> ParseCtx<'src> {
             // 4+ leading spaces: only valid as paragraph text or
             // blockquote lazy continuation.
             if let Accumulator::InBlockquote { lines_start } = acc {
-                self.lines
-                    .push(self.input.get(pos..line_end).unwrap_or(""));
+                self.lines.push(self.input.get(pos..line_end).unwrap_or(""));
                 return Accumulator::InBlockquote { lines_start };
             }
             return self.fold_paragraph(acc, pos, line_end);
@@ -669,9 +672,7 @@ impl<'src> ParseCtx<'src> {
         // current blockquote.
         let acc = if let Accumulator::InBlockquote { lines_start } = acc {
             // Fast reject: if first byte can't start a block element, continue.
-            let continues = if !line_bytes.is_empty()
-                && !line_bytes.could_start_block()
-            {
+            let continues = if !line_bytes.is_empty() && !line_bytes.could_start_block() {
                 true
             } else {
                 !line_bytes.is_horizontal_rule()
@@ -681,8 +682,7 @@ impl<'src> ParseCtx<'src> {
                     && line_bytes.try_parse_ordered_item().is_none()
             };
             if continues {
-                self.lines
-                    .push(self.input.get(pos..line_end).unwrap_or(""));
+                self.lines.push(self.input.get(pos..line_end).unwrap_or(""));
                 return Accumulator::InBlockquote { lines_start };
             }
             // Line starts a new block — flush the blockquote and fall through.
@@ -700,16 +700,12 @@ impl<'src> ParseCtx<'src> {
             return Accumulator::Empty;
         }
 
-        if let Some((marker, item_offset)) =
-            line_bytes.try_parse_unordered_item()
-        {
+        if let Some((marker, item_offset)) = line_bytes.try_parse_unordered_item() {
             let item = self.input.get(spos + item_offset..line_end).unwrap_or("");
             return self.fold_unordered_list(acc, marker, item);
         }
 
-        if let Some((num, delim, item_offset)) =
-            line_bytes.try_parse_ordered_item()
-        {
+        if let Some((num, delim, item_offset)) = line_bytes.try_parse_ordered_item() {
             let item = self.input.get(spos + item_offset..line_end).unwrap_or("");
             return self.fold_ordered_list(acc, num, delim, item);
         }
@@ -731,7 +727,10 @@ impl<'src> ParseCtx<'src> {
         {
             if m == marker {
                 self.lines.push(item);
-                return Accumulator::InUnorderedList { marker, items_start };
+                return Accumulator::InUnorderedList {
+                    marker,
+                    items_start,
+                };
             }
             Accumulator::InUnorderedList {
                 marker: m,
