@@ -1,4 +1,5 @@
 use crate::section::{OrderedListDelimiter, Section};
+use crate::simd::find_byte;
 use crate::special_char::SpecialChar;
 use crate::{Inline, MarkdownFile};
 
@@ -81,16 +82,80 @@ fn vec_with_first<T>(first: T) -> Vec<T> {
 impl<'src> MarkdownFile<'src> {
     #[must_use]
     pub fn parse(input: &'src str) -> Self {
+        let bytes = input.as_bytes();
         // Rough heuristic: ~50 bytes per section on average.
         let mut sections = Vec::with_capacity(input.len() / 50 + 1);
         let mut acc = Accumulator::Empty;
+        let mut pos = 0;
 
-        for line in input.lines() {
+        while pos < bytes.len() {
+            let line_end = find_byte(bytes, pos, b'\n').unwrap_or(bytes.len());
+            let line = &input[pos..line_end];
+
+            // Fast-path: when we detect a code fence opening, scan ahead for
+            // the closing fence in one shot instead of processing line-by-line.
+            if !matches!(acc, Accumulator::InCodeBlock { .. }) {
+                let first = bytes.get(pos).copied().unwrap_or(b' ');
+                if first == SpecialChar::Backtick.byte() || first.is_ascii_whitespace() {
+                    let fence_len = Self::code_fence_len(line);
+                    if fence_len > 0 {
+                        let language = Self::extract_code_language(line, fence_len);
+                        acc.flush_into(&mut sections);
+                        let content_start = line_end + 1;
+                        let (code, resume) =
+                            Self::scan_code_block_fast(input, bytes, content_start, fence_len);
+                        sections.push(Section::CodeBlock { language, code });
+                        pos = resume;
+                        acc = Accumulator::Empty;
+                        continue;
+                    }
+                }
+            }
+
             acc = Self::fold_line(input, &mut sections, acc, line);
+            pos = line_end + 1;
         }
 
         acc.flush_into(&mut sections);
         Self { sections }
+    }
+
+    /// Scan forward from `start` to find a closing code fence of at least
+    /// `fence_len` backticks. Returns `(code_content, resume_position)`.
+    fn scan_code_block_fast(
+        input: &'src str,
+        bytes: &[u8],
+        start: usize,
+        fence_len: usize,
+    ) -> (&'src str, usize) {
+        let mut pos = start;
+        while pos < bytes.len() {
+            let line_end = find_byte(bytes, pos, b'\n').unwrap_or(bytes.len());
+            let line = &input[pos..line_end];
+
+            // Check for closing fence: first non-whitespace byte must be backtick.
+            let first = bytes.get(pos).copied().unwrap_or(0);
+            if (first == SpecialChar::Backtick.byte() || first.is_ascii_whitespace())
+                && Self::code_fence_len(line) >= fence_len
+            {
+                // Content is everything between opening and closing fence.
+                let code = if start < pos {
+                    // Trim the trailing newline before the closing fence.
+                    &input[start..pos - 1]
+                } else {
+                    ""
+                };
+                return (code, line_end + 1);
+            }
+            pos = line_end + 1;
+        }
+        // Unclosed code block: content runs to end of input.
+        let code = if start < bytes.len() {
+            &input[start..]
+        } else {
+            ""
+        };
+        (code, bytes.len())
     }
 
     fn fold_line(

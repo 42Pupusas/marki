@@ -10,7 +10,7 @@ nursery = "warn"
 
 [dev-dependencies]
 criterion = "0.5"
-pulldown-cmark = "0.12"
+pulldown-cmark = { version = "0.12", features = ["simd"] }
 
 [[bench]]
 name = "parse"
@@ -22,3 +22,5 @@ harness = false
 
 [profile.bench]
 debug = true
+lto = "fat"
+codegen-units = 1

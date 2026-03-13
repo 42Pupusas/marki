@@ -1,4 +1,5 @@
 use crate::SpecialChar;
+use crate::simd::{ByteSet, find_byte, find_byte_set};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Inline<'src> {
@@ -26,18 +27,16 @@ impl<'src> From<&'src str> for Inline<'src> {
     }
 }
 
-/// Lookup table: true for bytes that can start an inline element.
-static SPECIAL: [bool; 256] = {
-    let mut table = [false; 256];
-    table[SpecialChar::Newline.byte() as usize] = true;
-    table[SpecialChar::Asterisk.byte() as usize] = true;
-    table[SpecialChar::Underscore.byte() as usize] = true;
-    table[SpecialChar::OpenBracket.byte() as usize] = true;
-    table[SpecialChar::ExclamationMark.byte() as usize] = true;
-    table[SpecialChar::Backslash.byte() as usize] = true;
-    table[SpecialChar::Backtick.byte() as usize] = true;
-    table
-};
+/// SIMD-accelerated byte set for inline special characters.
+static SPECIAL_SET: ByteSet = ByteSet::new(&[
+    SpecialChar::Newline.byte(),
+    SpecialChar::Asterisk.byte(),
+    SpecialChar::Underscore.byte(),
+    SpecialChar::OpenBracket.byte(),
+    SpecialChar::ExclamationMark.byte(),
+    SpecialChar::Backslash.byte(),
+    SpecialChar::Backtick.byte(),
+]);
 
 /// Character classification for `CommonMark` emphasis flanking rules.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -160,20 +159,26 @@ impl EmphasisState {
     }
 
     fn from_bytes(bytes: &[u8]) -> Self {
+        static EMPH_SET: ByteSet = ByteSet::new(&[
+            SpecialChar::Asterisk.byte(),
+            SpecialChar::Underscore.byte(),
+        ]);
         let mut stars: u8 = 0;
         let mut unders: u8 = 0;
-        for &b in bytes {
-            if b == SpecialChar::Asterisk {
+        let mut i = 0;
+        loop {
+            let Some(pos) = find_byte_set(bytes, i, &EMPH_SET) else {
+                break;
+            };
+            if bytes[pos] == SpecialChar::Asterisk {
                 stars += 1;
-                if stars >= 4 && unders >= 4 {
-                    break;
-                }
-            } else if b == SpecialChar::Underscore {
+            } else {
                 unders += 1;
-                if stars >= 4 && unders >= 4 {
-                    break;
-                }
             }
+            if stars >= 4 && unders >= 4 {
+                break;
+            }
+            i = pos + 1;
         }
         Self {
             star: DelimiterAvail::from_count(stars as usize),
@@ -199,7 +204,7 @@ impl<'src> Inline<'src> {
         let bytes = input.as_bytes();
         // Fast path: if no special bytes exist, the entire input is plain text.
         // Avoids Vec preallocation, emphasis pre-scan, and the full parse loop.
-        if !bytes.iter().any(|&b| SPECIAL[b as usize]) {
+        if find_byte_set(bytes, 0, &SPECIAL_SET).is_none() {
             return if input.is_empty() {
                 Vec::new()
             } else {
@@ -230,7 +235,7 @@ impl<'src> Inline<'src> {
     pub fn parse_into(input: &'src str, out: &mut Vec<Self>) {
         let bytes = input.as_bytes();
         // Fast path: no special bytes means plain text, skip the full parser.
-        if !bytes.iter().any(|&b| SPECIAL[b as usize]) {
+        if find_byte_set(bytes, 0, &SPECIAL_SET).is_none() {
             if !input.is_empty() {
                 out.push(Self::Text(input));
             }
@@ -254,11 +259,10 @@ impl<'src> Inline<'src> {
         let mut i = 0;
 
         loop {
-            // Scan forward to the next special byte in a tight loop that
-            // LLVM can auto-vectorize, avoiding per-byte dispatch overhead.
-            let next = bytes[i..].iter().position(|&b| SPECIAL[b as usize]);
-            match next {
-                Some(offset) => i += offset,
+            // SIMD-accelerated scan: find next special byte using SSE2 (16
+            // bytes per iteration on x86_64).
+            match find_byte_set(bytes, i, &SPECIAL_SET) {
+                Some(pos) => i = pos,
                 None => break,
             }
             let b = bytes[i];
@@ -425,27 +429,29 @@ impl<'src> Inline<'src> {
         open: SpecialChar,
         close: SpecialChar,
     ) -> Option<usize> {
+        // SIMD byte set: only stop at open, close, or backslash.
+        let bracket_set = ByteSet::new(&[open.byte(), close.byte(), SpecialChar::Backslash.byte()]);
         let mut depth = 0u32;
         let mut j = start;
-        while let Some(&b) = bytes.get(j) {
+        loop {
+            let pos = find_byte_set(bytes, j, &bracket_set)?;
+            let b = bytes[pos];
             if b == SpecialChar::Backslash
-                && bytes.get(j + 1).is_some_and(u8::is_ascii_punctuation)
+                && bytes.get(pos + 1).is_some_and(u8::is_ascii_punctuation)
             {
-                // Skip backslash-escaped punctuation.
-                j += 2;
+                j = pos + 2;
                 continue;
             }
             if b == open {
                 depth += 1;
             } else if b == close {
                 if depth == 0 {
-                    return Some(j);
+                    return Some(pos);
                 }
                 depth -= 1;
             }
-            j += 1;
+            j = pos + 1;
         }
-        None
     }
 
     fn try_parse_bracket_paren(
@@ -630,8 +636,18 @@ impl<'src> Inline<'src> {
             }
         }
 
+        // SIMD byte set: scan for marker or backslash (the only two bytes
+        // that require action inside a delimited span).
+        let delim_set = ByteSet::new(&[marker, SpecialChar::Backslash.byte()]);
+
         let mut i = inner_start;
-        while let Some(&b) = bytes.get(i) {
+        loop {
+            let Some(pos) = find_byte_set(bytes, i, &delim_set) else {
+                break;
+            };
+            i = pos;
+            let b = bytes[i];
+
             if b == SpecialChar::Backslash
                 && bytes.get(i + 1).is_some_and(u8::is_ascii_punctuation)
             {
@@ -702,10 +718,8 @@ impl<'src> Inline<'src> {
         let content_start = start + backtick_count;
         let mut i = content_start;
         while i < bytes.len() {
-            // Find next backtick
-            let remaining = bytes.get(i..)?;
-            let offset = remaining.iter().position(|&b| b == SpecialChar::Backtick)?;
-            i += offset;
+            // SIMD-accelerated backtick scan.
+            i = find_byte(bytes, i, SpecialChar::Backtick.byte())?;
 
             // Count consecutive backticks
             let close_count = bytes

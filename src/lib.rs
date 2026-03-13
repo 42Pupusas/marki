@@ -1,6 +1,7 @@
 mod block;
 mod inline;
 mod section;
+pub(crate) mod simd;
 mod special_char;
 
 #[cfg(test)]
