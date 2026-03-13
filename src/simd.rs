@@ -1,7 +1,7 @@
-/// SIMD-accelerated byte scanning for the inline and block parsers.
-///
-/// On x86/x86_64 with SSE2 (baseline for all x86_64), processes 16 bytes per
-/// iteration. Falls back to a scalar loop on other architectures.
+//! SIMD-accelerated byte scanning for the inline and block parsers.
+//!
+//! On x86/x86\_64 with SSE2 (baseline for all x86\_64), processes 16 bytes per
+//! iteration. Falls back to a scalar loop on other architectures.
 
 /// Find the first byte in `haystack[offset..]` that matches any byte in `needles`.
 /// Returns the absolute index into `haystack`, or `None` if not found.
@@ -52,7 +52,7 @@ impl ByteSet {
     /// Create a new `ByteSet` from a slice of distinct bytes (max 8).
     #[inline]
     pub const fn new(needles: &[u8]) -> Self {
-        assert!(needles.len() >= 1 && needles.len() <= 8);
+        assert!(!needles.is_empty() && needles.len() <= 8);
         let mut bytes = [needles[0]; 8];
         let mut table = [false; 256];
         let mut i = 0;
@@ -70,10 +70,33 @@ impl ByteSet {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
+use std::arch::x86_64::{
+    __m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_or_si128, _mm_set1_epi8,
+};
+
+/// Reinterpret a `u8` as `i8` (bit-preserving cast for SSE2 intrinsics).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+const fn as_i8(b: u8) -> i8 {
+    i8::from_ne_bytes([b])
+}
+
+/// Extract the low 16 bits of a movemask result as a `u32` for `trailing_zeros`.
+/// `_mm_movemask_epi8` returns an `i32` with only bits 0..15 set, so the
+/// bitwise AND is lossless.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+const fn movemask_to_u32(mask: i32) -> u32 {
+    // Movemask returns 0..=0xFFFF. Reinterpret the low two bytes as u16,
+    // then widen losslessly. No sign or truncation issues.
+    let [lo, hi, _, _] = mask.to_ne_bytes();
+    u16::from_ne_bytes([lo, hi]) as u32
+}
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
+// _mm_loadu_si128 is an unaligned load — the pointer alignment cast is intentional.
+#[allow(clippy::cast_ptr_alignment)]
 unsafe fn find_byte_set_sse2(haystack: &[u8], offset: usize, set: &ByteSet) -> Option<usize> {
     let bytes = &haystack[offset..];
     let len = bytes.len();
@@ -81,20 +104,20 @@ unsafe fn find_byte_set_sse2(haystack: &[u8], offset: usize, set: &ByteSet) -> O
 
     unsafe {
         // Load all needle lanes.
-        let n0 = _mm_set1_epi8(set.bytes[0] as i8);
-        let n1 = _mm_set1_epi8(set.bytes[1] as i8);
-        let n2 = _mm_set1_epi8(set.bytes[2] as i8);
-        let n3 = _mm_set1_epi8(set.bytes[3] as i8);
-        let n4 = _mm_set1_epi8(set.bytes[4] as i8);
-        let n5 = _mm_set1_epi8(set.bytes[5] as i8);
-        let n6 = _mm_set1_epi8(set.bytes[6] as i8);
-        let n7 = _mm_set1_epi8(set.bytes[7] as i8);
+        let n0 = _mm_set1_epi8(as_i8(set.bytes[0]));
+        let n1 = _mm_set1_epi8(as_i8(set.bytes[1]));
+        let n2 = _mm_set1_epi8(as_i8(set.bytes[2]));
+        let n3 = _mm_set1_epi8(as_i8(set.bytes[3]));
+        let n4 = _mm_set1_epi8(as_i8(set.bytes[4]));
+        let n5 = _mm_set1_epi8(as_i8(set.bytes[5]));
+        let n6 = _mm_set1_epi8(as_i8(set.bytes[6]));
+        let n7 = _mm_set1_epi8(as_i8(set.bytes[7]));
 
         let mut i = 0;
 
         // Process 16-byte chunks.
         while i + 16 <= len {
-            let chunk = _mm_loadu_si128(ptr.add(i) as *const __m128i);
+            let chunk = _mm_loadu_si128(ptr.add(i).cast::<__m128i>());
             let eq = _mm_or_si128(
                 _mm_or_si128(
                     _mm_or_si128(_mm_cmpeq_epi8(chunk, n0), _mm_cmpeq_epi8(chunk, n1)),
@@ -105,7 +128,7 @@ unsafe fn find_byte_set_sse2(haystack: &[u8], offset: usize, set: &ByteSet) -> O
                     _mm_or_si128(_mm_cmpeq_epi8(chunk, n6), _mm_cmpeq_epi8(chunk, n7)),
                 ),
             );
-            let mask = _mm_movemask_epi8(eq) as u32;
+            let mask = movemask_to_u32(_mm_movemask_epi8(eq));
             if mask != 0 {
                 return Some(offset + i + mask.trailing_zeros() as usize);
             }
@@ -126,18 +149,20 @@ unsafe fn find_byte_set_sse2(haystack: &[u8], offset: usize, set: &ByteSet) -> O
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
+// _mm_loadu_si128 is an unaligned load — the pointer alignment cast is intentional.
+#[allow(clippy::cast_ptr_alignment)]
 unsafe fn find_byte_sse2(haystack: &[u8], offset: usize, needle: u8) -> Option<usize> {
     let bytes = &haystack[offset..];
     let len = bytes.len();
     let ptr = bytes.as_ptr();
 
     unsafe {
-        let n = _mm_set1_epi8(needle as i8);
+        let n = _mm_set1_epi8(as_i8(needle));
 
         let mut i = 0;
         while i + 16 <= len {
-            let chunk = _mm_loadu_si128(ptr.add(i) as *const __m128i);
-            let mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, n)) as u32;
+            let chunk = _mm_loadu_si128(ptr.add(i).cast::<__m128i>());
+            let mask = movemask_to_u32(_mm_movemask_epi8(_mm_cmpeq_epi8(chunk, n)));
             if mask != 0 {
                 return Some(offset + i + mask.trailing_zeros() as usize);
             }

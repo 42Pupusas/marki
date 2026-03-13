@@ -156,10 +156,8 @@ impl EmphasisState {
     }
 
     fn from_bytes(bytes: &[u8]) -> Self {
-        static EMPH_SET: ByteSet = ByteSet::new(&[
-            SpecialChar::Asterisk.byte(),
-            SpecialChar::Underscore.byte(),
-        ]);
+        static EMPH_SET: ByteSet =
+            ByteSet::new(&[SpecialChar::Asterisk.byte(), SpecialChar::Underscore.byte()]);
         let mut stars: u8 = 0;
         let mut unders: u8 = 0;
         let mut i = 0;
@@ -205,7 +203,7 @@ struct InlineBuf<'src> {
 
 impl<'src> InlineBuf<'src> {
     #[inline]
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             stack: [Inline::SoftBreak; STACK_CAP],
             len: 0,
@@ -230,16 +228,23 @@ impl<'src> InlineBuf<'src> {
 
     #[inline]
     fn flush_to_pool(self, pool: &mut Vec<Inline<'src>>) -> InlineSpan {
-        let start = pool.len() as u32;
+        let start = pool_offset(pool.len());
         if self.overflow.is_empty() {
             pool.extend_from_slice(&self.stack[..self.len]);
-            InlineSpan::new(start, self.len as u32)
+            InlineSpan::new(start, pool_offset(self.len))
         } else {
-            let len = self.overflow.len() as u32;
+            let len = pool_offset(self.overflow.len());
             pool.extend(self.overflow);
             InlineSpan::new(start, len)
         }
     }
+}
+
+/// Pool index as `u32`. Panics if the pool exceeds 4 GiB of elements
+/// (unreachable in practice — that would require billions of inline nodes).
+#[inline]
+pub fn pool_offset(pool_len: usize) -> u32 {
+    u32::try_from(pool_len).expect("inline pool exceeded u32::MAX elements")
 }
 
 impl<'src> Inline<'src> {
@@ -255,7 +260,7 @@ impl<'src> Inline<'src> {
             if input.is_empty() {
                 return InlineSpan::EMPTY;
             }
-            let start = pool.len() as u32;
+            let start = pool_offset(pool.len());
             pool.push(Self::Text(input));
             return InlineSpan::new(start, 1);
         }
@@ -304,14 +309,11 @@ impl<'src> Inline<'src> {
         let mut buf = InlineBuf::new();
         Self::parse_into_buf(input, bytes, emph, pool, &mut buf);
         // Flush buf directly to pool (not wrapped in a span).
-        let start = pool.len() as u32;
         if buf.overflow.is_empty() {
             pool.extend_from_slice(&buf.stack[..buf.len]);
         } else {
             pool.extend(buf.overflow);
         }
-        // No InlineSpan returned — caller manages boundaries.
-        let _ = start;
     }
 
     fn parse_into_buf(
@@ -324,12 +326,9 @@ impl<'src> Inline<'src> {
         let mut plain_start = 0;
         let mut i = 0;
 
-        loop {
-            // SIMD-accelerated scan: find next special byte.
-            match find_byte_set(bytes, i, &SPECIAL_SET) {
-                Some(pos) => i = pos,
-                None => break,
-            }
+        // SIMD-accelerated scan: find next special byte.
+        while let Some(pos) = find_byte_set(bytes, i, &SPECIAL_SET) {
+            i = pos;
             let b = bytes[i];
 
             if b == SpecialChar::Newline {
@@ -401,8 +400,7 @@ impl<'src> Inline<'src> {
             }
 
             // Bold/Italic: ** __ * _
-            if let Some((elem, end)) =
-                Self::try_parse_emphasis(input, bytes, i, b, &mut emph, pool)
+            if let Some((elem, end)) = Self::try_parse_emphasis(input, bytes, i, b, &mut emph, pool)
             {
                 if plain_start < i {
                     buf.push(Self::Text(&input[plain_start..i]));
@@ -431,21 +429,20 @@ impl<'src> Inline<'src> {
         buf: &mut InlineBuf<'src>,
     ) {
         let preceding = &bytes[plain_start..newline_pos];
-        let (trim_end, is_hard) =
-            if preceding.last() == SpecialChar::Backslash {
-                (newline_pos - 1, true)
+        let (trim_end, is_hard) = if preceding.last() == SpecialChar::Backslash {
+            (newline_pos - 1, true)
+        } else {
+            let spaces = preceding
+                .iter()
+                .rev()
+                .take_while(|&&b| b == SpecialChar::Space)
+                .count();
+            if spaces >= 2 {
+                (newline_pos - spaces, true)
             } else {
-                let spaces = preceding
-                    .iter()
-                    .rev()
-                    .take_while(|&&b| b == SpecialChar::Space)
-                    .count();
-                if spaces >= 2 {
-                    (newline_pos - spaces, true)
-                } else {
-                    (newline_pos, false)
-                }
-            };
+                (newline_pos, false)
+            }
+        };
         if plain_start < trim_end {
             buf.push(Self::Text(&input[plain_start..trim_end]));
         }
@@ -719,8 +716,7 @@ impl<'src> Inline<'src> {
             i = pos;
             let b = bytes[i];
 
-            if b == SpecialChar::Backslash
-                && bytes.get(i + 1).is_some_and(u8::is_ascii_punctuation)
+            if b == SpecialChar::Backslash && bytes.get(i + 1).is_some_and(u8::is_ascii_punctuation)
             {
                 i += 2;
                 continue;
@@ -755,8 +751,7 @@ impl<'src> Inline<'src> {
             if !is_star {
                 // _ can close only if right-flanking AND (not left-flanking OR followed by punctuation)
                 let left_flanking_close = after_close != CharClass::Whitespace
-                    && (after_close != CharClass::Punctuation
-                        || before_close != CharClass::Other);
+                    && (after_close != CharClass::Punctuation || before_close != CharClass::Other);
                 if left_flanking_close && after_close != CharClass::Punctuation {
                     i += 1;
                     continue;

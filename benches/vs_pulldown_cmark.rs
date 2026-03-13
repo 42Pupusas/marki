@@ -5,7 +5,10 @@ use pulldown_cmark::{Options, Parser};
 const FIXTURES: &[(&str, &str)] = &[
     ("rust_readme", include_str!("fixtures/rust_readme.md")),
     ("awesome", include_str!("fixtures/awesome.md")),
-    ("commonmark_spec", include_str!("fixtures/commonmark_spec.md")),
+    (
+        "commonmark_spec",
+        include_str!("fixtures/commonmark_spec.md"),
+    ),
 ];
 
 fn pulldown_parse(input: &str) {
@@ -22,9 +25,13 @@ fn bench_vs(c: &mut Criterion) {
             b.iter(|| MarkdownFile::parse(black_box(doc)));
         });
 
-        group.bench_with_input(BenchmarkId::new("pulldown_cmark", ""), &content, |b, doc| {
-            b.iter(|| pulldown_parse(black_box(doc)));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("pulldown_cmark", ""),
+            &content,
+            |b, doc| {
+                b.iter(|| pulldown_parse(black_box(doc)));
+            },
+        );
 
         group.finish();
     }

@@ -26,7 +26,10 @@ pub use special_char::SpecialChar;
 /// ```
 #[must_use]
 pub fn normalize(input: &str) -> Cow<'_, str> {
-    if input.as_bytes().contains(&SpecialChar::CarriageReturn.byte()) {
+    if input
+        .as_bytes()
+        .contains(&SpecialChar::CarriageReturn.byte())
+    {
         Cow::Owned(input.replace('\r', ""))
     } else {
         Cow::Borrowed(input)

@@ -3,7 +3,8 @@ use marki::MarkdownFile;
 
 const HEADING: &str = "# Hello World\n";
 const PARAGRAPH: &str = "This is a simple paragraph with some text.\n";
-const INLINE_RICH: &str = "Some **bold** and *italic* and `code` and [a link](http://example.com).\n";
+const INLINE_RICH: &str =
+    "Some **bold** and *italic* and `code` and [a link](http://example.com).\n";
 const CODE_BLOCK: &str = "```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n";
 const UNORDERED_LIST: &str = "- item one\n- item two\n- item three\n";
 const ORDERED_LIST: &str = "1. first\n2. second\n3. third\n";
@@ -13,7 +14,10 @@ const HORIZONTAL_RULE: &str = "---\n";
 const FIXTURES: &[(&str, &str)] = &[
     ("rust_readme", include_str!("fixtures/rust_readme.md")),
     ("awesome", include_str!("fixtures/awesome.md")),
-    ("commonmark_spec", include_str!("fixtures/commonmark_spec.md")),
+    (
+        "commonmark_spec",
+        include_str!("fixtures/commonmark_spec.md"),
+    ),
 ];
 
 fn mixed_document() -> String {

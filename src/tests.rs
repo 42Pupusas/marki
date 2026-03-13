@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use crate::section::OrderedListDelimiter;
-use crate::{normalize, Inline, InlineSpan, MarkdownFile, Section};
+use crate::{Inline, InlineSpan, MarkdownFile, Section, normalize};
 
 /// Assert that a span in the pool contains exactly the given inline elements.
 /// For nested spans (Bold, Italic, Link), recursively checks children.

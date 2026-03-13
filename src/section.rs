@@ -9,11 +9,13 @@ impl InlineSpan {
     pub const EMPTY: Self = Self { start: 0, len: 0 };
 
     #[inline]
+    #[must_use]
     pub const fn new(start: u32, len: u32) -> Self {
         Self { start, len }
     }
 
     #[inline]
+    #[must_use]
     pub const fn is_empty(self) -> bool {
         self.len == 0
     }
