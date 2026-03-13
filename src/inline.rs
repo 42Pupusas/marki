@@ -288,8 +288,7 @@ impl<'src> InlineBuf<'src> {
 #[allow(clippy::inline_always)]
 #[inline(always)]
 pub fn pool_offset(pool_len: usize) -> u32 {
-    debug_assert!(pool_len <= u32::MAX as usize);
-    pool_len as u32
+    u32::try_from(pool_len).expect("inline pool exceeds u32::MAX elements")
 }
 
 impl<'src> Inline<'src> {
@@ -632,8 +631,10 @@ impl<'src> Inline<'src> {
     ///     match is the only candidate (no nesting possible).
     fn split_url_title(content: &'src str) -> (&'src str, Option<&'src str>) {
         let trimmed = content.trim();
-        if trimmed.is_empty() {
-            return ("", None);
+        // A valid title needs at minimum: url, space, open+close quotes (e.g. `u "t"`).
+        // With fewer than 3 bytes the backward scan would underflow.
+        if trimmed.len() < 3 {
+            return (trimmed, None);
         }
 
         let bytes = trimmed.as_bytes();

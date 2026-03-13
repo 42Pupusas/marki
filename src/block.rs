@@ -4,34 +4,65 @@ use crate::special_char::SpecialChar;
 use crate::inline::pool_offset;
 use crate::{Inline, MarkdownFile};
 
-/// Mutable parsing context that bundles the output vectors, reducing the number
-/// of parameters threaded through every `fold_*` call.
+// ---------------------------------------------------------------------------
+// Pass 1: block-level parsing into RawSection (no inline parsing)
+// ---------------------------------------------------------------------------
+
+/// Intermediate section representation produced by pass 1 (block parsing).
+/// Stores raw `&str` text that will be inline-parsed in pass 2.
+enum RawSection<'src> {
+    Heading {
+        level: u8,
+        text: &'src str,
+    },
+    Paragraph {
+        text: &'src str,
+    },
+    CodeBlock {
+        language: Option<&'src str>,
+        code: &'src str,
+    },
+    UnorderedList {
+        items_start: u32,
+        items_len: u32,
+    },
+    OrderedList {
+        start: u32,
+        delimiter: OrderedListDelimiter,
+        items_start: u32,
+        items_len: u32,
+    },
+    Blockquote {
+        lines_start: u32,
+        lines_len: u32,
+    },
+    HorizontalRule,
+}
+
+/// Mutable parsing context for pass 1. Only collects raw sections — no inline
+/// pool or span pool needed.
 struct ParseCtx<'src> {
     input: &'src str,
     bytes: &'src [u8],
-    sections: Vec<Section<'src>>,
-    pool: Vec<Inline<'src>>,
-    span_pool: Vec<InlineSpan>,
+    sections: Vec<RawSection<'src>>,
+    /// Shared pool for blockquote lines and list items, avoiding per-section
+    /// `Vec<&str>` heap allocations.
+    lines: Vec<&'src str>,
 }
 
 enum Accumulator<'src> {
     Empty,
-    InCodeBlock {
-        language: Option<&'src str>,
-        content: Option<&'src str>,
-        fence_len: usize,
-    },
     InBlockquote {
-        lines: Vec<&'src str>,
+        lines_start: u32,
     },
     InUnorderedList {
         marker: SpecialChar,
-        items: Vec<&'src str>,
+        items_start: u32,
     },
     InOrderedList {
         start: u32,
         delimiter: OrderedListDelimiter,
-        items: Vec<&'src str>,
+        items_start: u32,
     },
     InParagraph {
         content: &'src str,
@@ -39,78 +70,47 @@ enum Accumulator<'src> {
 }
 
 impl<'src> Accumulator<'src> {
-    fn flush(
-        self,
-        pool: &mut Vec<Inline<'src>>,
-        span_pool: &mut Vec<InlineSpan>,
-    ) -> Option<Section<'src>> {
+    const fn flush(self, lines_pool_len: u32) -> Option<RawSection<'src>> {
         match self {
             Self::Empty => None,
-            Self::InCodeBlock {
-                language, content, ..
-            } => Some(Section::CodeBlock {
-                language,
-                code: content.unwrap_or(""),
+            Self::InBlockquote { lines_start } => Some(RawSection::Blockquote {
+                lines_start,
+                lines_len: lines_pool_len - lines_start,
             }),
-            Self::InBlockquote { lines } => {
-                let start = pool_offset(pool.len());
-                for (i, line) in lines.iter().enumerate() {
-                    if i > 0 {
-                        pool.push(Inline::Text("\n"));
-                    }
-                    Inline::parse_flat_into(line, pool);
-                }
-                let len = pool_offset(pool.len()) - start;
-                Some(Section::Blockquote {
-                    content: InlineSpan::new(start, len),
-                })
-            }
-            Self::InUnorderedList { items, .. } => {
-                let start = pool_offset(span_pool.len());
-                for item in &items {
-                    let span = Inline::parse(item, pool);
-                    span_pool.push(span);
-                }
-                let len = pool_offset(span_pool.len()) - start;
-                Some(Section::UnorderedList {
-                    items: SpanSlice::new(start, len),
-                })
-            }
+            Self::InUnorderedList {
+                items_start,
+                ..
+            } => Some(RawSection::UnorderedList {
+                items_start,
+                items_len: lines_pool_len - items_start,
+            }),
             Self::InOrderedList {
                 start,
                 delimiter,
-                items,
-            } => {
-                let sp_start = pool_offset(span_pool.len());
-                for item in &items {
-                    let span = Inline::parse(item, pool);
-                    span_pool.push(span);
-                }
-                let sp_len = pool_offset(span_pool.len()) - sp_start;
-                Some(Section::OrderedList {
-                    start,
-                    delimiter,
-                    items: SpanSlice::new(sp_start, sp_len),
-                })
-            }
-            Self::InParagraph { content } => Some(Section::Paragraph {
-                content: Inline::parse(content, pool),
+                items_start,
+            } => Some(RawSection::OrderedList {
+                start,
+                delimiter,
+                items_start,
+                items_len: lines_pool_len - items_start,
             }),
+            Self::InParagraph { content } => Some(RawSection::Paragraph { text: content }),
         }
     }
 
     fn flush_into(self, ctx: &mut ParseCtx<'src>) {
-        if let Some(section) = self.flush(&mut ctx.pool, &mut ctx.span_pool) {
+        let pool_len = lines_offset(ctx.lines.len());
+        if let Some(section) = self.flush(pool_len) {
             ctx.sections.push(section);
         }
     }
 }
 
-/// Create a `Vec` with pre-allocated capacity and a single initial element.
-fn vec_with_first<T>(first: T) -> Vec<T> {
-    let mut v = Vec::with_capacity(4);
-    v.push(first);
-    v
+/// Lines pool index as `u32`. Panics if the pool exceeds `u32::MAX` elements.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+fn lines_offset(len: usize) -> u32 {
+    u32::try_from(len).expect("lines pool exceeds u32::MAX elements")
 }
 
 /// Convert a byte range from the input into a `&str` without char-boundary
@@ -138,17 +138,114 @@ fn is_blank_line(bytes: &[u8], start: usize, end: usize) -> bool {
     bytes[start..end].iter().all(u8::is_ascii_whitespace)
 }
 
+// ---------------------------------------------------------------------------
+// Pass 2: resolve inlines
+// ---------------------------------------------------------------------------
+
+/// Convert raw sections from pass 1 into final sections with inline parsing.
+/// All inline parsing happens here, improving instruction cache locality by
+/// keeping block and inline parsing in separate phases.
+fn resolve_inlines<'src>(
+    raw: Vec<RawSection<'src>>,
+    lines: &[&'src str],
+    pool: &mut Vec<Inline<'src>>,
+    span_pool: &mut Vec<InlineSpan>,
+) -> Vec<Section<'src>> {
+    let mut sections = Vec::with_capacity(raw.len());
+    for raw_section in raw {
+        match raw_section {
+            RawSection::Heading { level, text } => {
+                sections.push(Section::Heading {
+                    level,
+                    content: Inline::parse(text, pool),
+                });
+            }
+            RawSection::Paragraph { text } => {
+                sections.push(Section::Paragraph {
+                    content: Inline::parse(text, pool),
+                });
+            }
+            RawSection::CodeBlock { language, code } => {
+                sections.push(Section::CodeBlock { language, code });
+            }
+            RawSection::UnorderedList {
+                items_start,
+                items_len,
+            } => {
+                let raw_items =
+                    &lines[items_start as usize..(items_start + items_len) as usize];
+                let start = pool_offset(span_pool.len());
+                for item in raw_items {
+                    let span = Inline::parse(item, pool);
+                    span_pool.push(span);
+                }
+                let len = pool_offset(span_pool.len()) - start;
+                sections.push(Section::UnorderedList {
+                    items: SpanSlice::new(start, len),
+                });
+            }
+            RawSection::OrderedList {
+                start,
+                delimiter,
+                items_start,
+                items_len,
+            } => {
+                let raw_items =
+                    &lines[items_start as usize..(items_start + items_len) as usize];
+                let sp_start = pool_offset(span_pool.len());
+                for item in raw_items {
+                    let span = Inline::parse(item, pool);
+                    span_pool.push(span);
+                }
+                let sp_len = pool_offset(span_pool.len()) - sp_start;
+                sections.push(Section::OrderedList {
+                    start,
+                    delimiter,
+                    items: SpanSlice::new(sp_start, sp_len),
+                });
+            }
+            RawSection::Blockquote {
+                lines_start,
+                lines_len,
+            } => {
+                let raw_lines =
+                    &lines[lines_start as usize..(lines_start + lines_len) as usize];
+                let start = pool_offset(pool.len());
+                for (i, line) in raw_lines.iter().enumerate() {
+                    if i > 0 {
+                        pool.push(Inline::Text("\n"));
+                    }
+                    Inline::parse_flat_into(line, pool);
+                }
+                let len = pool_offset(pool.len()) - start;
+                sections.push(Section::Blockquote {
+                    content: InlineSpan::new(start, len),
+                });
+            }
+            RawSection::HorizontalRule => {
+                sections.push(Section::HorizontalRule);
+            }
+        }
+    }
+    sections
+}
+
+// ---------------------------------------------------------------------------
+// MarkdownFile: public API and static helpers
+// ---------------------------------------------------------------------------
+
 impl<'src> MarkdownFile<'src> {
     #[must_use]
     pub fn parse(input: &'src str) -> Self {
         let bytes = input.as_bytes();
+
+        // --- Pass 1: block-level parsing (no inline work) ---
         let mut ctx = ParseCtx {
             input,
             bytes,
             // Rough heuristic: ~50 bytes per section on average.
             sections: Vec::with_capacity(input.len() / 50 + 1),
-            pool: Vec::with_capacity(input.len() / 20),
-            span_pool: Vec::with_capacity(input.len() / 100 + 1),
+            lines: Vec::with_capacity(input.len() / 80 + 1),
         };
         let mut acc = Accumulator::Empty;
         let mut pos = 0;
@@ -160,28 +257,27 @@ impl<'src> MarkdownFile<'src> {
             // the closing fence in one shot instead of processing line-by-line.
             // CommonMark §4.5: a code fence can be indented 0-3 spaces, so we
             // only need to check if a backtick appears within the first 4 bytes.
-            if !matches!(acc, Accumulator::InCodeBlock { .. }) {
-                let first = bytes.get(pos).copied().unwrap_or(SpecialChar::Space.byte());
-                let backtick = SpecialChar::Backtick.byte();
-                if first == backtick
-                    || (first == SpecialChar::Space
-                        && bytes[pos..line_end]
-                            .get(..4)
-                            .is_some_and(|w| w.contains(&backtick)))
-                {
-                    let fence_len = Self::code_fence_len_bytes(&bytes[pos..line_end]);
-                    if fence_len > 0 {
-                        let language =
-                            Self::extract_code_language_bytes(input, &bytes[pos..line_end]);
-                        acc.flush_into(&mut ctx);
-                        let content_start = line_end + 1;
-                        let (code, resume) =
-                            Self::scan_code_block_fast(input, bytes, content_start, fence_len);
-                        ctx.sections.push(Section::CodeBlock { language, code });
-                        pos = resume;
-                        acc = Accumulator::Empty;
-                        continue;
-                    }
+            let first = bytes.get(pos).copied().unwrap_or(SpecialChar::Space.byte());
+            let backtick = SpecialChar::Backtick.byte();
+            if first == backtick
+                || (first == SpecialChar::Space
+                    && bytes[pos..line_end]
+                        .get(..4)
+                        .is_some_and(|w| w.contains(&backtick)))
+            {
+                let fence_len = Self::code_fence_len_bytes(&bytes[pos..line_end]);
+                if fence_len > 0 {
+                    let language =
+                        Self::extract_code_language_bytes(input, &bytes[pos..line_end]);
+                    acc.flush_into(&mut ctx);
+                    let content_start = line_end + 1;
+                    let (code, resume) =
+                        Self::scan_code_block_fast(input, bytes, content_start, fence_len);
+                    ctx.sections
+                        .push(RawSection::CodeBlock { language, code });
+                    pos = resume;
+                    acc = Accumulator::Empty;
+                    continue;
                 }
             }
 
@@ -190,10 +286,16 @@ impl<'src> MarkdownFile<'src> {
         }
 
         acc.flush_into(&mut ctx);
+
+        // --- Pass 2: inline parsing ---
+        let mut pool = Vec::with_capacity(input.len() / 20);
+        let mut span_pool = Vec::with_capacity(input.len() / 100 + 1);
+        let sections = resolve_inlines(ctx.sections, &ctx.lines, &mut pool, &mut span_pool);
+
         Self {
-            sections: ctx.sections,
-            pool: ctx.pool,
-            span_pool: ctx.span_pool,
+            sections,
+            pool,
+            span_pool,
         }
     }
 
@@ -343,14 +445,13 @@ impl<'src> MarkdownFile<'src> {
         count >= 3
     }
 
-    /// Parse an ATX heading (`CommonMark` §4.2) from a byte slice.
-    /// Strips optional closing `#` sequences when preceded by whitespace.
-    fn try_parse_heading_bytes(
+    /// Check whether a byte slice is an ATX heading (`CommonMark` §4.2).
+    /// Returns `(level, text)` without performing any inline parsing.
+    fn try_parse_heading_range(
         input: &'src str,
         line: &[u8],
         line_offset: usize,
-        pool: &mut Vec<Inline<'src>>,
-    ) -> Option<Section<'src>> {
+    ) -> Option<(u8, &'src str)> {
         let level = SpecialChar::Hash.count_leading_bytes(line);
         if !(1..=6).contains(&level) || line.get(level) != SpecialChar::Space {
             return None;
@@ -384,10 +485,8 @@ impl<'src> MarkdownFile<'src> {
         }
         // SAFETY: start and end are within the ASCII heading prefix/suffix.
         let text = unsafe { str_from_range(input, line_offset + start, line_offset + end) };
-        Some(Section::Heading {
-            level: u8::try_from(level).expect("heading level already validated 1..=6"),
-            content: Inline::parse(text, pool),
-        })
+        let level = u8::try_from(level).expect("heading level already validated 1..=6");
+        Some((level, text))
     }
 
     /// Try to parse an unordered list item from a byte slice.
@@ -454,27 +553,21 @@ impl<'src> MarkdownFile<'src> {
 }
 
 // ---------------------------------------------------------------------------
-// ParseCtx methods — line-level fold logic
+// ParseCtx methods — pass 1 line-level fold logic
 // ---------------------------------------------------------------------------
 
 impl<'src> ParseCtx<'src> {
     /// Process one line given as byte range `[pos..line_end)`.
     /// Operates on `&[u8]` throughout; converts to `&str` only when storing.
+    ///
+    /// Code fence opening is handled by the fast-path in `parse()` before this
+    /// method is called, so no code-block state is tracked here.
     fn fold_line(
         &mut self,
         acc: Accumulator<'src>,
         pos: usize,
         line_end: usize,
     ) -> Accumulator<'src> {
-        if let Accumulator::InCodeBlock {
-            language,
-            content,
-            fence_len,
-        } = acc
-        {
-            return self.fold_code_block(language, content, fence_len, pos, line_end);
-        }
-
         let first = self.bytes.get(pos).copied().unwrap_or(SpecialChar::Space.byte());
 
         if first.is_ascii_whitespace() && is_blank_line(self.bytes, pos, line_end) {
@@ -482,59 +575,20 @@ impl<'src> ParseCtx<'src> {
             return Accumulator::Empty;
         }
 
-        // Code fence opening is already handled by parse()'s fast-path before
-        // fold_line is called, so no need to re-check here.
-
         // ATX headings (CommonMark §4.2): only if line starts with '#'.
         if first == SpecialChar::Hash.byte()
-            && let Some(section) = MarkdownFile::try_parse_heading_bytes(
+            && let Some((level, text)) = MarkdownFile::try_parse_heading_range(
                 self.input,
                 &self.bytes[pos..line_end],
                 pos,
-                &mut self.pool,
             )
         {
             acc.flush_into(self);
-            self.sections.push(section);
+            self.sections.push(RawSection::Heading { level, text });
             return Accumulator::Empty;
         }
 
         self.fold_block_element(acc, pos, line_end)
-    }
-
-    #[inline]
-    fn fold_code_block(
-        &mut self,
-        language: Option<&'src str>,
-        content: Option<&'src str>,
-        fence_len: usize,
-        pos: usize,
-        line_end: usize,
-    ) -> Accumulator<'src> {
-        // Guard: only check for closing fence if first byte could be a backtick
-        // or whitespace (indented fence). Avoids calling code_fence_len on
-        // every code block content line.
-        let first = self.bytes.get(pos).copied().unwrap_or(0);
-        if (first == SpecialChar::Backtick.byte() || first.is_ascii_whitespace())
-            && MarkdownFile::code_fence_len_bytes(&self.bytes[pos..line_end]) >= fence_len
-        {
-            self.sections.push(Section::CodeBlock {
-                language,
-                code: content.unwrap_or(""),
-            });
-            return Accumulator::Empty;
-        }
-        // SAFETY: pos and line_end are at newline boundaries.
-        let line_str = unsafe { str_from_range(self.input, pos, line_end) };
-        let content = content.map_or(line_str, |existing| {
-            MarkdownFile::merge_slices(self.input, existing, line_str)
-                .expect("merge_slices failed in code block: slices not from same input")
-        });
-        Accumulator::InCodeBlock {
-            language,
-            content: Some(content),
-            fence_len,
-        }
     }
 
     #[inline]
@@ -564,38 +618,41 @@ impl<'src> ParseCtx<'src> {
             } else {
                 unsafe { str_from_range(self.input, content_start, line_end) }
             };
-            if let Accumulator::InBlockquote { mut lines } = acc {
-                lines.push(content);
-                return Accumulator::InBlockquote { lines };
+            if let Accumulator::InBlockquote { lines_start } = acc {
+                self.lines.push(content);
+                return Accumulator::InBlockquote { lines_start };
             }
             acc.flush_into(self);
-            return Accumulator::InBlockquote {
-                lines: vec_with_first(content),
-            };
+            let lines_start = lines_offset(self.lines.len());
+            self.lines.push(content);
+            return Accumulator::InBlockquote { lines_start };
         }
 
         // Blockquote lazy continuation (CommonMark §5.1): a non-blank line
         // that doesn't start a new block-level construct continues the
         // current blockquote.
-        let acc = if let Accumulator::InBlockquote { mut lines } = acc {
-            if !MarkdownFile::is_horizontal_rule_bytes(line_bytes)
-                && MarkdownFile::try_parse_heading_bytes(
-                    self.input,
-                    line_bytes,
-                    pos,
-                    &mut self.pool,
-                )
-                .is_none()
-                && MarkdownFile::<'src>::code_fence_len_bytes(line_bytes) == 0
-                && MarkdownFile::<'src>::try_parse_unordered_item_bytes(line_bytes).is_none()
-                && MarkdownFile::<'src>::try_parse_ordered_item_bytes(line_bytes).is_none()
+        let acc = if let Accumulator::InBlockquote { lines_start } = acc {
+            // Fast reject: if first byte can't start a block element, continue.
+            let continues = if !line_bytes.is_empty()
+                && !MarkdownFile::<'src>::COULD_START_BLOCK[line_bytes[0] as usize]
             {
+                true
+            } else {
+                !MarkdownFile::is_horizontal_rule_bytes(line_bytes)
+                    && MarkdownFile::try_parse_heading_range(self.input, line_bytes, pos)
+                        .is_none()
+                    && MarkdownFile::<'src>::code_fence_len_bytes(line_bytes) == 0
+                    && MarkdownFile::<'src>::try_parse_unordered_item_bytes(line_bytes).is_none()
+                    && MarkdownFile::<'src>::try_parse_ordered_item_bytes(line_bytes).is_none()
+            };
+            if continues {
                 // SAFETY: pos and line_end are at newline boundaries.
-                lines.push(unsafe { str_from_range(self.input, pos, line_end) });
-                return Accumulator::InBlockquote { lines };
+                self.lines
+                    .push(unsafe { str_from_range(self.input, pos, line_end) });
+                return Accumulator::InBlockquote { lines_start };
             }
             // Line starts a new block — flush the blockquote and fall through.
-            Accumulator::InBlockquote { lines }.flush_into(self);
+            Accumulator::InBlockquote { lines_start }.flush_into(self);
             Accumulator::Empty
         } else {
             acc
@@ -605,7 +662,7 @@ impl<'src> ParseCtx<'src> {
         // characters (optionally with spaces) on a line by themselves.
         if MarkdownFile::is_horizontal_rule_bytes(line_bytes) {
             acc.flush_into(self);
-            self.sections.push(Section::HorizontalRule);
+            self.sections.push(RawSection::HorizontalRule);
             return Accumulator::Empty;
         }
 
@@ -637,23 +694,26 @@ impl<'src> ParseCtx<'src> {
     ) -> Accumulator<'src> {
         if let Accumulator::InUnorderedList {
             marker: m,
-            mut items,
+            items_start,
         } = acc
         {
             if m == marker {
-                items.push(item);
-                return Accumulator::InUnorderedList { marker, items };
+                self.lines.push(item);
+                return Accumulator::InUnorderedList { marker, items_start };
             }
-            Accumulator::InUnorderedList { marker: m, items }.flush_into(self);
-            return Accumulator::InUnorderedList {
-                marker,
-                items: vec_with_first(item),
-            };
+            Accumulator::InUnorderedList {
+                marker: m,
+                items_start,
+            }
+            .flush_into(self);
+        } else {
+            acc.flush_into(self);
         }
-        acc.flush_into(self);
+        let items_start = lines_offset(self.lines.len());
+        self.lines.push(item);
         Accumulator::InUnorderedList {
             marker,
-            items: vec_with_first(item),
+            items_start,
         }
     }
 
@@ -668,34 +728,32 @@ impl<'src> ParseCtx<'src> {
         if let Accumulator::InOrderedList {
             start,
             delimiter,
-            mut items,
+            items_start,
         } = acc
         {
             if delimiter == delim {
-                items.push(item);
+                self.lines.push(item);
                 return Accumulator::InOrderedList {
                     start,
                     delimiter,
-                    items,
+                    items_start,
                 };
             }
             Accumulator::InOrderedList {
                 start,
                 delimiter,
-                items,
+                items_start,
             }
             .flush_into(self);
-            return Accumulator::InOrderedList {
-                start: num,
-                delimiter: delim,
-                items: vec_with_first(item),
-            };
+        } else {
+            acc.flush_into(self);
         }
-        acc.flush_into(self);
+        let items_start = lines_offset(self.lines.len());
+        self.lines.push(item);
         Accumulator::InOrderedList {
             start: num,
             delimiter: delim,
-            items: vec_with_first(item),
+            items_start,
         }
     }
 
@@ -711,9 +769,7 @@ impl<'src> ParseCtx<'src> {
         if let Accumulator::InParagraph { content } = acc {
             return MarkdownFile::merge_slices(self.input, content, line_str).map_or_else(
                 || {
-                    self.sections.push(Section::Paragraph {
-                        content: Inline::parse(content, &mut self.pool),
-                    });
+                    self.sections.push(RawSection::Paragraph { text: content });
                     Accumulator::InParagraph { content: line_str }
                 },
                 |merged| Accumulator::InParagraph { content: merged },
