@@ -1,5 +1,5 @@
 [package]
-name = "marki"
+name = "marki-parse"
 version = "0.1.0"
 edition = "2024"
 description = "A fast, zero-copy CommonMark parser with SIMD-accelerated scanning"

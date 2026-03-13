@@ -1,13 +1,13 @@
 //! A fast, zero-copy `CommonMark` parser with SIMD-accelerated scanning.
 //!
-//! `marki` parses Markdown into structured [`Section`] and [`Inline`] elements,
+//! `marki-parse` parses Markdown into structured [`Section`] and [`Inline`] elements,
 //! borrowing directly from the input string with no intermediate allocations for
 //! text content.
 //!
 //! # Quick start
 //!
 //! ```
-//! use marki::MarkdownFile;
+//! use marki_parse::MarkdownFile;
 //!
 //! let md: MarkdownFile<'_> = MarkdownFile::parse("# Hello\n\nSome **bold** text.");
 //! for section in &md.sections {
@@ -23,8 +23,8 @@
 //!
 //! ```
 //! let input = "# Hello\r\nWorld";
-//! let normalized = marki::normalize(input);
-//! let md: marki::MarkdownFile<'_> = marki::MarkdownFile::parse(&normalized);
+//! let normalized = marki_parse::normalize(input);
+//! let md: marki_parse::MarkdownFile<'_> = marki_parse::MarkdownFile::parse(&normalized);
 //! ```
 //!
 //! # Accessing inline elements
@@ -34,7 +34,7 @@
 //! [`InlineSpan`] / [`SpanSlice`]) to retrieve them:
 //!
 //! ```
-//! use marki::{MarkdownFile, Section};
+//! use marki_parse::{MarkdownFile, Section};
 //!
 //! let md: MarkdownFile<'_> = MarkdownFile::parse("Hello **world**");
 //! if let Some(Section::Paragraph { content }) = md.sections.first() {
@@ -70,8 +70,8 @@ pub use special_char::SpecialChar;
 ///
 /// ```
 /// let input = "# Hello\r\nWorld";
-/// let normalized = marki::normalize(input);
-/// let md: marki::MarkdownFile<'_> = marki::MarkdownFile::parse(&normalized);
+/// let normalized = marki_parse::normalize(input);
+/// let md: marki_parse::MarkdownFile<'_> = marki_parse::MarkdownFile::parse(&normalized);
 /// ```
 #[must_use]
 pub fn normalize(input: &str) -> Cow<'_, str> {
