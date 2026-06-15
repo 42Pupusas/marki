@@ -196,10 +196,7 @@ impl EmphasisState {
         let mut stars: u8 = 0;
         let mut unders: u8 = 0;
         let mut i = 0;
-        loop {
-            let Some(pos) = find_byte_set(bytes, i, &EMPH_SET) else {
-                break;
-            };
+        while let Some(pos) = find_byte_set(bytes, i, &EMPH_SET) {
             if bytes[pos] == SpecialChar::Asterisk {
                 stars = stars.saturating_add(1);
             } else {
@@ -830,10 +827,7 @@ impl<'src> Inline<'src> {
         };
 
         let mut i = inner_start;
-        loop {
-            let Some(pos) = find_byte_set(bytes, i, delim_set) else {
-                break;
-            };
+        while let Some(pos) = find_byte_set(bytes, i, delim_set) {
             i = pos;
             let b = bytes[i];
 

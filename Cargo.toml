@@ -1,6 +1,6 @@
 [package]
 name = "marki-parse"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A fast, zero-copy CommonMark parser with SIMD-accelerated scanning"
 license = "MIT"
@@ -8,7 +8,7 @@ repository = "https://github.com/42Pupusas/marki"
 readme = "README.md"
 keywords = ["markdown", "commonmark", "parser", "zero-copy"]
 categories = ["parsing", "text-processing"]
-rust-version = "1.85"
+rust-version = "1.87"
 exclude = ["flamegraph.svg", "perf.data*", "fuzz/"]
 
 [lints.clippy]
