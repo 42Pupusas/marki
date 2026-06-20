@@ -11,14 +11,19 @@ const ORDERED_LIST: &str = "1. first\n2. second\n3. third\n";
 const BLOCKQUOTE: &str = "> This is a blockquote\n> spanning two lines.\n";
 const HORIZONTAL_RULE: &str = "---\n";
 
-const FIXTURES: &[(&str, &str)] = &[
-    ("rust_readme", include_str!("fixtures/rust_readme.md")),
-    ("awesome", include_str!("fixtures/awesome.md")),
-    (
-        "commonmark_spec",
-        include_str!("fixtures/commonmark_spec.md"),
-    ),
-];
+/// Fixture names used as bench arguments. Kept as bare names so divan prints
+/// readable row labels instead of `Debug`-ing the entire file contents.
+const FIXTURES: &[&str] = &["rust_readme", "awesome", "commonmark_spec"];
+
+/// Resolve a fixture name to its embedded contents.
+fn fixture_src(name: &str) -> &'static str {
+    match name {
+        "rust_readme" => include_str!("fixtures/rust_readme.md"),
+        "awesome" => include_str!("fixtures/awesome.md"),
+        "commonmark_spec" => include_str!("fixtures/commonmark_spec.md"),
+        other => panic!("unknown fixture: {other}"),
+    }
+}
 
 fn mixed_document() -> String {
     [
@@ -111,7 +116,7 @@ mod fixture {
     use super::*;
 
     #[divan::bench(args = FIXTURES)]
-    fn parse(fixture: &(&str, &str)) {
-        let _ = MarkdownFile::<'_, 16, 32>::parse(black_box(fixture.1));
+    fn parse(name: &str) {
+        let _ = MarkdownFile::<'_, 16, 32>::parse(black_box(fixture_src(name)));
     }
 }
