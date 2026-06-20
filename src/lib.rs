@@ -78,8 +78,6 @@ pub use special_char::SpecialChar;
 
 use std::borrow::Cow;
 
-
-
 /// A parsed Markdown document.
 ///
 /// Contains the block-level [`Section`]s and the internal pools that store
@@ -115,7 +113,10 @@ impl MarkdownFile<'_, 16, 32> {
     #[must_use]
     pub fn normalize(input: &str) -> Cow<'_, str> {
         let bytes = input.as_bytes();
-        if bytes.find_byte(0, SpecialChar::CarriageReturn.byte()).is_none() {
+        if bytes
+            .find_byte(0, SpecialChar::CarriageReturn.byte())
+            .is_none()
+        {
             return Cow::Borrowed(input);
         }
         let mut out = String::with_capacity(input.len());
@@ -154,12 +155,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     pub(crate) fn walk_all_inlines(&self) {
         for section in &self.sections {
             match section {
-                Section::UnorderedList { items } => {
-                    for &span in self.item_spans(*items) {
-                        let _ = self.inlines(span);
-                    }
-                }
-                Section::OrderedList { items, .. } => {
+                Section::UnorderedList { items } | Section::OrderedList { items, .. } => {
                     for &span in self.item_spans(*items) {
                         let _ = self.inlines(span);
                     }

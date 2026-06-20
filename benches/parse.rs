@@ -98,7 +98,7 @@ fn mixed_document_bench() {
 
 #[divan::bench_group]
 mod scaling {
-    use super::*;
+    use super::{MarkdownFile, black_box, mixed_document};
 
     fn large_document(repetitions: usize) -> String {
         mixed_document().repeat(repetitions)
@@ -113,7 +113,7 @@ mod scaling {
 
 #[divan::bench_group]
 mod fixture {
-    use super::*;
+    use super::{FIXTURES, MarkdownFile, black_box, fixture_src};
 
     #[divan::bench(args = FIXTURES)]
     fn parse(name: &str) {

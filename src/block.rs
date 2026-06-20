@@ -98,10 +98,6 @@ impl<'src> Accumulator<'src> {
     }
 }
 
-
-
-
-
 // ---------------------------------------------------------------------------
 // BlockBytes trait — block-level helpers on byte slices.
 // ---------------------------------------------------------------------------
@@ -320,12 +316,18 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 RawSection::Heading { level, text } => {
                     sections.push(Section::Heading {
                         level,
-                        content: InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_configured(text, pool),
+                        content:
+                            InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_configured(
+                                text, pool,
+                            ),
                     });
                 }
                 RawSection::Paragraph { text } => {
                     sections.push(Section::Paragraph {
-                        content: InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_configured(text, pool),
+                        content:
+                            InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_configured(
+                                text, pool,
+                            ),
                     });
                 }
                 RawSection::CodeBlock { language, code } => {
@@ -340,7 +342,10 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                         .unwrap_or(&[]);
                     let start = span_pool.len().pool_offset();
                     for item in raw_items {
-                        let span = InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_configured(item, pool);
+                        let span =
+                            InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_configured(
+                                item, pool,
+                            );
                         span_pool.push(span);
                     }
                     let len = span_pool.len().pool_offset() - start;
@@ -359,7 +364,10 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                         .unwrap_or(&[]);
                     let sp_start = span_pool.len().pool_offset();
                     for item in raw_items {
-                        let span = InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_configured(item, pool);
+                        let span =
+                            InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_configured(
+                                item, pool,
+                            );
                         span_pool.push(span);
                     }
                     let sp_len = span_pool.len().pool_offset() - sp_start;
@@ -436,8 +444,9 @@ impl<'src> ParseCtx<'src> {
         let mut pos = 0;
 
         while pos < bytes.len() {
-            let line_end =
-                bytes.find_byte(pos, SpecialChar::Newline.byte()).unwrap_or(bytes.len());
+            let line_end = bytes
+                .find_byte(pos, SpecialChar::Newline.byte())
+                .unwrap_or(bytes.len());
 
             // Fast-path: when we detect a code fence opening, scan ahead for
             // the closing fence in one shot instead of processing line-by-line.
@@ -510,7 +519,9 @@ impl<'src> ParseCtx<'src> {
         let bytes = self.bytes;
         let mut pos = start;
         while pos < bytes.len() {
-            let line_end = bytes.find_byte(pos, SpecialChar::Newline.byte()).unwrap_or(bytes.len());
+            let line_end = bytes
+                .find_byte(pos, SpecialChar::Newline.byte())
+                .unwrap_or(bytes.len());
 
             let first = bytes.get(pos).copied();
             if (first == Some(fence_char) || first == Some(SpecialChar::Space.byte()))
@@ -568,8 +579,7 @@ impl<'src> ParseCtx<'src> {
     ) -> Accumulator<'src> {
         let first = self.bytes.get(pos).copied();
 
-        if first.is_some_and(|b| b.is_ascii_whitespace())
-            && self.bytes.is_blank_line(pos, line_end)
+        if first.is_some_and(|b| b.is_ascii_whitespace()) && self.bytes.is_blank_line(pos, line_end)
         {
             self.flush_acc(acc);
             return Accumulator::Empty;

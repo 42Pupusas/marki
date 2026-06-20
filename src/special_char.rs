@@ -103,7 +103,9 @@ impl SpecialChar {
     #[target_feature(enable = "sse2")]
     #[allow(clippy::cast_ptr_alignment)]
     unsafe fn count_leading_sse2(self, bytes: &[u8]) -> usize {
-        use std::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8};
+        use std::arch::x86_64::{
+            _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8,
+        };
         let needle = self.byte();
         let len = bytes.len();
         let ptr = bytes.as_ptr();

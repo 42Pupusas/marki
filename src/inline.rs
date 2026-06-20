@@ -292,9 +292,7 @@ pub struct InlineParser<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> {
     pool: &'pool mut Vec<Inline<'src>>,
 }
 
-impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize>
-    InlineParser<'src, 'pool, MAX_DEPTH, CAP>
-{
+impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'pool, MAX_DEPTH, CAP> {
     const fn new(input: &'src str, pool: &'pool mut Vec<Inline<'src>>) -> Self {
         Self { input, pool }
     }
@@ -565,8 +563,8 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize>
                 // leaving longer runs (e.g. ****text****) to the strong/italic
                 // logic below.
                 let close_run_start = end - 3;
-                let exact_close = bytes.get(close_run_start - 1) != Some(&b)
-                    && bytes.get(end) != Some(&b);
+                let exact_close =
+                    bytes.get(close_run_start - 1) != Some(&b) && bytes.get(end) != Some(&b);
                 if exact_close {
                     let inner_span = self.parse_inner(inner, depth + 1);
                     let bold_start = self.pool.len().pool_offset();
@@ -704,12 +702,8 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize>
         let bytes = trimmed.as_bytes();
         let last = bytes[bytes.len() - 1];
         let (open, close) = match SpecialChar::from_byte(last) {
-            Some(SpecialChar::DoubleQuote) => {
-                (SpecialChar::DoubleQuote, SpecialChar::DoubleQuote)
-            }
-            Some(SpecialChar::SingleQuote) => {
-                (SpecialChar::SingleQuote, SpecialChar::SingleQuote)
-            }
+            Some(SpecialChar::DoubleQuote) => (SpecialChar::DoubleQuote, SpecialChar::DoubleQuote),
+            Some(SpecialChar::SingleQuote) => (SpecialChar::SingleQuote, SpecialChar::SingleQuote),
             Some(SpecialChar::CloseParen) => (SpecialChar::OpenParen, SpecialChar::CloseParen),
             // No trailing title delimiter — the entire content is the URL.
             _ => return (trimmed, None),
@@ -837,8 +831,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize>
             i = pos;
             let b = bytes[i];
 
-            if b == SpecialChar::Backslash
-                && bytes.get(i + 1).is_some_and(u8::is_ascii_punctuation)
+            if b == SpecialChar::Backslash && bytes.get(i + 1).is_some_and(u8::is_ascii_punctuation)
             {
                 i += 2;
                 continue;
@@ -928,5 +921,3 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize>
         None
     }
 }
-
-

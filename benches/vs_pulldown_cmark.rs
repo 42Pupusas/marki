@@ -28,7 +28,7 @@ fn main() {
 
 #[divan::bench_group]
 mod vs {
-    use super::*;
+    use super::{FIXTURES, MarkdownFile, black_box, fixture, pulldown_parse};
 
     #[divan::bench(args = FIXTURES)]
     fn marki(name: &str) {
