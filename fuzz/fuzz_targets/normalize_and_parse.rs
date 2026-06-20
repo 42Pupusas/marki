@@ -7,6 +7,6 @@ fuzz_target!(|data: &[u8]| {
     let Ok(s) = std::str::from_utf8(data) else {
         return;
     };
-    let normalized = marki::normalize(&s);
+    let normalized = marki::MarkdownFile::normalize(&s);
     let _: marki::MarkdownFile<'_> = marki::MarkdownFile::parse(&normalized);
 });

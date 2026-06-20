@@ -1,5 +1,5 @@
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use marki::MarkdownFile;
+use divan::black_box;
+use marki_parse::MarkdownFile;
 
 const HEADING: &str = "# Hello World\n";
 const PARAGRAPH: &str = "This is a simple paragraph with some text.\n";
@@ -41,79 +41,77 @@ fn mixed_document() -> String {
     .concat()
 }
 
-fn large_document(repetitions: usize) -> String {
-    let section = mixed_document();
-    section.repeat(repetitions)
+fn main() {
+    divan::main();
 }
 
-fn bench_individual_sections(c: &mut Criterion) {
-    let mut group = c.benchmark_group("section");
-
-    group.bench_function("heading", |b| {
-        b.iter(|| MarkdownFile::<'_, 16, 32>::parse(black_box(HEADING)));
-    });
-    group.bench_function("paragraph", |b| {
-        b.iter(|| MarkdownFile::<'_, 16, 32>::parse(black_box(PARAGRAPH)));
-    });
-    group.bench_function("inline_rich", |b| {
-        b.iter(|| MarkdownFile::<'_, 16, 32>::parse(black_box(INLINE_RICH)));
-    });
-    group.bench_function("code_block", |b| {
-        b.iter(|| MarkdownFile::<'_, 16, 32>::parse(black_box(CODE_BLOCK)));
-    });
-    group.bench_function("unordered_list", |b| {
-        b.iter(|| MarkdownFile::<'_, 16, 32>::parse(black_box(UNORDERED_LIST)));
-    });
-    group.bench_function("ordered_list", |b| {
-        b.iter(|| MarkdownFile::<'_, 16, 32>::parse(black_box(ORDERED_LIST)));
-    });
-    group.bench_function("blockquote", |b| {
-        b.iter(|| MarkdownFile::<'_, 16, 32>::parse(black_box(BLOCKQUOTE)));
-    });
-    group.bench_function("horizontal_rule", |b| {
-        b.iter(|| MarkdownFile::<'_, 16, 32>::parse(black_box(HORIZONTAL_RULE)));
-    });
-
-    group.finish();
+#[divan::bench]
+fn heading() {
+    let _ = MarkdownFile::<'_, 16, 32>::parse(black_box(HEADING));
 }
 
-fn bench_mixed_document(c: &mut Criterion) {
+#[divan::bench]
+fn paragraph() {
+    let _ = MarkdownFile::<'_, 16, 32>::parse(black_box(PARAGRAPH));
+}
+
+#[divan::bench]
+fn inline_rich() {
+    let _ = MarkdownFile::<'_, 16, 32>::parse(black_box(INLINE_RICH));
+}
+
+#[divan::bench]
+fn code_block() {
+    let _ = MarkdownFile::<'_, 16, 32>::parse(black_box(CODE_BLOCK));
+}
+
+#[divan::bench]
+fn unordered_list() {
+    let _ = MarkdownFile::<'_, 16, 32>::parse(black_box(UNORDERED_LIST));
+}
+
+#[divan::bench]
+fn ordered_list() {
+    let _ = MarkdownFile::<'_, 16, 32>::parse(black_box(ORDERED_LIST));
+}
+
+#[divan::bench]
+fn blockquote() {
+    let _ = MarkdownFile::<'_, 16, 32>::parse(black_box(BLOCKQUOTE));
+}
+
+#[divan::bench]
+fn horizontal_rule() {
+    let _ = MarkdownFile::<'_, 16, 32>::parse(black_box(HORIZONTAL_RULE));
+}
+
+#[divan::bench]
+fn mixed_document_bench() {
     let doc = mixed_document();
-    c.bench_function("mixed_document", |b| {
-        b.iter(|| MarkdownFile::<'_, 16, 32>::parse(black_box(&doc)));
-    });
+    let _ = MarkdownFile::<'_, 16, 32>::parse(black_box(&doc));
 }
 
-fn bench_scaling(c: &mut Criterion) {
-    let mut group = c.benchmark_group("scaling");
+#[divan::bench_group]
+mod scaling {
+    use super::*;
 
-    for reps in [1, 10, 100] {
+    fn large_document(repetitions: usize) -> String {
+        mixed_document().repeat(repetitions)
+    }
+
+    #[divan::bench(args = [1, 10, 100])]
+    fn parse(reps: usize) {
         let doc = large_document(reps);
-        group.bench_with_input(BenchmarkId::from_parameter(reps), &doc, |b, doc| {
-            b.iter(|| MarkdownFile::<'_, 16, 32>::parse(black_box(doc)));
-        });
+        let _ = MarkdownFile::<'_, 16, 32>::parse(black_box(&doc));
     }
-
-    group.finish();
 }
 
-fn bench_fixtures(c: &mut Criterion) {
-    let mut group = c.benchmark_group("fixture");
+#[divan::bench_group]
+mod fixture {
+    use super::*;
 
-    for &(name, content) in FIXTURES {
-        group.bench_with_input(BenchmarkId::from_parameter(name), &content, |b, doc| {
-            b.iter(|| MarkdownFile::<'_, 16, 32>::parse(black_box(doc)));
-        });
+    #[divan::bench(args = FIXTURES)]
+    fn parse(fixture: &(&str, &str)) {
+        let _ = MarkdownFile::<'_, 16, 32>::parse(black_box(fixture.1));
     }
-
-    group.finish();
 }
-
-criterion_group!(
-    benches,
-    bench_individual_sections,
-    bench_mixed_document,
-    bench_scaling,
-    bench_fixtures,
-);
-criterion_main!(benches);

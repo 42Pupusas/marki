@@ -18,12 +18,12 @@
 //! # CRLF input
 //!
 //! The parser operates on LF (`\n`) line endings. For input that may contain
-//! `\r\n`, call [`normalize`] first — it returns the input borrowed when no
+//! `\r\n`, call [`MarkdownFile::normalize`] first — it returns the input borrowed when no
 //! `\r` is present (zero cost):
 //!
 //! ```
 //! let input = "# Hello\r\nWorld";
-//! let normalized = marki_parse::normalize(input);
+//! let normalized = marki_parse::MarkdownFile::normalize(input);
 //! let md: marki_parse::MarkdownFile<'_> = marki_parse::MarkdownFile::parse(&normalized);
 //! ```
 //!
@@ -55,46 +55,30 @@ mod fuzz_finds;
 #[cfg(test)]
 mod tests;
 
-use std::borrow::Cow;
-
 pub use inline::Inline;
+
+/// Convert collection lengths into the `u32` offsets used by spans.
+pub(crate) trait OffsetExt {
+    fn pool_offset(self) -> u32;
+    fn lines_offset(self) -> u32;
+}
+
+impl OffsetExt for usize {
+    fn pool_offset(self) -> u32 {
+        u32::try_from(self).expect("inline pool exceeds u32::MAX elements")
+    }
+
+    fn lines_offset(self) -> u32 {
+        u32::try_from(self).expect("lines pool exceeds u32::MAX elements")
+    }
+}
+use crate::simd::ByteSliceExt;
 pub use section::{InlineSpan, OrderedListDelimiter, Section, SpanSlice};
 pub use special_char::SpecialChar;
 
-/// Normalize line endings for parsing. Converts `\r\n` to `\n` and bare `\r`
-/// (classic Mac) to `\n`. Returns the input borrowed if no carriage returns
-/// are found.
-///
-/// Use this before [`MarkdownFile::parse`] when the input may contain CRLF
-/// line endings:
-///
-/// ```
-/// let input = "# Hello\r\nWorld";
-/// let normalized = marki_parse::normalize(input);
-/// let md: marki_parse::MarkdownFile<'_> = marki_parse::MarkdownFile::parse(&normalized);
-/// ```
-#[must_use]
-pub fn normalize(input: &str) -> Cow<'_, str> {
-    let bytes = input.as_bytes();
-    if simd::find_byte(bytes, 0, SpecialChar::CarriageReturn.byte()).is_none() {
-        return Cow::Borrowed(input);
-    }
-    // Single-pass: copy chunks between \r characters, replacing each \r with
-    // \n and consuming the following \n in \r\n pairs.
-    let mut out = String::with_capacity(input.len());
-    let mut start = 0;
-    while let Some(cr) = simd::find_byte(bytes, start, SpecialChar::CarriageReturn.byte()) {
-        out.push_str(&input[start..cr]);
-        out.push('\n');
-        start = cr + 1;
-        // Consume the \n in a \r\n pair so it doesn't become a double newline.
-        if bytes.get(start) == Some(&SpecialChar::Newline.byte()) {
-            start += 1;
-        }
-    }
-    out.push_str(&input[start..]);
-    Cow::Owned(out)
-}
+use std::borrow::Cow;
+
+
 
 /// A parsed Markdown document.
 ///
@@ -114,6 +98,41 @@ pub struct MarkdownFile<'src, const MAX_INLINE_DEPTH: u8 = 16, const INLINE_STAC
     span_pool: Vec<InlineSpan>,
 }
 
+/// On the default `MarkdownFile` (depth=16, cap=32) we expose `normalize` as
+/// an associated fn so callers don't need to import a free function.
+impl MarkdownFile<'_, 16, 32> {
+    /// Normalize line endings for parsing. Converts `\r\n` to `\n` and bare
+    /// `\r` (classic Mac) to `\n`. Returns the input borrowed if no carriage
+    /// returns are found (zero cost).
+    ///
+    /// Call this before [`MarkdownFile::parse`] when input may contain CRLF:
+    ///
+    /// ```
+    /// let input = "# Hello\r\nWorld";
+    /// let normalized = marki_parse::MarkdownFile::normalize(input);
+    /// let md: marki_parse::MarkdownFile<'_> = marki_parse::MarkdownFile::parse(&normalized);
+    /// ```
+    #[must_use]
+    pub fn normalize(input: &str) -> Cow<'_, str> {
+        let bytes = input.as_bytes();
+        if bytes.find_byte(0, SpecialChar::CarriageReturn.byte()).is_none() {
+            return Cow::Borrowed(input);
+        }
+        let mut out = String::with_capacity(input.len());
+        let mut start = 0;
+        while let Some(cr) = bytes.find_byte(start, SpecialChar::CarriageReturn.byte()) {
+            out.push_str(&input[start..cr]);
+            out.push('\n');
+            start = cr + 1;
+            if bytes.get(start) == Some(&SpecialChar::Newline.byte()) {
+                start += 1;
+            }
+        }
+        out.push_str(&input[start..]);
+        Cow::Owned(out)
+    }
+}
+
 impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP>
 {
@@ -127,6 +146,32 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     #[must_use]
     pub fn item_spans(&self, slice: SpanSlice) -> &[InlineSpan] {
         &self[slice]
+    }
+
+    /// Walk every section and dereference every inline span. Used in tests and
+    /// fuzz targets to assert the parser does not panic on arbitrary input.
+    #[cfg(test)]
+    pub(crate) fn walk_all_inlines(&self) {
+        for section in &self.sections {
+            match section {
+                Section::UnorderedList { items } => {
+                    for &span in self.item_spans(*items) {
+                        let _ = self.inlines(span);
+                    }
+                }
+                Section::OrderedList { items, .. } => {
+                    for &span in self.item_spans(*items) {
+                        let _ = self.inlines(span);
+                    }
+                }
+                Section::Heading { content, .. }
+                | Section::Paragraph { content }
+                | Section::Blockquote { content } => {
+                    let _ = self.inlines(*content);
+                }
+                Section::CodeBlock { .. } | Section::HorizontalRule => {}
+            }
+        }
     }
 }
 

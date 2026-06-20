@@ -1,5 +1,5 @@
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use marki::MarkdownFile;
+use divan::black_box;
+use marki_parse::MarkdownFile;
 use pulldown_cmark::{Options, Parser};
 
 const FIXTURES: &[(&str, &str)] = &[
@@ -13,29 +13,25 @@ const FIXTURES: &[(&str, &str)] = &[
 
 fn pulldown_parse(input: &str) {
     let parser = Parser::new_ext(input, Options::empty());
-    // Consume the iterator to force full parse
+    // Consume the iterator to force full parse.
     for _ in parser {}
 }
 
-fn bench_vs(c: &mut Criterion) {
-    for &(name, content) in FIXTURES {
-        let mut group = c.benchmark_group(name);
-
-        group.bench_with_input(BenchmarkId::new("marki", ""), &content, |b, doc| {
-            b.iter(|| MarkdownFile::<'_, 16, 32>::parse(black_box(doc)));
-        });
-
-        group.bench_with_input(
-            BenchmarkId::new("pulldown_cmark", ""),
-            &content,
-            |b, doc| {
-                b.iter(|| pulldown_parse(black_box(doc)));
-            },
-        );
-
-        group.finish();
-    }
+fn main() {
+    divan::main();
 }
 
-criterion_group!(benches, bench_vs);
-criterion_main!(benches);
+#[divan::bench_group]
+mod vs {
+    use super::*;
+
+    #[divan::bench(args = FIXTURES)]
+    fn marki(fixture: &(&str, &str)) {
+        let _ = MarkdownFile::<'_, 16, 32>::parse(black_box(fixture.1));
+    }
+
+    #[divan::bench(args = FIXTURES)]
+    fn pulldown_cmark(fixture: &(&str, &str)) {
+        pulldown_parse(black_box(fixture.1));
+    }
+}

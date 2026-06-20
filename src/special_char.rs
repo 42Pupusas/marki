@@ -78,63 +78,57 @@ impl SpecialChar {
     #[inline]
     #[must_use]
     pub fn count_leading_bytes(self, bytes: &[u8]) -> usize {
-        let needle = self.byte();
         #[cfg(target_arch = "x86_64")]
         {
             // SAFETY: SSE2 is baseline on all x86_64 processors.
-            unsafe { count_leading_sse2(bytes, needle) }
+            unsafe { self.count_leading_sse2(bytes) }
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            count_leading_scalar(bytes, needle)
+            self.count_leading_scalar(bytes)
         }
     }
-}
 
-#[cfg(not(target_arch = "x86_64"))]
-fn count_leading_scalar(bytes: &[u8], needle: u8) -> usize {
-    let mut n = 0;
-    while n < bytes.len() && bytes[n] == needle {
-        n += 1;
+    #[cfg(not(target_arch = "x86_64"))]
+    fn count_leading_scalar(self, bytes: &[u8]) -> usize {
+        let needle = self.byte();
+        let mut n = 0;
+        while n < bytes.len() && bytes[n] == needle {
+            n += 1;
+        }
+        n
     }
-    n
-}
 
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8};
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
-#[allow(
-    clippy::cast_ptr_alignment,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
-unsafe fn count_leading_sse2(bytes: &[u8], needle: u8) -> usize {
-    let len = bytes.len();
-    let ptr = bytes.as_ptr();
-
-    unsafe {
-        let n = _mm_set1_epi8(i8::from_ne_bytes([needle]));
-        let mut i = 0;
-
-        // Process 16-byte chunks: all bytes must match.
-        while i + 16 <= len {
-            let chunk = _mm_loadu_si128(ptr.add(i).cast());
-            let mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, n)) as u16;
-            if mask == 0xFFFF {
-                i += 16;
-            } else {
-                // First non-matching byte within this chunk.
-                return i + mask.trailing_ones() as usize;
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "sse2")]
+    #[allow(clippy::cast_ptr_alignment)]
+    unsafe fn count_leading_sse2(self, bytes: &[u8]) -> usize {
+        use std::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8};
+        let needle = self.byte();
+        let len = bytes.len();
+        let ptr = bytes.as_ptr();
+        unsafe {
+            let n = _mm_set1_epi8(i8::from_ne_bytes([needle]));
+            let mut i = 0;
+            while i + 16 <= len {
+                let chunk = _mm_loadu_si128(ptr.add(i).cast());
+                let mask = u16::try_from(_mm_movemask_epi8(_mm_cmpeq_epi8(chunk, n)))
+                    .expect("movemask produces a 16-bit value");
+                if mask == 0xFFFF {
+                    i += 16;
+                } else {
+                    let matched: usize = mask
+                        .trailing_ones()
+                        .try_into()
+                        .expect("trailing ones fit in usize");
+                    return i + matched;
+                }
             }
+            while i < len && bytes[i] == needle {
+                i += 1;
+            }
+            i
         }
-
-        // Scalar tail.
-        while i < len && bytes[i] == needle {
-            i += 1;
-        }
-        i
     }
 }
 
@@ -169,5 +163,49 @@ impl PartialEq<SpecialChar> for Option<u8> {
 impl std::fmt::Display for SpecialChar {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.byte() as char)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SpecialChar;
+
+    #[test]
+    fn count_leading_bytes_empty() {
+        assert_eq!(SpecialChar::Asterisk.count_leading_bytes(b""), 0);
+    }
+
+    #[test]
+    fn count_leading_bytes_none() {
+        assert_eq!(SpecialChar::Asterisk.count_leading_bytes(b"abc"), 0);
+    }
+
+    #[test]
+    fn count_leading_bytes_short_run() {
+        assert_eq!(SpecialChar::Backtick.count_leading_bytes(b"``code"), 2);
+    }
+
+    #[test]
+    fn count_leading_bytes_exact_boundary() {
+        // Exactly 16 characters exercises the SSE2 fast-path boundary.
+        let input = b"****************";
+        assert_eq!(SpecialChar::Asterisk.count_leading_bytes(input), 16);
+    }
+
+    #[test]
+    fn count_leading_bytes_long_run() {
+        let input = vec![SpecialChar::Hash.byte(); 100];
+        assert_eq!(SpecialChar::Hash.count_leading_bytes(&input), 100);
+    }
+
+    #[test]
+    fn count_leading_bytes_partial_chunk() {
+        let input = b"*****x**********";
+        assert_eq!(SpecialChar::Asterisk.count_leading_bytes(input), 5);
+    }
+
+    #[test]
+    fn count_leading_bytes_tilde() {
+        assert_eq!(SpecialChar::Tilde.count_leading_bytes(b"~~~rust"), 3);
     }
 }

@@ -71,16 +71,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "marki"
-version = "0.1.0"
-
-[[package]]
 name = "marki-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
- "marki",
+ "marki-parse",
 ]
+
+[[package]]
+name = "marki-parse"
+version = "0.1.1"
 
 [[package]]
 name = "r-efi"

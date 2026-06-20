@@ -1,19 +1,9 @@
 use std::mem::MaybeUninit;
 
+use crate::OffsetExt;
 use crate::SpecialChar;
 use crate::section::InlineSpan;
-use crate::simd::{ByteSet, find_byte, find_byte_set};
-
-/// Count consecutive occurrences of `needle` at the start of `bytes`.
-/// Scalar loop — faster than SIMD for short runs (inline code backticks are typically 1-3).
-#[inline]
-fn count_leading_byte(bytes: &[u8], needle: u8) -> usize {
-    let mut n = 0;
-    while n < bytes.len() && bytes[n] == needle {
-        n += 1;
-    }
-    n
-}
+use crate::simd::{ByteSet, ByteSliceExt};
 
 /// An inline element within a Markdown block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,7 +76,7 @@ impl CharClass {
     const fn of(ch: char) -> Self {
         if ch.is_whitespace() {
             Self::Whitespace
-        } else if ch.is_ascii_punctuation() || unicode_punctuation(ch) {
+        } else if ch.is_ascii_punctuation() || Self::unicode_punctuation(ch) {
             Self::Punctuation
         } else {
             Self::Other
@@ -104,28 +94,27 @@ impl CharClass {
             Self::Other
         }
     }
-}
 
-/// Check if a character is Unicode punctuation (general categories P or S)
-/// beyond ASCII punctuation. Covers the most common cases without a dependency.
-/// A full implementation would use unicode-general-category crate.
-const fn unicode_punctuation(ch: char) -> bool {
-    if ch.is_ascii() {
-        return false;
+    /// Returns `true` for Unicode punctuation/symbol characters beyond ASCII.
+    /// Covers general categories P and S without an external crate.
+    const fn unicode_punctuation(ch: char) -> bool {
+        if ch.is_ascii() {
+            return false;
+        }
+        matches!(ch,
+            '\u{00A1}'..='\u{00BF}' // Latin punctuation/symbols
+            | '\u{2010}'..='\u{2027}' // General punctuation
+            | '\u{2030}'..='\u{205E}' // More general punctuation
+            | '\u{2190}'..='\u{23FF}' // Arrows, math operators, misc technical
+            | '\u{2500}'..='\u{2BFF}' // Box drawing, block elements, symbols
+            | '\u{3000}'..='\u{303F}' // CJK symbols and punctuation
+            | '\u{FE30}'..='\u{FE6F}' // CJK compatibility forms, small forms
+            | '\u{FF01}'..='\u{FF0F}' // Fullwidth punctuation
+            | '\u{FF1A}'..='\u{FF20}' // More fullwidth punctuation
+            | '\u{FF3B}'..='\u{FF40}' // Fullwidth brackets
+            | '\u{FF5B}'..='\u{FF65}' // Fullwidth punctuation
+        )
     }
-    matches!(ch,
-        '\u{00A1}'..='\u{00BF}' // Latin punctuation/symbols
-        | '\u{2010}'..='\u{2027}' // General punctuation (dashes, quotes, etc.)
-        | '\u{2030}'..='\u{205E}' // More general punctuation
-        | '\u{2190}'..='\u{23FF}' // Arrows, math operators, misc technical
-        | '\u{2500}'..='\u{2BFF}' // Box drawing, block elements, symbols
-        | '\u{3000}'..='\u{303F}' // CJK symbols and punctuation
-        | '\u{FE30}'..='\u{FE6F}' // CJK compatibility forms, small forms
-        | '\u{FF01}'..='\u{FF0F}' // Fullwidth punctuation
-        | '\u{FF1A}'..='\u{FF20}' // More fullwidth punctuation
-        | '\u{FF3B}'..='\u{FF40}' // Fullwidth brackets
-        | '\u{FF5B}'..='\u{FF65}' // Fullwidth punctuation
-    )
 }
 
 /// What emphasis types remain possible for a given delimiter character.
@@ -171,7 +160,7 @@ impl DelimiterAvail {
     const fn from_count(count: usize) -> Self {
         match count {
             0 | 1 => Self::None,
-            2 | 3 => Self::ItalicOnly,
+            2 => Self::BoldOnly,
             _ => Self::Both,
         }
     }
@@ -196,7 +185,7 @@ impl EmphasisState {
         let mut stars: u8 = 0;
         let mut unders: u8 = 0;
         let mut i = 0;
-        while let Some(pos) = find_byte_set(bytes, i, &EMPH_SET) {
+        while let Some(pos) = bytes.find_byte_set(i, &EMPH_SET) {
             if bytes[pos] == SpecialChar::Asterisk {
                 stars = stars.saturating_add(1);
             } else {
@@ -278,133 +267,122 @@ impl<'src, const CAP: usize> InlineBuf<'src, CAP> {
 
     #[inline]
     fn flush_to_pool(self, pool: &mut Vec<Inline<'src>>) -> InlineSpan {
-        let start = pool_offset(pool.len());
+        let start = pool.len().pool_offset();
         if self.overflow.is_empty() {
             pool.extend_from_slice(self.initialized_stack());
-            InlineSpan::new(start, pool_offset(self.len))
+            InlineSpan::new(start, self.len.pool_offset())
         } else {
-            let len = pool_offset(self.overflow.len());
+            let len = self.overflow.len().pool_offset();
             pool.extend(self.overflow);
             InlineSpan::new(start, len)
         }
     }
 }
 
-/// Pool index as `u32`. Panics if the pool exceeds 4 GiB of elements
-/// (unreachable in practice — that would require billions of inline nodes).
-#[allow(clippy::inline_always)]
-#[inline(always)]
-pub fn pool_offset(pool_len: usize) -> u32 {
-    u32::try_from(pool_len).expect("inline pool exceeds u32::MAX elements")
+/// Threshold below which the emphasis pre-scan costs more than it saves.
+const EMPH_SCAN_THRESHOLD: usize = 256;
+
+/// Stateful parser for a single inline parse pass.
+///
+/// Holds the input slice and a mutable reference to the output pool so that
+/// recursive/nested parsing can share the same pool without threading the
+/// pool through every helper.
+pub struct InlineParser<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> {
+    input: &'src str,
+    pool: &'pool mut Vec<Inline<'src>>,
 }
 
-impl<'src> Inline<'src> {
-    /// Threshold below which the emphasis pre-scan costs more than it saves.
-    const EMPH_SCAN_THRESHOLD: usize = 256;
+impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize>
+    InlineParser<'src, 'pool, MAX_DEPTH, CAP>
+{
+    const fn new(input: &'src str, pool: &'pool mut Vec<Inline<'src>>) -> Self {
+        Self { input, pool }
+    }
+
+    /// Parse inline elements with configurable depth and stack limits.
+    pub(crate) fn parse_configured(
+        input: &'src str,
+        pool: &'pool mut Vec<Inline<'src>>,
+    ) -> InlineSpan {
+        Self::new(input, pool).parse()
+    }
+
+    /// Push parsed inline elements directly into the pool without wrapping
+    /// in a span, with configurable depth and stack limits.
+    pub(crate) fn parse_flat_into_configured(input: &'src str, pool: &'pool mut Vec<Inline<'src>>) {
+        Self::new(input, pool).parse_flat();
+    }
 
     /// Parse inline elements and store them in the pool. Returns a span.
     ///
     /// Uses default limits (`MAX_INLINE_DEPTH = 16`, `INLINE_STACK_CAP = 32`).
     /// For custom limits, use [`crate::MarkdownFile::parse`] with const generics.
     #[must_use]
-    pub fn parse(input: &'src str, pool: &mut Vec<Self>) -> InlineSpan {
-        Self::parse_configured::<16, 32>(input, pool)
+    fn parse(&mut self) -> InlineSpan {
+        self.parse_at_depth(0)
     }
 
-    /// Parse inline elements with configurable depth and stack limits.
-    pub(crate) fn parse_configured<const MAX_DEPTH: u8, const CAP: usize>(
-        input: &'src str,
-        pool: &mut Vec<Self>,
-    ) -> InlineSpan {
-        let bytes = input.as_bytes();
+    fn parse_at_depth(&mut self, depth: u8) -> InlineSpan {
+        let bytes = self.input.as_bytes();
         // Fast path: if no special bytes exist, the entire input is plain text.
-        if find_byte_set(bytes, 0, &SPECIAL_SET).is_none() {
-            if input.is_empty() {
+        if bytes.find_byte_set(0, &SPECIAL_SET).is_none() {
+            if self.input.is_empty() {
                 return InlineSpan::EMPTY;
             }
-            let start = pool_offset(pool.len());
-            pool.push(Self::Text(input));
+            let start = self.pool.len().pool_offset();
+            self.pool.push(Inline::Text(self.input));
             return InlineSpan::new(start, 1);
         }
-        let emph = if bytes.len() < Self::EMPH_SCAN_THRESHOLD {
+        let emph = if bytes.len() < EMPH_SCAN_THRESHOLD {
             EmphasisState::assume_both()
         } else {
             EmphasisState::from_bytes(bytes)
         };
-        Self::parse_with_emph::<MAX_DEPTH, CAP>(input, bytes, emph, pool, 0)
-    }
-
-    fn parse_inner<const MAX_DEPTH: u8, const CAP: usize>(
-        input: &'src str,
-        pool: &mut Vec<Self>,
-        depth: u8,
-    ) -> InlineSpan {
-        let bytes = input.as_bytes();
-        Self::parse_with_emph::<MAX_DEPTH, CAP>(
-            input,
-            bytes,
-            EmphasisState::assume_both(),
-            pool,
-            depth,
-        )
-    }
-
-    fn parse_with_emph<const MAX_DEPTH: u8, const CAP: usize>(
-        input: &'src str,
-        bytes: &[u8],
-        emph: EmphasisState,
-        pool: &mut Vec<Self>,
-        depth: u8,
-    ) -> InlineSpan {
         let mut buf = InlineBuf::<CAP>::new();
-        Self::parse_into_buf::<MAX_DEPTH, CAP>(input, bytes, emph, pool, &mut buf, depth);
-        buf.flush_to_pool(pool)
+        self.parse_into_buf(bytes, emph, &mut buf, depth);
+        buf.flush_to_pool(self.pool)
+    }
+
+    fn parse_inner(&mut self, input: &'src str, depth: u8) -> InlineSpan {
+        InlineParser::<MAX_DEPTH, CAP> {
+            input,
+            pool: self.pool,
+        }
+        .parse_at_depth(depth)
     }
 
     /// Push parsed inline elements directly into the pool without wrapping
     /// in a span. Used for blockquote multi-line accumulation where the caller
     /// manages span boundaries.
-    ///
-    /// Uses default limits (`MAX_INLINE_DEPTH = 16`, `INLINE_STACK_CAP = 32`).
-    /// For custom limits, use [`crate::MarkdownFile::parse`] with const generics.
-    pub fn parse_flat_into(input: &'src str, pool: &mut Vec<Self>) {
-        Self::parse_flat_into_configured::<16, 32>(input, pool);
-    }
-
-    /// Push parsed inline elements with configurable depth and stack limits.
-    pub(crate) fn parse_flat_into_configured<const MAX_DEPTH: u8, const CAP: usize>(
-        input: &'src str,
-        pool: &mut Vec<Self>,
-    ) {
-        let bytes = input.as_bytes();
+    fn parse_flat(&mut self) {
+        let bytes = self.input.as_bytes();
         // Fast path: no special bytes means plain text.
-        if find_byte_set(bytes, 0, &SPECIAL_SET).is_none() {
-            if !input.is_empty() {
-                pool.push(Self::Text(input));
+        if bytes.find_byte_set(0, &SPECIAL_SET).is_none() {
+            if !self.input.is_empty() {
+                self.pool.push(Inline::Text(self.input));
             }
             return;
         }
-        let emph = if bytes.len() < Self::EMPH_SCAN_THRESHOLD {
+        let emph = if bytes.len() < EMPH_SCAN_THRESHOLD {
             EmphasisState::assume_both()
         } else {
             EmphasisState::from_bytes(bytes)
         };
         // Parse directly into a buf that flushes to pool (flat, no span wrapper).
         let mut buf = InlineBuf::<CAP>::new();
-        Self::parse_into_buf::<MAX_DEPTH, CAP>(input, bytes, emph, pool, &mut buf, 0);
+        self.parse_into_buf(bytes, emph, &mut buf, 0);
         // Flush buf directly to pool (not wrapped in a span).
         if buf.overflow.is_empty() {
-            pool.extend_from_slice(buf.initialized_stack());
+            self.pool.extend_from_slice(buf.initialized_stack());
         } else {
-            pool.extend(buf.overflow);
+            self.pool.extend(buf.overflow);
         }
     }
 
-    fn parse_into_buf<const MAX_DEPTH: u8, const CAP: usize>(
-        input: &'src str,
+    fn parse_into_buf(
+        &mut self,
         bytes: &[u8],
         mut emph: EmphasisState,
-        pool: &mut Vec<Self>,
         buf: &mut InlineBuf<'src, CAP>,
         depth: u8,
     ) {
@@ -412,12 +390,12 @@ impl<'src> Inline<'src> {
         let mut i = 0;
 
         // SIMD-accelerated scan: find next special byte.
-        while let Some(pos) = find_byte_set(bytes, i, &SPECIAL_SET) {
+        while let Some(pos) = bytes.find_byte_set(i, &SPECIAL_SET) {
             i = pos;
             let b = bytes[i];
 
             if b == SpecialChar::Newline {
-                Self::emit_line_break::<CAP>(input, bytes, plain_start, i, buf);
+                self.emit_line_break(bytes, plain_start, i, buf);
                 plain_start = i + 1;
                 i = plain_start;
                 continue;
@@ -429,10 +407,10 @@ impl<'src> Inline<'src> {
                 && let Some(&next) = bytes.get(i + 1)
                 && next.is_ascii_punctuation()
             {
-                if let Some(text) = input.get(plain_start..i)
+                if let Some(text) = self.input.get(plain_start..i)
                     && !text.is_empty()
                 {
-                    buf.push(Self::Text(text));
+                    buf.push(Inline::Text(text));
                 }
                 plain_start = i + 1;
                 i += 2;
@@ -441,14 +419,14 @@ impl<'src> Inline<'src> {
 
             // Inline code: `code` or ``code``
             if b == SpecialChar::Backtick
-                && let Some((code, end)) = Self::try_parse_inline_code(input, bytes, i)
+                && let Some((code, end)) = Self::try_parse_inline_code(self.input, bytes, i)
             {
-                if let Some(text) = input.get(plain_start..i)
+                if let Some(text) = self.input.get(plain_start..i)
                     && !text.is_empty()
                 {
-                    buf.push(Self::Text(text));
+                    buf.push(Inline::Text(text));
                 }
-                buf.push(Self::Code(code));
+                buf.push(Inline::Code(code));
                 plain_start = end;
                 i = end;
                 continue;
@@ -458,14 +436,14 @@ impl<'src> Inline<'src> {
             if b == SpecialChar::ExclamationMark
                 && bytes.get(i + 1) == SpecialChar::OpenBracket
                 && let Some((alt, url, title, end)) =
-                    Self::try_parse_bracket_paren(input, bytes, i + 1)
+                    Self::try_parse_bracket_paren(self.input, bytes, i + 1)
             {
-                if let Some(text) = input.get(plain_start..i)
+                if let Some(text) = self.input.get(plain_start..i)
                     && !text.is_empty()
                 {
-                    buf.push(Self::Text(text));
+                    buf.push(Inline::Text(text));
                 }
-                buf.push(Self::Image { alt, url, title });
+                buf.push(Inline::Image { alt, url, title });
                 plain_start = end;
                 i = end;
                 continue;
@@ -474,16 +452,15 @@ impl<'src> Inline<'src> {
             // Link: [text](url "title")
             if b == SpecialChar::OpenBracket
                 && let Some((text_str, url, title, end)) =
-                    Self::try_parse_bracket_paren(input, bytes, i)
+                    Self::try_parse_bracket_paren(self.input, bytes, i)
             {
-                if let Some(text) = input.get(plain_start..i)
+                if let Some(text) = self.input.get(plain_start..i)
                     && !text.is_empty()
                 {
-                    buf.push(Self::Text(text));
+                    buf.push(Inline::Text(text));
                 }
-                let text_span =
-                    Self::parse_inner::<MAX_DEPTH, CAP>(text_str, pool, depth.saturating_add(1));
-                buf.push(Self::Link {
+                let text_span = self.parse_inner(text_str, depth.saturating_add(1));
+                buf.push(Inline::Link {
                     text: text_span,
                     url,
                     title,
@@ -494,13 +471,11 @@ impl<'src> Inline<'src> {
             }
 
             // Bold/Italic: ** __ * _
-            if let Some((elem, end)) = Self::try_parse_emphasis::<MAX_DEPTH, CAP>(
-                input, bytes, i, b, &mut emph, pool, depth,
-            ) {
-                if let Some(text) = input.get(plain_start..i)
+            if let Some((elem, end)) = self.try_parse_emphasis(bytes, i, b, &mut emph, depth) {
+                if let Some(text) = self.input.get(plain_start..i)
                     && !text.is_empty()
                 {
-                    buf.push(Self::Text(text));
+                    buf.push(Inline::Text(text));
                 }
                 buf.push(elem);
                 plain_start = end;
@@ -511,18 +486,18 @@ impl<'src> Inline<'src> {
             i += 1;
         }
 
-        if let Some(text) = input.get(plain_start..)
+        if let Some(text) = self.input.get(plain_start..)
             && !text.is_empty()
         {
-            buf.push(Self::Text(text));
+            buf.push(Inline::Text(text));
         }
     }
 
     /// Emit a hard or soft line break at a newline position.
     /// Hard break if preceded by trailing `\` or 2+ spaces; soft break otherwise.
     #[inline]
-    fn emit_line_break<const CAP: usize>(
-        input: &'src str,
+    fn emit_line_break(
+        &self,
         bytes: &[u8],
         plain_start: usize,
         newline_pos: usize,
@@ -545,28 +520,27 @@ impl<'src> Inline<'src> {
                 (newline_pos, false)
             }
         };
-        if let Some(text) = input.get(plain_start..trim_end)
+        if let Some(text) = self.input.get(plain_start..trim_end)
             && !text.is_empty()
         {
-            buf.push(Self::Text(text));
+            buf.push(Inline::Text(text));
         }
         buf.push(if is_hard {
-            Self::HardBreak
+            Inline::HardBreak
         } else {
-            Self::SoftBreak
+            Inline::SoftBreak
         });
     }
 
     #[inline]
-    fn try_parse_emphasis<const MAX_DEPTH: u8, const CAP: usize>(
-        input: &'src str,
+    fn try_parse_emphasis(
+        &mut self,
         bytes: &[u8],
         i: usize,
         b: u8,
         emph: &mut EmphasisState,
-        pool: &mut Vec<Self>,
         depth: u8,
-    ) -> Option<(Self, usize)> {
+    ) -> Option<(Inline<'src>, usize)> {
         let is_star = b == SpecialChar::Asterisk;
         if !is_star && b != SpecialChar::Underscore {
             return None;
@@ -576,21 +550,49 @@ impl<'src> Inline<'src> {
             return None;
         }
         let avail = emph.avail_mut(is_star);
+        let open_run = if is_star {
+            SpecialChar::Asterisk.count_leading_bytes(&bytes[i..])
+        } else {
+            SpecialChar::Underscore.count_leading_bytes(&bytes[i..])
+        };
+
+        // Triple runs (*** or ___) can open/close both emphasis and strong
+        // emphasis. Match them as strong nested inside emphasis so that
+        // ***text*** becomes Italic(Bold(text)) instead of being split.
+        if open_run >= 3 && avail.can_bold() && avail.can_italic() {
+            if let Some((inner, end)) = Self::try_parse_delimited(self.input, bytes, i, b, 3) {
+                // Only match when the closing run is exactly three characters,
+                // leaving longer runs (e.g. ****text****) to the strong/italic
+                // logic below.
+                let close_run_start = end - 3;
+                let exact_close = bytes.get(close_run_start - 1) != Some(&b)
+                    && bytes.get(end) != Some(&b);
+                if exact_close {
+                    let inner_span = self.parse_inner(inner, depth + 1);
+                    let bold_start = self.pool.len().pool_offset();
+                    self.pool.push(Inline::Bold(inner_span));
+                    let bold_span = InlineSpan::new(bold_start, 1);
+                    return Some((Inline::Italic(bold_span), end));
+                }
+            }
+            // A triple run exists but couldn't be matched; strong and italic
+            // may still succeed from the same starting position.
+        }
 
         // Bold: ** or __
         if avail.can_bold() && bytes.get(i + 1) == Some(&b) {
-            if let Some((inner, end)) = Self::try_parse_delimited(input, bytes, i, b, 2) {
-                let span = Self::parse_inner::<MAX_DEPTH, CAP>(inner, pool, depth + 1);
-                return Some((Self::Bold(span), end));
+            if let Some((inner, end)) = Self::try_parse_delimited(self.input, bytes, i, b, 2) {
+                let span = self.parse_inner(inner, depth + 1);
+                return Some((Inline::Bold(span), end));
             }
             avail.bold_failed();
         }
 
         // Italic: * or _
         if avail.can_italic() {
-            if let Some((inner, end)) = Self::try_parse_delimited(input, bytes, i, b, 1) {
-                let span = Self::parse_inner::<MAX_DEPTH, CAP>(inner, pool, depth + 1);
-                return Some((Self::Italic(span), end));
+            if let Some((inner, end)) = Self::try_parse_delimited(self.input, bytes, i, b, 1) {
+                let span = self.parse_inner(inner, depth + 1);
+                return Some((Inline::Italic(span), end));
             }
             avail.italic_failed();
         }
@@ -612,10 +614,10 @@ impl<'src> Inline<'src> {
         } else {
             &PAREN_CLOSE_SET
         };
-        let mut depth = 0u32;
+        let mut nested = 0u32;
         let mut j = start;
         loop {
-            let pos = find_byte_set(bytes, j, set)?;
+            let pos = bytes.find_byte_set(j, set)?;
             let b = bytes[pos];
             if b == SpecialChar::Backslash
                 && bytes.get(pos + 1).is_some_and(u8::is_ascii_punctuation)
@@ -624,12 +626,12 @@ impl<'src> Inline<'src> {
                 continue;
             }
             if b == open {
-                depth += 1;
+                nested += 1;
             } else if b == close {
-                if depth == 0 {
+                if nested == 0 {
                     return Some(pos);
                 }
-                depth -= 1;
+                nested -= 1;
             }
             j = pos + 1;
         }
@@ -702,8 +704,12 @@ impl<'src> Inline<'src> {
         let bytes = trimmed.as_bytes();
         let last = bytes[bytes.len() - 1];
         let (open, close) = match SpecialChar::from_byte(last) {
-            Some(SpecialChar::DoubleQuote) => (SpecialChar::DoubleQuote, SpecialChar::DoubleQuote),
-            Some(SpecialChar::SingleQuote) => (SpecialChar::SingleQuote, SpecialChar::SingleQuote),
+            Some(SpecialChar::DoubleQuote) => {
+                (SpecialChar::DoubleQuote, SpecialChar::DoubleQuote)
+            }
+            Some(SpecialChar::SingleQuote) => {
+                (SpecialChar::SingleQuote, SpecialChar::SingleQuote)
+            }
             Some(SpecialChar::CloseParen) => (SpecialChar::OpenParen, SpecialChar::CloseParen),
             // No trailing title delimiter — the entire content is the URL.
             _ => return (trimmed, None),
@@ -827,11 +833,12 @@ impl<'src> Inline<'src> {
         };
 
         let mut i = inner_start;
-        while let Some(pos) = find_byte_set(bytes, i, delim_set) {
+        while let Some(pos) = bytes.find_byte_set(i, delim_set) {
             i = pos;
             let b = bytes[i];
 
-            if b == SpecialChar::Backslash && bytes.get(i + 1).is_some_and(u8::is_ascii_punctuation)
+            if b == SpecialChar::Backslash
+                && bytes.get(i + 1).is_some_and(u8::is_ascii_punctuation)
             {
                 i += 2;
                 continue;
@@ -887,7 +894,7 @@ impl<'src> Inline<'src> {
         bytes: &[u8],
         start: usize,
     ) -> Option<(&'src str, usize)> {
-        let backtick_count = count_leading_byte(&bytes[start..], SpecialChar::Backtick.byte());
+        let backtick_count = SpecialChar::Backtick.count_leading_bytes(&bytes[start..]);
         if backtick_count == 0 {
             return None;
         }
@@ -896,10 +903,10 @@ impl<'src> Inline<'src> {
         let mut i = content_start;
         while i < bytes.len() {
             // SIMD-accelerated backtick scan.
-            i = find_byte(bytes, i, SpecialChar::Backtick.byte())?;
+            i = bytes.find_byte(i, SpecialChar::Backtick.byte())?;
 
             // Count consecutive backticks
-            let close_count = count_leading_byte(&bytes[i..], SpecialChar::Backtick.byte());
+            let close_count = SpecialChar::Backtick.count_leading_bytes(&bytes[i..]);
 
             if close_count == backtick_count {
                 // CommonMark §6.1: strip one leading and one trailing space
@@ -921,3 +928,5 @@ impl<'src> Inline<'src> {
         None
     }
 }
+
+
