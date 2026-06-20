@@ -30,7 +30,7 @@ A zero-copy Markdown parser for Rust. Parses markdown strings into structured se
 ## Usage
 
 ```rust
-use marki::MarkdownFile;
+use marki_parse::MarkdownFile;
 
 let md = MarkdownFile::parse("# Hello\n\nWorld");
 for section in &md.sections {
@@ -43,9 +43,9 @@ for section in &md.sections {
 The parser operates on LF (`\n`) line endings. For CRLF (`\r\n`) input, call `normalize` before parsing — it returns the input borrowed when no `\r` is present (zero-cost), or an owned copy with `\r` stripped:
 
 ```rust
-use marki::{normalize, MarkdownFile};
+use marki_parse::MarkdownFile;
 
-let normalized = normalize(input);
+let normalized = MarkdownFile::normalize(input);
 let md = MarkdownFile::parse(&normalized);
 ```
 
@@ -53,4 +53,4 @@ let md = MarkdownFile::parse(&normalized);
 
 - List items are single-line only (no continuation with indentation)
 - Emphasis cannot span across blockquote lines (`> **bold\n> continues**` is not recognized)
-- For CRLF (`\r\n`) input, call `marki::normalize` before parsing
+- For CRLF (`\r\n`) input, call `MarkdownFile::normalize` before parsing
