@@ -106,5 +106,10 @@ pub enum Section<'src> {
     Blockquote {
         content: InlineSpan,
     },
+    /// A raw HTML block (`CommonMark` §4.6). The slice is emitted verbatim,
+    /// without escaping or inline parsing.
+    HtmlBlock {
+        html: &'src str,
+    },
     HorizontalRule,
 }

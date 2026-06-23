@@ -47,6 +47,7 @@
 mod block;
 mod html;
 mod inline;
+pub(crate) mod raw_html;
 mod section;
 pub(crate) mod simd;
 mod special_char;
@@ -166,7 +167,9 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 | Section::Blockquote { content } => {
                     let _ = self.inlines(*content);
                 }
-                Section::CodeBlock { .. } | Section::HorizontalRule => {}
+                Section::CodeBlock { .. }
+                | Section::HtmlBlock { .. }
+                | Section::HorizontalRule => {}
             }
         }
     }

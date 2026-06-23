@@ -16,6 +16,7 @@ pub enum SpecialChar {
     Dash = b'-',
     Dot = b'.',
     Zero = b'0',
+    LessThan = b'<',
     GreaterThan = b'>',
     OpenBracket = b'[',
     Backslash = b'\\',
@@ -44,6 +45,7 @@ static FROM_BYTE: [Option<SpecialChar>; 256] = {
     table[b'-' as usize] = Some(S::Dash);
     table[b'.' as usize] = Some(S::Dot);
     table[b'0' as usize] = Some(S::Zero);
+    table[b'<' as usize] = Some(S::LessThan);
     table[b'>' as usize] = Some(S::GreaterThan);
     table[b'[' as usize] = Some(S::OpenBracket);
     table[b'\\' as usize] = Some(S::Backslash);

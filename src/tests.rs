@@ -63,6 +63,19 @@ impl<'md, 'src> Checker<'md, 'src> {
                 assert_eq!(url, eu, "Image url mismatch at index {idx}");
                 assert_eq!(title, eti, "Image title mismatch at index {idx}");
             }
+            (
+                Inline::Autolink { target, is_email },
+                Expect::Autolink {
+                    target: et,
+                    is_email: ee,
+                },
+            ) => {
+                assert_eq!(target, et, "Autolink target mismatch at index {idx}");
+                assert_eq!(is_email, ee, "Autolink is_email mismatch at index {idx}");
+            }
+            (Inline::RawHtml(a), Expect::RawHtml(e)) => {
+                assert_eq!(a, e, "RawHtml mismatch at index {idx}");
+            }
             _ => panic!("Inline mismatch at index {idx}: got {actual:?}, expected {expected:?}"),
         }
     }
@@ -88,6 +101,11 @@ enum Expect<'a> {
         url: &'a str,
         title: Option<&'a str>,
     },
+    Autolink {
+        target: &'a str,
+        is_email: bool,
+    },
+    RawHtml(&'a str),
 }
 
 impl<'a> Expect<'a> {
@@ -339,6 +357,85 @@ fn test_setext_heading_multiline_paragraph() {
         ),
         other => panic!("expected h2, got {other:?}"),
     }
+}
+
+#[test]
+fn test_autolink_uri() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("<http://foo.bar>");
+    match &md.sections[0] {
+        Section::Paragraph { content } => Checker::new(&md).check_span(
+            *content,
+            &[Expect::Autolink {
+                target: "http://foo.bar",
+                is_email: false,
+            }],
+        ),
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_autolink_email() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("<foo@bar.com>");
+    match &md.sections[0] {
+        Section::Paragraph { content } => Checker::new(&md).check_span(
+            *content,
+            &[Expect::Autolink {
+                target: "foo@bar.com",
+                is_email: true,
+            }],
+        ),
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_raw_inline_html() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("a <b2/> c");
+    match &md.sections[0] {
+        Section::Paragraph { content } => Checker::new(&md).check_span(
+            *content,
+            &[
+                Expect::Text("a "),
+                Expect::RawHtml("<b2/>"),
+                Expect::Text(" c"),
+            ],
+        ),
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_html_block_div() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("<div>\nbar\n</div>\n");
+    assert_eq!(md.sections.len(), 1);
+    match &md.sections[0] {
+        Section::HtmlBlock { html } => assert_eq!(*html, "<div>\nbar\n</div>"),
+        other => panic!("expected html block, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_html_block_comment() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("<!-- hi -->\n");
+    match &md.sections[0] {
+        Section::HtmlBlock { html } => assert_eq!(*html, "<!-- hi -->"),
+        other => panic!("expected html block, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_html_block_script_ends_at_close_tag() {
+    let md: MarkdownFile<'_> =
+        MarkdownFile::parse("<script>\nfoo\n</script>\nokay\n");
+    assert_eq!(md.sections.len(), 2);
+    match &md.sections[0] {
+        Section::HtmlBlock { html } => {
+            assert_eq!(*html, "<script>\nfoo\n</script>");
+        }
+        other => panic!("expected html block, got {other:?}"),
+    }
+    assert!(matches!(md.sections[1], Section::Paragraph { .. }));
 }
 
 #[test]

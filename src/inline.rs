@@ -22,6 +22,14 @@ pub enum Inline<'src> {
         title: Option<&'src str>,
     },
     Code(&'src str),
+    /// An autolink `<uri>` or `<email>` (`CommonMark` §6.5). `is_email`
+    /// distinguishes the two so the renderer can add the `mailto:` scheme.
+    Autolink {
+        target: &'src str,
+        is_email: bool,
+    },
+    /// A raw inline HTML tag/comment/etc. (`CommonMark` §6.6), emitted verbatim.
+    RawHtml(&'src str),
     SoftBreak,
     HardBreak,
 }
@@ -41,6 +49,7 @@ static SPECIAL_SET: ByteSet = ByteSet::new(&[
     SpecialChar::ExclamationMark.byte(),
     SpecialChar::Backslash.byte(),
     SpecialChar::Backtick.byte(),
+    SpecialChar::LessThan.byte(),
 ]);
 
 /// Pre-computed byte sets for `find_matching_close` — avoids rebuilding
@@ -377,6 +386,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn parse_into_buf(
         &mut self,
         bytes: &[u8],
@@ -463,6 +473,21 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                     url,
                     title,
                 });
+                plain_start = end;
+                i = end;
+                continue;
+            }
+
+            // Autolinks `<uri>` / `<email>` and raw inline HTML (§6.5, §6.6).
+            if b == SpecialChar::LessThan
+                && let Some((elem, end)) = Self::try_parse_angle(self.input, bytes, i)
+            {
+                if let Some(text) = self.input.get(plain_start..i)
+                    && !text.is_empty()
+                {
+                    buf.push(Inline::Text(text));
+                }
+                buf.push(elem);
                 plain_start = end;
                 i = end;
                 continue;
@@ -877,6 +902,121 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         }
 
         None
+    }
+
+    /// Parse an angle-bracket construct at `start` (a `<`): an absolute-URI
+    /// autolink, an email autolink, or a raw inline HTML tag. Returns the
+    /// parsed inline and the index just past it.
+    fn try_parse_angle(
+        input: &'src str,
+        bytes: &[u8],
+        start: usize,
+    ) -> Option<(Inline<'src>, usize)> {
+        // Autolink: <scheme:...> with no spaces or `<`, scheme 2-32 chars.
+        if let Some(close) = Self::scan_autolink_uri(bytes, start) {
+            let target = input.get(start + 1..close)?;
+            return Some((
+                Inline::Autolink {
+                    target,
+                    is_email: false,
+                },
+                close + 1,
+            ));
+        }
+        // Email autolink.
+        if let Some(close) = Self::scan_autolink_email(bytes, start) {
+            let target = input.get(start + 1..close)?;
+            return Some((
+                Inline::Autolink {
+                    target,
+                    is_email: true,
+                },
+                close + 1,
+            ));
+        }
+        // Raw inline HTML.
+        if let Some(len) = crate::raw_html::scan_inline_html(&bytes[start..]) {
+            let html = input.get(start..start + len)?;
+            return Some((Inline::RawHtml(html), start + len));
+        }
+        None
+    }
+
+    /// Scan an absolute-URI autolink body. Returns the index of the closing
+    /// `>` if `bytes[start..]` is `<scheme:chars>` per `CommonMark` §6.5.
+    fn scan_autolink_uri(bytes: &[u8], start: usize) -> Option<usize> {
+        let mut i = start + 1;
+        // Scheme: ASCII letter then 1-31 of [A-Za-z0-9+.-], total 2-32.
+        if !bytes.get(i).is_some_and(u8::is_ascii_alphabetic) {
+            return None;
+        }
+        i += 1;
+        let scheme_start = start + 1;
+        while bytes.get(i).is_some_and(|&b| {
+            b.is_ascii_alphanumeric() || b == b'+' || b == b'.' || b == b'-'
+        }) {
+            i += 1;
+        }
+        let scheme_len = i - scheme_start;
+        if bytes.get(i) != Some(&b':') || !(2..=32).contains(&scheme_len) {
+            return None;
+        }
+        i += 1;
+        // Body: no whitespace, no `<`, up to `>`.
+        while let Some(&b) = bytes.get(i) {
+            match b {
+                b'>' => return Some(i),
+                b'<' => return None,
+                _ if b.is_ascii_whitespace() => return None,
+                _ => i += 1,
+            }
+        }
+        None
+    }
+
+    /// Scan an email autolink body per the `CommonMark` §6.5 email regex.
+    fn scan_autolink_email(bytes: &[u8], start: usize) -> Option<usize> {
+        let mut i = start + 1;
+        let local_start = i;
+        while bytes.get(i).is_some_and(|&b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'.' | b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+'
+                        | b'/' | b'=' | b'?' | b'^' | b'_' | b'`' | b'{' | b'|'
+                        | b'}' | b'~' | b'-'
+                )
+        }) {
+            i += 1;
+        }
+        if i == local_start || bytes.get(i) != Some(&b'@') {
+            return None;
+        }
+        i += 1;
+        // One or more dot-separated labels of [A-Za-z0-9-] (max 63, no leading/
+        // trailing hyphen). We keep it permissive but require at least one.
+        loop {
+            let label_start = i;
+            if !bytes.get(i).is_some_and(u8::is_ascii_alphanumeric) {
+                return None;
+            }
+            while bytes
+                .get(i)
+                .is_some_and(|&b| b.is_ascii_alphanumeric() || b == b'-')
+            {
+                i += 1;
+            }
+            // No trailing hyphen.
+            if bytes.get(i - 1) == Some(&b'-') {
+                return None;
+            }
+            let _ = label_start;
+            match bytes.get(i) {
+                Some(&b'.') => i += 1,
+                Some(&b'>') => return Some(i),
+                _ => return None,
+            }
+        }
     }
 
     /// Parse inline code spans (`CommonMark` §6.1).

@@ -23,7 +23,7 @@ const fn is_tag_name_char(b: u8) -> bool {
 /// Grammar (`CommonMark` §6.6): `<` tagname (whitespace attribute)\*
 /// whitespace? `/`? `>`.
 #[must_use]
-pub(crate) fn scan_open_tag(b: &[u8]) -> Option<usize> {
+pub fn scan_open_tag(b: &[u8]) -> Option<usize> {
     if b.first() != Some(&b'<') {
         return None;
     }
@@ -39,7 +39,7 @@ pub(crate) fn scan_open_tag(b: &[u8]) -> Option<usize> {
     // Attributes.
     loop {
         let ws_start = i;
-        while b.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
+        while b.get(i).is_some_and(u8::is_ascii_whitespace) {
             i += 1;
         }
         let had_ws = i > ws_start;
@@ -73,12 +73,12 @@ pub(crate) fn scan_open_tag(b: &[u8]) -> Option<usize> {
         }
         // Optional value spec: whitespace? `=` whitespace? value.
         let mut j = i;
-        while b.get(j).is_some_and(|c| c.is_ascii_whitespace()) {
+        while b.get(j).is_some_and(u8::is_ascii_whitespace) {
             j += 1;
         }
         if b.get(j) == Some(&b'=') {
             j += 1;
-            while b.get(j).is_some_and(|c| c.is_ascii_whitespace()) {
+            while b.get(j).is_some_and(u8::is_ascii_whitespace) {
                 j += 1;
             }
             i = scan_attribute_value(b, j)?;
@@ -122,7 +122,7 @@ fn scan_attribute_value(b: &[u8], i: usize) -> Option<usize> {
 /// Scan a closing tag beginning at index 0 (the leading `</` included).
 /// Returns the bytes consumed through the closing `>`, or `None`.
 #[must_use]
-pub(crate) fn scan_closing_tag(b: &[u8]) -> Option<usize> {
+pub fn scan_closing_tag(b: &[u8]) -> Option<usize> {
     if b.first() != Some(&b'<') || b.get(1) != Some(&b'/') {
         return None;
     }
@@ -134,7 +134,7 @@ pub(crate) fn scan_closing_tag(b: &[u8]) -> Option<usize> {
     while b.get(i).copied().is_some_and(is_tag_name_char) {
         i += 1;
     }
-    while b.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
+    while b.get(i).is_some_and(u8::is_ascii_whitespace) {
         i += 1;
     }
     (b.get(i) == Some(&b'>')).then_some(i + 1)
@@ -143,7 +143,7 @@ pub(crate) fn scan_closing_tag(b: &[u8]) -> Option<usize> {
 /// Scan any inline raw-HTML construct at index 0: open/closing tag, comment,
 /// processing instruction, declaration, or CDATA. Returns bytes consumed.
 #[must_use]
-pub(crate) fn scan_inline_html(b: &[u8]) -> Option<usize> {
+pub fn scan_inline_html(b: &[u8]) -> Option<usize> {
     if b.first() != Some(&b'<') {
         return None;
     }
@@ -186,4 +186,163 @@ fn scan_until(b: &[u8], start: usize, close: &[u8]) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Block-level HTML start conditions (CommonMark §4.6).
+// ---------------------------------------------------------------------------
+
+/// The seven kinds of HTML block, distinguished by start/end conditions.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HtmlBlockKind {
+    /// `<script`, `<pre`, `<style`, `<textarea` — ends at matching close tag.
+    Type1,
+    /// `<!--` — ends at `-->`.
+    Type2,
+    /// `<?` — ends at `?>`.
+    Type3,
+    /// `<!` + letter — ends at `>`.
+    Type4,
+    /// `<![CDATA[` — ends at `]]>`.
+    Type5,
+    /// A known block-level tag name — ends at a blank line.
+    Type6,
+    /// A complete standalone open/closing tag — ends at a blank line.
+    Type7,
+}
+
+impl HtmlBlockKind {
+    /// The literal end marker for types 1–5 whose block ends on the line that
+    /// contains it. Types 6 and 7 end at a blank line and return `None`.
+    pub const fn end_marker(self) -> Option<&'static [u8]> {
+        match self {
+            Self::Type2 => Some(b"-->"),
+            Self::Type3 => Some(b"?>"),
+            Self::Type4 => Some(b">"),
+            Self::Type5 => Some(b"]]>"),
+            // Type1 uses multiple markers (handled specially); Type6/Type7 end
+            // at a blank line.
+            Self::Type1 | Self::Type6 | Self::Type7 => None,
+        }
+    }
+}
+
+/// HTML block tag names for start condition 6 (`CommonMark` §4.6).
+const BLOCK_TAGS: &[&[u8]] = &[
+    b"address", b"article", b"aside", b"base", b"basefont", b"blockquote",
+    b"body", b"caption", b"center", b"col", b"colgroup", b"dd", b"details",
+    b"dialog", b"dir", b"div", b"dl", b"dt", b"fieldset", b"figcaption",
+    b"figure", b"footer", b"form", b"frame", b"frameset", b"h1", b"h2", b"h3",
+    b"h4", b"h5", b"h6", b"head", b"header", b"hr", b"html", b"iframe",
+    b"legend", b"li", b"link", b"main", b"menu", b"menuitem", b"nav",
+    b"noframes", b"ol", b"optgroup", b"option", b"p", b"param", b"search",
+    b"section", b"summary", b"table", b"tbody", b"td", b"tfoot", b"th",
+    b"thead", b"title", b"tr", b"track", b"ul",
+];
+
+/// Tag names for start condition 1 (raw text elements).
+const RAW_TEXT_TAGS: &[&[u8]] = &[b"script", b"pre", b"style", b"textarea"];
+
+/// Determine whether `line` (leading indentation already stripped) starts an
+/// HTML block, returning the block kind. `can_interrupt_paragraph` is true when
+/// the previous line was not part of an open paragraph; type 7 only starts a
+/// block when it can interrupt (i.e. not mid-paragraph).
+#[must_use]
+pub fn html_block_start(line: &[u8], in_paragraph: bool) -> Option<HtmlBlockKind> {
+    if line.first() != Some(&b'<') {
+        return None;
+    }
+    // Type 2: <!--
+    if line.starts_with(b"<!--") {
+        return Some(HtmlBlockKind::Type2);
+    }
+    // Type 3: <?
+    if line.starts_with(b"<?") {
+        return Some(HtmlBlockKind::Type3);
+    }
+    // Type 5: <![CDATA[
+    if line.starts_with(b"<![CDATA[") {
+        return Some(HtmlBlockKind::Type5);
+    }
+    // Type 4: <! + ASCII letter
+    if line.starts_with(b"<!") && line.get(2).is_some_and(u8::is_ascii_alphabetic) {
+        return Some(HtmlBlockKind::Type4);
+    }
+    // Extract the tag name (after optional `/`).
+    let name_start = if line.get(1) == Some(&b'/') { 2 } else { 1 };
+    let mut end = name_start;
+    while line.get(end).is_some_and(u8::is_ascii_alphanumeric) {
+        end += 1;
+    }
+    let name = &line[name_start..end];
+    if name.is_empty() {
+        return None;
+    }
+
+    // Type 1: raw-text tags, only as open tags, followed by ws / > / EOL.
+    if name_start == 1
+        && RAW_TEXT_TAGS.iter().any(|t| eq_ignore_case(name, t))
+        && line
+            .get(end)
+            .is_none_or(|&c| c.is_ascii_whitespace() || c == b'>')
+    {
+        return Some(HtmlBlockKind::Type1);
+    }
+
+    // Type 6: known block tags followed by ws, end-of-line, `>`, or `/>`.
+    if BLOCK_TAGS.iter().any(|t| eq_ignore_case(name, t)) {
+        let ok = match line.get(end) {
+            None => true,
+            Some(&c) if c.is_ascii_whitespace() || c == b'>' => true,
+            Some(&b'/') if line.get(end + 1) == Some(&b'>') => true,
+            _ => false,
+        };
+        if ok {
+            return Some(HtmlBlockKind::Type6);
+        }
+    }
+
+    // Type 7: a complete standalone tag filling the whole line. Cannot
+    // interrupt a paragraph.
+    if !in_paragraph {
+        let consumed = if name_start == 2 {
+            scan_closing_tag(line)?
+        } else {
+            // Type 7 excludes the raw-text tags handled by type 1.
+            if RAW_TEXT_TAGS.iter().any(|t| eq_ignore_case(name, t)) {
+                return None;
+            }
+            scan_open_tag(line)?
+        };
+        // Only whitespace may follow the tag on the line.
+        if line[consumed..].iter().all(u8::is_ascii_whitespace) {
+            return Some(HtmlBlockKind::Type7);
+        }
+    }
+    None
+}
+
+/// Case-insensitive ASCII byte-slice comparison.
+fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| x.eq_ignore_ascii_case(y))
+}
+
+/// True if `line` contains any of the type-1 closing markers.
+#[must_use]
+pub fn type1_end(line: &[u8]) -> bool {
+    const CLOSERS: &[&[u8]] = &[b"</script>", b"</pre>", b"</style>", b"</textarea>"];
+    CLOSERS.iter().any(|c| contains_ci(line, c))
+}
+
+/// Case-insensitive substring search.
+fn contains_ci(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|w| eq_ignore_case(w, needle))
 }

@@ -119,6 +119,11 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 self.render_inlines(*content, out);
                 out.push_str("</p>\n</blockquote>\n");
             }
+            Section::HtmlBlock { html } => {
+                // Emitted verbatim, with the trailing newline CommonMark adds.
+                out.push_str(html);
+                out.push('\n');
+            }
             Section::HorizontalRule => out.push_str("<hr />\n"),
         }
     }
@@ -147,6 +152,17 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 escape_html(c, out);
                 out.push_str("</code>");
             }
+            Inline::Autolink { target, is_email } => {
+                out.push_str("<a href=\"");
+                if *is_email {
+                    out.push_str("mailto:");
+                }
+                escape_href(target, out);
+                out.push_str("\">");
+                escape_html(target, out);
+                out.push_str("</a>");
+            }
+            Inline::RawHtml(html) => out.push_str(html),
             Inline::Link { text, url, title } => {
                 out.push_str("<a href=\"");
                 escape_href(url, out);

@@ -38,6 +38,9 @@ enum RawSection<'src> {
         lines_start: u32,
         lines_len: u32,
     },
+    HtmlBlock {
+        html: &'src str,
+    },
     HorizontalRule,
 }
 
@@ -418,6 +421,9 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                         content: InlineSpan::new(start, len),
                     });
                 }
+                RawSection::HtmlBlock { html } => {
+                    sections.push(Section::HtmlBlock { html });
+                }
                 RawSection::HorizontalRule => {
                     sections.push(Section::HorizontalRule);
                 }
@@ -497,6 +503,28 @@ impl<'src> ParseCtx<'src> {
                 continue;
             }
 
+            // HTML blocks (CommonMark §4.6): detected by a `<` within the first
+            // 4 bytes. Type 7 (a bare standalone tag) cannot interrupt an open
+            // paragraph; the other six can.
+            if (first == Some(b'<')
+                || (first == SpecialChar::Space
+                    && bytes[pos..line_end].get(..4).is_some_and(|w| w.contains(&b'<'))))
+                && let Some(indent) = bytes[pos..line_end].strip_indent()
+            {
+                let spos = pos + indent;
+                let in_paragraph = matches!(acc, Accumulator::InParagraph { .. });
+                if let Some(kind) =
+                    crate::raw_html::html_block_start(&bytes[spos..line_end], in_paragraph)
+                {
+                    ctx.flush_acc(acc);
+                    let (html, resume) = ctx.scan_html_block(pos, line_end, kind);
+                    ctx.sections.push(RawSection::HtmlBlock { html });
+                    pos = resume;
+                    acc = Accumulator::Empty;
+                    continue;
+                }
+            }
+
             acc = ctx.fold_line(acc, pos, line_end);
             pos = line_end + 1;
         }
@@ -563,6 +591,77 @@ impl<'src> ParseCtx<'src> {
         }
         let code = self.input.get(start..).unwrap_or("");
         (code, bytes.len())
+    }
+
+    /// Scan an HTML block (`CommonMark` §4.6) starting at `start_pos`, whose
+    /// first line ends at `first_line_end`. Returns `(html_slice, resume_pos)`.
+    /// The returned slice spans whole lines verbatim (no trailing newline).
+    fn scan_html_block(
+        &self,
+        start_pos: usize,
+        first_line_end: usize,
+        kind: crate::raw_html::HtmlBlockKind,
+    ) -> (&'src str, usize) {
+        use crate::raw_html::HtmlBlockKind;
+        let bytes = self.bytes;
+
+        // Helper: produce the slice [start_pos..end) trimmed of one trailing
+        // newline, and the resume position after it.
+        let finish = |content_end: usize, resume: usize| {
+            let end = content_end.min(bytes.len());
+            (self.input.get(start_pos..end).unwrap_or(""), resume)
+        };
+
+        // Types 1–5 end on the line containing their end marker.
+        if matches!(
+            kind,
+            HtmlBlockKind::Type1
+                | HtmlBlockKind::Type2
+                | HtmlBlockKind::Type3
+                | HtmlBlockKind::Type4
+                | HtmlBlockKind::Type5
+        ) {
+            let mut pos = start_pos;
+            let mut last_end_for_eof = start_pos;
+            while pos < bytes.len() {
+                let line_end = bytes
+                    .find_byte(pos, SpecialChar::Newline.byte())
+                    .unwrap_or(bytes.len());
+                let line = &bytes[pos..line_end];
+                let ends = match kind {
+                    HtmlBlockKind::Type1 => crate::raw_html::type1_end(line),
+                    other => other
+                        .end_marker()
+                        .is_some_and(|m| line.windows(m.len()).any(|w| w == m)),
+                };
+                if ends {
+                    return finish(line_end, line_end + 1);
+                }
+                last_end_for_eof = line_end;
+                pos = line_end + 1;
+            }
+            return finish(last_end_for_eof, bytes.len());
+        }
+
+        // Types 6 and 7 end at a blank line (the blank line is not included).
+        let mut pos = first_line_end + 1;
+        let mut last_end = first_line_end;
+        while pos <= bytes.len() {
+            if pos >= bytes.len() {
+                break;
+            }
+            let line_end = bytes
+                .find_byte(pos, SpecialChar::Newline.byte())
+                .unwrap_or(bytes.len());
+            if bytes.is_blank_line(pos, line_end) {
+                return finish(last_end, line_end + 1);
+            }
+            last_end = line_end;
+            pos = line_end + 1;
+        }
+        // Reached end of input: the block ends at the last non-blank line, not
+        // the buffer end (which would wrongly include a trailing newline).
+        finish(last_end, bytes.len())
     }
 
     /// Merge two subslices of the current input into one contiguous slice
