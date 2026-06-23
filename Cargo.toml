@@ -19,6 +19,7 @@ nursery = "warn"
 [dev-dependencies]
 divan = "0.1"
 pulldown-cmark = { version = "0.12", features = ["simd"] }
+comrak = "0.52"
 
 [[bench]]
 name = "parse"
