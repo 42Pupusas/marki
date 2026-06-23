@@ -289,6 +289,68 @@ fn test_heading_without_blank_line() {
 }
 
 #[test]
+fn test_setext_heading_level_1() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("Foo\n=====");
+    assert_eq!(md.sections.len(), 1);
+    match &md.sections[0] {
+        Section::Heading { level: 1, content } => {
+            Checker::new(&md).check_span(*content, &Expect::text("Foo"));
+        }
+        other => panic!("expected h1, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_setext_heading_level_2() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("Foo\n-----");
+    assert_eq!(md.sections.len(), 1);
+    match &md.sections[0] {
+        Section::Heading { level: 2, content } => {
+            Checker::new(&md).check_span(*content, &Expect::text("Foo"));
+        }
+        other => panic!("expected h2, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_setext_heading_with_inline() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("Foo *bar*\n=========");
+    match &md.sections[0] {
+        Section::Heading { level: 1, content } => Checker::new(&md).check_span(
+            *content,
+            &[Expect::Text("Foo "), Expect::Italic(Expect::text("bar"))],
+        ),
+        other => panic!("expected h1, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_setext_heading_multiline_paragraph() {
+    // The whole preceding paragraph becomes the heading text.
+    let md: MarkdownFile<'_> = MarkdownFile::parse("Foo\nBar\n---");
+    match &md.sections[0] {
+        Section::Heading { level: 2, content } => Checker::new(&md).check_span(
+            *content,
+            &[
+                Expect::Text("Foo"),
+                Expect::SoftBreak,
+                Expect::Text("Bar"),
+            ],
+        ),
+        other => panic!("expected h2, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_setext_dash_without_paragraph_is_hr() {
+    // A `---` with no preceding paragraph text is a thematic break, not a
+    // setext underline.
+    let md: MarkdownFile<'_> = MarkdownFile::parse("---");
+    assert_eq!(md.sections.len(), 1);
+    assert!(matches!(md.sections[0], Section::HorizontalRule));
+}
+
+#[test]
 fn test_bold() {
     let md: MarkdownFile<'_> = MarkdownFile::parse("This is **bold** text");
     match &md.sections[0] {

@@ -134,6 +134,7 @@ trait BlockBytes {
     fn try_parse_unordered_item(&self) -> Option<(SpecialChar, usize)>;
     fn try_parse_ordered_item(&self) -> Option<(u32, OrderedListDelimiter, usize)>;
     fn could_start_block(&self) -> bool;
+    fn setext_heading_level(&self) -> Option<u8>;
 }
 
 impl BlockBytes for [u8] {
@@ -294,6 +295,27 @@ impl BlockBytes for [u8] {
     #[inline]
     fn could_start_block(&self) -> bool {
         self.first().is_some_and(|&b| COULD_START_BLOCK[b as usize])
+    }
+
+    /// Check whether this line is a setext heading underline (`CommonMark`
+    /// §4.3): one or more `=` (level 1) or `-` (level 2) characters, followed
+    /// only by trailing whitespace. Leading 0-3 space indentation is assumed
+    /// already stripped by the caller.
+    fn setext_heading_level(&self) -> Option<u8> {
+        let &first = self.first()?;
+        let level = match first {
+            b'=' => 1,
+            b'-' => 2,
+            _ => return None,
+        };
+        let mut run = 0;
+        while run < self.len() && self[run] == first {
+            run += 1;
+        }
+        if run == 0 || !self[run..].iter().all(u8::is_ascii_whitespace) {
+            return None;
+        }
+        Some(level)
     }
 }
 
@@ -610,6 +632,22 @@ impl<'src> ParseCtx<'src> {
         };
         let spos = pos + indent;
         let line_bytes = &self.bytes[spos..line_end];
+
+        // Setext headings (CommonMark §4.3): an `=`/`-` underline directly
+        // below a paragraph turns that paragraph's text into a heading. This
+        // must precede both the paragraph fast-path (an `=` underline is not a
+        // block-start byte, so the fast-path would otherwise swallow it) and
+        // the thematic-break check (`---` after a paragraph is a level-2
+        // setext underline, not an `<hr>`).
+        if let Accumulator::InParagraph { content } = acc
+            && let Some(level) = line_bytes.setext_heading_level()
+        {
+            self.sections.push(RawSection::Heading {
+                level,
+                text: content.trim(),
+            });
+            return Accumulator::Empty;
+        }
 
         // Fast-path: if we're in a paragraph and the line can't start a block
         // element, skip all the block-level checks and extend the paragraph.

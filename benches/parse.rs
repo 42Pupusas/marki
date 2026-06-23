@@ -25,6 +25,75 @@ fn fixture_src(name: &str) -> &'static str {
     }
 }
 
+/// The official `CommonMark` spec test suite as raw JSON (652 cases). We embed
+/// it and pull out just the `markdown` input strings to build a realistic
+/// corpus of small, feature-diverse documents for benchmarking.
+const SPEC_JSON: &str = include_str!("../tests/fixtures/spec.json");
+
+/// Extract every `"markdown": "..."` value from the spec JSON, decoding the
+/// handful of JSON escapes the suite uses. Deliberately minimal — just enough
+/// to turn the embedded fixture into a `Vec<String>` of parser inputs.
+fn spec_vectors() -> Vec<String> {
+    let bytes = SPEC_JSON.as_bytes();
+    let key = b"\"markdown\":";
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(rel) = find(&bytes[i..], key) {
+        i += rel + key.len();
+        // Skip whitespace up to the opening quote.
+        while i < bytes.len() && bytes[i] != b'"' {
+            i += 1;
+        }
+        i += 1; // past opening quote
+        let mut s = String::new();
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' => {
+                    i += 1;
+                    break;
+                }
+                b'\\' => {
+                    i += 1;
+                    match bytes.get(i) {
+                        Some(b'n') => s.push('\n'),
+                        Some(b't') => s.push('\t'),
+                        Some(b'r') => s.push('\r'),
+                        Some(b'"') => s.push('"'),
+                        Some(b'\\') => s.push('\\'),
+                        Some(b'/') => s.push('/'),
+                        Some(b'u') => {
+                            let hex = &SPEC_JSON[i + 1..i + 5];
+                            if let Ok(code) = u32::from_str_radix(hex, 16) {
+                                s.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                            }
+                            i += 4;
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                _ => {
+                    let start = i;
+                    i += 1;
+                    while i < bytes.len() && bytes[i] & 0xC0 == 0x80 {
+                        i += 1;
+                    }
+                    s.push_str(&SPEC_JSON[start..i]);
+                }
+            }
+        }
+        out.push(s);
+    }
+    out
+}
+
+/// Find the first occurrence of `needle` in `haystack`, returning its offset.
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
+}
+
 fn mixed_document() -> String {
     [
         HEADING,
@@ -118,5 +187,48 @@ mod fixture {
     #[divan::bench(args = FIXTURES)]
     fn parse(name: &str) {
         let _ = MarkdownFile::<'_, 16, 32>::parse(black_box(fixture_src(name)));
+    }
+}
+
+/// Benchmarks driven by the official `CommonMark` spec test vectors (652 cases).
+mod spec_vectors {
+    use super::{MarkdownFile, black_box, spec_vectors};
+
+    /// Parse every spec vector individually — measures per-document throughput
+    /// across the full diversity of `CommonMark` constructs. Inputs are gathered
+    /// once via `with_inputs` so JSON extraction is excluded from the timing.
+    #[divan::bench]
+    fn parse_each(bencher: divan::Bencher) {
+        bencher
+            .with_inputs(spec_vectors)
+            .bench_values(|vectors| {
+                for v in &vectors {
+                    let _ = MarkdownFile::<'_, 16, 32>::parse(black_box(v));
+                }
+            });
+    }
+
+    /// Parse all vectors concatenated into one large document.
+    #[divan::bench]
+    fn parse_concatenated(bencher: divan::Bencher) {
+        bencher
+            .with_inputs(|| spec_vectors().join("\n\n"))
+            .bench_values(|corpus| {
+                let _ = MarkdownFile::<'_, 16, 32>::parse(black_box(&corpus));
+            });
+    }
+
+    /// Parse and render every vector to HTML — exercises the `to_html` path
+    /// added for conformance testing.
+    #[divan::bench]
+    fn parse_and_render(bencher: divan::Bencher) {
+        bencher
+            .with_inputs(spec_vectors)
+            .bench_values(|vectors| {
+                for v in &vectors {
+                    let md = MarkdownFile::<'_, 16, 32>::parse(black_box(v));
+                    black_box(md.to_html());
+                }
+            });
     }
 }

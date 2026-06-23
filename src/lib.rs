@@ -45,6 +45,7 @@
 //! ```
 
 mod block;
+mod html;
 mod inline;
 mod section;
 pub(crate) mod simd;
