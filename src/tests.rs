@@ -360,6 +360,81 @@ fn test_setext_heading_multiline_paragraph() {
 }
 
 #[test]
+fn test_link_ref_shortcut() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("[foo]\n\n[foo]: /url \"title\"");
+    match &md.sections[0] {
+        Section::Paragraph { content } => Checker::new(&md).check_span(
+            *content,
+            &[Expect::Link {
+                text: Expect::text("foo"),
+                url: "/url",
+                title: Some("title"),
+            }],
+        ),
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_link_ref_full() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("[text][bar]\n\n[bar]: /url");
+    match &md.sections[0] {
+        Section::Paragraph { content } => Checker::new(&md).check_span(
+            *content,
+            &[Expect::Link {
+                text: Expect::text("text"),
+                url: "/url",
+                title: None,
+            }],
+        ),
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_link_ref_collapsed_case_insensitive() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("[Foo][]\n\n[foo]: /url");
+    match &md.sections[0] {
+        Section::Paragraph { content } => Checker::new(&md).check_span(
+            *content,
+            &[Expect::Link {
+                text: Expect::text("Foo"),
+                url: "/url",
+                title: None,
+            }],
+        ),
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_link_ref_image() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("![alt][bar]\n\n[bar]: /img.png \"t\"");
+    match &md.sections[0] {
+        Section::Paragraph { content } => Checker::new(&md).check_span(
+            *content,
+            &[Expect::Image {
+                alt: "alt",
+                url: "/img.png",
+                title: Some("t"),
+            }],
+        ),
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_link_ref_undefined_is_text() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("[nope]");
+    match &md.sections[0] {
+        Section::Paragraph { content } => {
+            Checker::new(&md).check_span(*content, &[Expect::Text("[nope]")]);
+        }
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_autolink_uri() {
     let md: MarkdownFile<'_> = MarkdownFile::parse("<http://foo.bar>");
     match &md.sections[0] {

@@ -2,6 +2,7 @@ use std::mem::MaybeUninit;
 
 use crate::OffsetExt;
 use crate::SpecialChar;
+use crate::link_def::{LinkDefs, normalize_label};
 use crate::section::InlineSpan;
 use crate::simd::{ByteSet, ByteSliceExt};
 
@@ -299,25 +300,35 @@ const EMPH_SCAN_THRESHOLD: usize = 256;
 pub struct InlineParser<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> {
     input: &'src str,
     pool: &'pool mut Vec<Inline<'src>>,
+    defs: &'pool LinkDefs<'src>,
 }
 
 impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'pool, MAX_DEPTH, CAP> {
-    const fn new(input: &'src str, pool: &'pool mut Vec<Inline<'src>>) -> Self {
-        Self { input, pool }
+    const fn new(
+        input: &'src str,
+        pool: &'pool mut Vec<Inline<'src>>,
+        defs: &'pool LinkDefs<'src>,
+    ) -> Self {
+        Self { input, pool, defs }
     }
 
     /// Parse inline elements with configurable depth and stack limits.
     pub(crate) fn parse_configured(
         input: &'src str,
         pool: &'pool mut Vec<Inline<'src>>,
+        defs: &'pool LinkDefs<'src>,
     ) -> InlineSpan {
-        Self::new(input, pool).parse()
+        Self::new(input, pool, defs).parse()
     }
 
     /// Push parsed inline elements directly into the pool without wrapping
     /// in a span, with configurable depth and stack limits.
-    pub(crate) fn parse_flat_into_configured(input: &'src str, pool: &'pool mut Vec<Inline<'src>>) {
-        Self::new(input, pool).parse_flat();
+    pub(crate) fn parse_flat_into_configured(
+        input: &'src str,
+        pool: &'pool mut Vec<Inline<'src>>,
+        defs: &'pool LinkDefs<'src>,
+    ) {
+        Self::new(input, pool, defs).parse_flat();
     }
 
     /// Parse inline elements and store them in the pool. Returns a span.
@@ -354,6 +365,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         InlineParser::<MAX_DEPTH, CAP> {
             input,
             pool: self.pool,
+            defs: self.defs,
         }
         .parse_at_depth(depth)
     }
@@ -440,7 +452,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 continue;
             }
 
-            // Image: ![alt](url "title")
+            // Image: ![alt](url "title") or reference ![alt][label]
             if b == SpecialChar::ExclamationMark
                 && bytes.get(i + 1) == SpecialChar::OpenBracket
                 && let Some((alt, url, title, end)) =
@@ -456,11 +468,49 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 i = end;
                 continue;
             }
+            if b == SpecialChar::ExclamationMark
+                && bytes.get(i + 1) == SpecialChar::OpenBracket
+                && let Some((text_str, url, title, end)) = self.try_parse_reference(bytes, i + 1)
+            {
+                if let Some(text) = self.input.get(plain_start..i)
+                    && !text.is_empty()
+                {
+                    buf.push(Inline::Text(text));
+                }
+                buf.push(Inline::Image {
+                    alt: text_str,
+                    url,
+                    title,
+                });
+                plain_start = end;
+                i = end;
+                continue;
+            }
 
             // Link: [text](url "title")
             if b == SpecialChar::OpenBracket
                 && let Some((text_str, url, title, end)) =
                     Self::try_parse_bracket_paren(self.input, bytes, i)
+            {
+                if let Some(text) = self.input.get(plain_start..i)
+                    && !text.is_empty()
+                {
+                    buf.push(Inline::Text(text));
+                }
+                let text_span = self.parse_inner(text_str, depth.saturating_add(1));
+                buf.push(Inline::Link {
+                    text: text_span,
+                    url,
+                    title,
+                });
+                plain_start = end;
+                i = end;
+                continue;
+            }
+
+            // Reference link: [text][label], [label][], or [label]
+            if b == SpecialChar::OpenBracket
+                && let Some((text_str, url, title, end)) = self.try_parse_reference(bytes, i)
             {
                 if let Some(text) = self.input.get(plain_start..i)
                     && !text.is_empty()
@@ -699,6 +749,63 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             title,
             paren_end + 1,
         ))
+    }
+
+    /// Try to parse a reference link/image at `start` (the `[`). Handles all
+    /// three `CommonMark` §6.3 reference forms:
+    ///  - full:      `[text][label]`
+    ///  - collapsed: `[label][]`
+    ///  - shortcut:  `[label]`
+    ///
+    /// Returns `(text_to_render, url, title, resume)` when the label resolves
+    /// against the definition registry. `text_to_render` is the bracket text
+    /// (for full references) or the label text itself (collapsed/shortcut).
+    fn try_parse_reference(
+        &self,
+        bytes: &[u8],
+        start: usize,
+    ) -> Option<(&'src str, &'src str, Option<&'src str>, usize)> {
+        if bytes.get(start) != SpecialChar::OpenBracket {
+            return None;
+        }
+        let first_start = start + 1;
+        let first_end = Self::find_matching_close(
+            bytes,
+            first_start,
+            SpecialChar::OpenBracket,
+            SpecialChar::CloseBracket,
+        )?;
+        let first_text = self.input.get(first_start..first_end)?;
+
+        // Is there a second bracket pair `[...]` immediately after?
+        let after_first = first_end + 1;
+        if bytes.get(after_first) == SpecialChar::OpenBracket {
+            let second_start = after_first + 1;
+            let second_end = Self::find_matching_close(
+                bytes,
+                second_start,
+                SpecialChar::OpenBracket,
+                SpecialChar::CloseBracket,
+            )?;
+            let second_text = self.input.get(second_start..second_end)?;
+            if second_text.trim().is_empty() {
+                // Collapsed reference `[label][]`: label is the first text.
+                let (url, title) = self.lookup(first_text)?;
+                return Some((first_text, url, title, second_end + 1));
+            }
+            // Full reference `[text][label]`: label is the second text.
+            let (url, title) = self.lookup(second_text)?;
+            return Some((first_text, url, title, second_end + 1));
+        }
+
+        // Shortcut reference `[label]`.
+        let (url, title) = self.lookup(first_text)?;
+        Some((first_text, url, title, after_first))
+    }
+
+    /// Look up a label in the definition registry after normalization.
+    fn lookup(&self, label: &str) -> Option<(&'src str, Option<&'src str>)> {
+        self.defs.get(&normalize_label(label)).copied()
     }
 
     /// Split the content inside `(...)` into a URL and optional title

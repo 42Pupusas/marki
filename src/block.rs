@@ -1,5 +1,6 @@
 use crate::OffsetExt;
 use crate::inline::InlineParser;
+use crate::link_def::{LinkDefs, normalize_label, scan_link_def};
 use crate::section::{InlineSpan, OrderedListDelimiter, Section, SpanSlice};
 use crate::simd::ByteSliceExt;
 use crate::special_char::SpecialChar;
@@ -53,6 +54,8 @@ struct ParseCtx<'src> {
     /// Shared pool for blockquote lines and list items, avoiding per-section
     /// `Vec<&str>` heap allocations.
     lines: Vec<&'src str>,
+    /// Link reference definitions collected during pass 1 (`CommonMark` §4.7).
+    defs: LinkDefs<'src>,
 }
 
 enum Accumulator<'src> {
@@ -335,6 +338,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         span_pool: &mut Vec<InlineSpan>,
     ) -> Vec<Section<'src>> {
         let lines = &ctx.lines;
+        let defs = &ctx.defs;
         let mut sections = Vec::with_capacity(ctx.sections.len());
         for raw_section in &ctx.sections {
             match *raw_section {
@@ -343,7 +347,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                         level,
                         content:
                             InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_configured(
-                                text, pool,
+                                text, pool, defs,
                             ),
                     });
                 }
@@ -351,7 +355,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     sections.push(Section::Paragraph {
                         content:
                             InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_configured(
-                                text, pool,
+                                text, pool, defs,
                             ),
                     });
                 }
@@ -369,7 +373,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     for item in raw_items {
                         let span =
                             InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_configured(
-                                item, pool,
+                                item, pool, defs,
                             );
                         span_pool.push(span);
                     }
@@ -391,7 +395,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     for item in raw_items {
                         let span =
                             InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_configured(
-                                item, pool,
+                                item, pool, defs,
                             );
                         span_pool.push(span);
                     }
@@ -414,7 +418,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                         if i > 0 {
                             pool.push(Inline::Text("\n"));
                         }
-                        InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_flat_into_configured(line, pool);
+                        InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_flat_into_configured(line, pool, defs);
                     }
                     let len = pool.len().pool_offset() - start;
                     sections.push(Section::Blockquote {
@@ -467,6 +471,7 @@ impl<'src> ParseCtx<'src> {
             // Rough heuristic: ~50 bytes per section on average.
             sections: Vec::with_capacity(input.len() / 50 + 1),
             lines: Vec::with_capacity(input.len() / 80 + 1),
+            defs: LinkDefs::new(),
         };
         let mut acc = Accumulator::Empty;
         let mut pos = 0;
@@ -523,6 +528,25 @@ impl<'src> ParseCtx<'src> {
                     acc = Accumulator::Empty;
                     continue;
                 }
+            }
+
+            // Link reference definitions (CommonMark §4.7): a `[` within the
+            // first 4 bytes, not interrupting a paragraph. They span up to
+            // three lines and produce no output, only a registry entry.
+            if !matches!(acc, Accumulator::InParagraph { .. })
+                && (first == Some(b'[')
+                    || (first == SpecialChar::Space
+                        && bytes[pos..line_end].get(..4).is_some_and(|w| w.contains(&b'['))))
+                && let Some(indent) = bytes[pos..line_end].strip_indent()
+                && let Some((def, resume)) = scan_link_def(ctx.input, pos + indent)
+            {
+                ctx.flush_acc(acc);
+                ctx.defs
+                    .entry(normalize_label(def.label))
+                    .or_insert((def.url, def.title));
+                pos = resume;
+                acc = Accumulator::Empty;
+                continue;
             }
 
             acc = ctx.fold_line(acc, pos, line_end);

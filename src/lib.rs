@@ -47,6 +47,7 @@
 mod block;
 mod html;
 mod inline;
+mod link_def;
 pub(crate) mod raw_html;
 mod section;
 pub(crate) mod simd;
