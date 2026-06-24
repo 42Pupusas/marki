@@ -201,6 +201,26 @@ fn is_lazy_paragraph_tail(mut line: &[u8]) -> bool {
     }
 }
 
+/// Update fenced-code-block state for one dedented list-item content line.
+/// `state` is `Some((fence_char, fence_len))` while inside a fence. A line that
+/// opens a fence enters the state; the matching closing fence leaves it. Used by
+/// [`scan_list`] so blank lines *inside* a fenced code block are not mistaken
+/// for the blank-line separators that make a list loose (`CommonMark` §5.3).
+fn update_fence(state: Option<(u8, usize)>, content: &[u8]) -> Option<(u8, usize)> {
+    let cind = content.leading_spaces().min(3);
+    let body = &content[cind.min(content.len())..];
+    match state {
+        Some((fc, flen)) => {
+            if body.is_closing_fence(fc, flen) {
+                None
+            } else {
+                Some((fc, flen))
+            }
+        }
+        None => body.code_fence_opening(),
+    }
+}
+
 /// Lookup table: true for bytes that could start a block-level element
 /// (heading, blockquote, list marker, HR character, or digit for ordered lists).
 const COULD_START_BLOCK: [bool; 256] = {
@@ -1356,11 +1376,15 @@ impl<'src> ParseCtx<'src> {
         let mut item_blanks = 0usize; // blanks seen inside the current item
         let mut pending_blanks = 0usize; // trailing blanks not yet attributed
         let mut last_para = true;
+        // `Some((char,len))` while the current item's content is inside a fenced
+        // code block; blank lines there must not loosen the list.
+        let mut fence: Option<(u8, usize)> = None;
 
         // Open the first item.
         {
             let le = line_end_of(pos);
             col = bytes[start + ind0 + family.width..le].item_content_indent(ind0, family);
+            fence = update_fence(fence, &bytes[(start + ind0 + family.width).min(le)..le]);
             self.push_marker_content(pos, le, col);
             pos = le + 1;
         }
@@ -1370,7 +1394,11 @@ impl<'src> ParseCtx<'src> {
             let line = &bytes[pos..le];
 
             if line.iter().all(u8::is_ascii_whitespace) {
-                item_blanks += 1;
+                // A blank line inside a fenced code block stays part of the
+                // block and does not make the list loose.
+                if fence.is_none() {
+                    item_blanks += 1;
+                }
                 self.lines.push("");
                 pos = le + 1;
                 last_para = false;
@@ -1385,6 +1413,8 @@ impl<'src> ParseCtx<'src> {
                     loose = true;
                 }
                 item_blanks = 0;
+                let content = self.input.get(pos + col..le).unwrap_or("");
+                fence = update_fence(fence, content.as_bytes());
                 self.push_dedented(pos, le, col);
                 pos = le + 1;
                 last_para = true;
@@ -1412,6 +1442,7 @@ impl<'src> ParseCtx<'src> {
                 item_start = self.lines.len().lines_offset();
                 col = bytes[pos + ind + m.width..le].item_content_indent(ind, m);
                 item_blanks = 0;
+                fence = update_fence(None, &bytes[(pos + ind + m.width).min(le)..le]);
                 self.push_marker_content(pos, le, col);
                 pos = le + 1;
                 last_para = true;
