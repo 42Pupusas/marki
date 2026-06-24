@@ -189,9 +189,9 @@ impl<'src> Accumulator<'src> {
 
 /// True if `line` ends in open paragraph text that a following marker-less
 /// line could lazily continue (`CommonMark` §5.1). Descends through any nested
-/// blockquote `>` markers and 0-3 spaces of indentation so a line like
-/// `> > foo` is judged by its innermost content (`foo`), which is paragraph
-/// text even though the outer line begins a block.
+/// blockquote `>` markers, list markers, and 0-3 spaces of indentation so a
+/// line like `> > foo` or `1. > foo` is judged by its innermost content
+/// (`foo`), which is paragraph text even though the outer line begins a block.
 fn is_lazy_paragraph_tail(mut line: &[u8]) -> bool {
     loop {
         let ind = line.leading_spaces().min(line.len());
@@ -204,6 +204,22 @@ fn is_lazy_paragraph_tail(mut line: &[u8]) -> bool {
             };
             line = &body[after.min(body.len())..];
             continue;
+        }
+        // Descend through a list marker into the item's content (e.g. the
+        // `> foo` inside `1. > foo`), but not a thematic break that merely
+        // looks like a bullet.
+        if !body.is_horizontal_rule()
+            && let Some(m) = body.list_marker()
+        {
+            let after = m.width;
+            let rest = &body[after.min(body.len())..];
+            // Require the conventional single space after the marker so we land
+            // on the content column; an empty item has no open paragraph.
+            if rest.first() == Some(&SpecialChar::Space.byte()) {
+                line = &rest[1..];
+                continue;
+            }
+            return false;
         }
         return !body.is_blank_line(0, body.len()) && !body.begins_block();
     }
