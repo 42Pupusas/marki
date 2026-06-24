@@ -93,31 +93,23 @@ impl Marker {
     }
 }
 
-/// Recycler for the temporary `Vec`s used while resolving container blocks.
+/// Recycler for the temporary line `Vec`s used while resolving container
+/// blocks.
 ///
-/// `resolve_blocks` runs once per list item and per blockquote, each needing a
-/// short-lived child-section buffer and paragraph-line buffer; `build_list`
-/// also needs an item-range buffer. Allocating these fresh every call made
-/// list-dense documents malloc-bound. Buffers are checked out, used, and
-/// returned, so the live allocation count tracks nesting depth rather than the
-/// number of items.
+/// `resolve_blocks` and `build_list` each need a short-lived de-indented
+/// content-line buffer; allocating one fresh per item made list-dense
+/// documents malloc-bound. Buffers are checked out, used, and returned, so the
+/// live allocation count tracks nesting depth rather than the number of items.
+///
+/// Child sections themselves are no longer buffered here: the section pool is a
+/// pre-order arena, so each child block is appended in place (see
+/// [`MarkdownFile::resolve_blocks`]).
 #[derive(Default)]
 struct Scratch<'src> {
-    sections: Vec<Vec<Section<'src>>>,
     lines: Vec<Vec<&'src str>>,
-    ranges: Vec<Vec<SectionRange>>,
 }
 
 impl<'src> Scratch<'src> {
-    fn take_sections(&mut self) -> Vec<Section<'src>> {
-        self.sections.pop().map_or_else(Vec::new, |mut v| {
-            v.clear();
-            v
-        })
-    }
-    fn give_sections(&mut self, v: Vec<Section<'src>>) {
-        self.sections.push(v);
-    }
     fn take_lines(&mut self) -> Vec<&'src str> {
         self.lines.pop().map_or_else(Vec::new, |mut v| {
             v.clear();
@@ -126,15 +118,6 @@ impl<'src> Scratch<'src> {
     }
     fn give_lines(&mut self, v: Vec<&'src str>) {
         self.lines.push(v);
-    }
-    fn take_ranges(&mut self) -> Vec<SectionRange> {
-        self.ranges.pop().map_or_else(Vec::new, |mut v| {
-            v.clear();
-            v
-        })
-    }
-    fn give_ranges(&mut self, v: Vec<SectionRange>) {
-        self.ranges.push(v);
     }
 }
 
@@ -507,8 +490,15 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                         .get(items_start as usize..(items_start + items_len) as usize)
                         .unwrap_or(&[]);
                     let list = Self::assemble_list(
-                        metas, lines, tight, ordered, pool, section_pool, line_pool,
-                        &mut scratch, defs,
+                        metas,
+                        lines,
+                        tight,
+                        ordered,
+                        pool,
+                        section_pool,
+                        line_pool,
+                        &mut scratch,
+                        defs,
                     );
                     sections.push(list);
                 }
@@ -520,7 +510,12 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                         .get(lines_start as usize..(lines_start + lines_len) as usize)
                         .unwrap_or(&[]);
                     let children = Self::resolve_blocks(
-                        raw_lines, pool, section_pool, line_pool, &mut scratch, defs,
+                        raw_lines,
+                        pool,
+                        section_pool,
+                        line_pool,
+                        &mut scratch,
+                        defs,
                     );
                     sections.push(Section::Blockquote { children });
                 }
@@ -552,24 +547,22 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         scratch: &mut Scratch<'src>,
         defs: &LinkDefs<'src>,
     ) -> Section<'src> {
-        let mut ranges = scratch.take_ranges();
+        // Pre-order: each item is a ListItem container followed immediately by
+        // its child-block subtree.
+        let items_start = section_pool.len().pool_offset();
         for meta in metas {
             let item_lines = lines
                 .get(meta.lines_start as usize..(meta.lines_start + meta.lines_len) as usize)
                 .unwrap_or(&[]);
+            let item_at = section_pool.len();
+            section_pool.push(Section::ListItem {
+                children: SectionRange::EMPTY,
+            });
             let range =
                 Self::resolve_blocks(item_lines, pool, section_pool, line_pool, scratch, defs);
-            ranges.push(range);
-        }
-
-        let items_start = section_pool.len().pool_offset();
-        // `drain` (not `into_iter`) so `ranges` keeps its capacity for reuse.
-        #[allow(clippy::iter_with_drain)]
-        for children in ranges.drain(..) {
-            section_pool.push(Section::ListItem { children });
+            section_pool[item_at] = Section::ListItem { children: range };
         }
         let items_len = section_pool.len().pool_offset() - items_start;
-        scratch.give_ranges(ranges);
         let items = SectionRange::new(items_start, items_len);
 
         if let Some((start, delimiter)) = ordered {
@@ -599,7 +592,11 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         scratch: &mut Scratch<'src>,
         defs: &LinkDefs<'src>,
     ) -> SectionRange {
-        let mut children = scratch.take_sections();
+        // Pre-order arena: append this forest's nodes directly to the section
+        // pool. Containers push a placeholder, recurse to append their subtree
+        // immediately after, then backpatch their child span. The returned
+        // range covers everything appended (children plus descendants).
+        let start = section_pool.len().pool_offset();
         let mut para = scratch.take_lines();
         let mut i = 0;
 
@@ -608,7 +605,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
             let b = line.as_bytes();
 
             if b.iter().all(u8::is_ascii_whitespace) {
-                Self::flush_para(&mut para, &mut children, pool, defs);
+                Self::flush_para(&mut para, section_pool, pool, defs);
                 i += 1;
                 continue;
             }
@@ -642,7 +639,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     line_pool.pop();
                 }
                 let len = line_pool.len().pool_offset() - code_start;
-                children.push(Section::CodeLines {
+                section_pool.push(Section::CodeLines {
                     language: None,
                     lines: LineRange::new(code_start, len),
                 });
@@ -654,7 +651,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
             if ind <= 3 {
                 // Nested blockquote: collect the run and recurse.
                 if body.first() == SpecialChar::GreaterThan {
-                    Self::flush_para(&mut para, &mut children, pool, defs);
+                    Self::flush_para(&mut para, section_pool, pool, defs);
                     let mut nested = scratch.take_lines();
                     while i < lines.len() {
                         let l = lines[i];
@@ -673,11 +670,15 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                         nested.push(content);
                         i += 1;
                     }
-                    let range = Self::resolve_blocks(
-                        &nested, pool, section_pool, line_pool, scratch, defs,
-                    );
+                    // Placeholder, recurse to append the subtree, then backpatch.
+                    let at = section_pool.len();
+                    section_pool.push(Section::Blockquote {
+                        children: SectionRange::EMPTY,
+                    });
+                    let range =
+                        Self::resolve_blocks(&nested, pool, section_pool, line_pool, scratch, defs);
                     scratch.give_lines(nested);
-                    children.push(Section::Blockquote { children: range });
+                    section_pool[at] = Section::Blockquote { children: range };
                     continue;
                 }
 
@@ -685,19 +686,19 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 if body.first() == SpecialChar::Hash
                     && let Some((level, text)) = body.try_parse_heading(line, ind)
                 {
-                    Self::flush_para(&mut para, &mut children, pool, defs);
+                    Self::flush_para(&mut para, section_pool, pool, defs);
                     let content =
                         InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_configured(
                             text, pool, defs,
                         );
-                    children.push(Section::Heading { level, content });
+                    section_pool.push(Section::Heading { level, content });
                     i += 1;
                     continue;
                 }
 
                 // Fenced code block.
                 if let Some((fence_char, fence_len)) = body.code_fence_opening() {
-                    Self::flush_para(&mut para, &mut children, pool, defs);
+                    Self::flush_para(&mut para, section_pool, pool, defs);
                     let language = Self::fence_language(line, ind, fence_len);
                     let code_start = line_pool.len().pool_offset();
                     i += 1;
@@ -714,7 +715,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                         i += 1;
                     }
                     let len = line_pool.len().pool_offset() - code_start;
-                    children.push(Section::CodeLines {
+                    section_pool.push(Section::CodeLines {
                         language,
                         lines: LineRange::new(code_start, len),
                     });
@@ -732,7 +733,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                         InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_lines_configured(
                             &para, pool, defs,
                         );
-                    children.push(Section::Heading { level, content });
+                    section_pool.push(Section::Heading { level, content });
                     para.clear();
                     i += 1;
                     continue;
@@ -740,19 +741,17 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
 
                 // Thematic break.
                 if body.is_horizontal_rule() {
-                    Self::flush_para(&mut para, &mut children, pool, defs);
-                    children.push(Section::HorizontalRule);
+                    Self::flush_para(&mut para, section_pool, pool, defs);
+                    section_pool.push(Section::HorizontalRule);
                     i += 1;
                     continue;
                 }
 
                 // Nested list (a thematic break takes precedence over a bullet).
                 if !body.is_horizontal_rule() && body.list_marker().is_some() {
-                    Self::flush_para(&mut para, &mut children, pool, defs);
-                    let (section, consumed) = Self::build_list(
-                        &lines[i..], pool, section_pool, line_pool, scratch, defs,
-                    );
-                    children.push(section);
+                    Self::flush_para(&mut para, section_pool, pool, defs);
+                    let consumed =
+                        Self::build_list(&lines[i..], pool, section_pool, line_pool, scratch, defs);
                     i += consumed;
                     continue;
                 }
@@ -764,21 +763,18 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
             i += 1;
         }
 
-        Self::flush_para(&mut para, &mut children, pool, defs);
+        Self::flush_para(&mut para, section_pool, pool, defs);
 
-        let start = section_pool.len().pool_offset();
-        section_pool.append(&mut children);
-        let len = section_pool.len().pool_offset() - start;
-        scratch.give_sections(children);
         scratch.give_lines(para);
+        let len = section_pool.len().pool_offset() - start;
         SectionRange::new(start, len)
     }
 
-    /// Flush pending paragraph lines into one [`Section::Paragraph`] child,
-    /// joining multiple lines with soft breaks.
+    /// Flush pending paragraph lines into one [`Section::Paragraph`] appended
+    /// to the section pool, joining multiple lines with soft breaks.
     fn flush_para(
         para: &mut Vec<&'src str>,
-        children: &mut Vec<Section<'src>>,
+        section_pool: &mut Vec<Section<'src>>,
         pool: &mut Vec<Inline<'src>>,
         defs: &LinkDefs<'src>,
     ) {
@@ -788,7 +784,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         let content = InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_lines_configured(
             para, pool, defs,
         );
-        children.push(Section::Paragraph { content });
+        section_pool.push(Section::Paragraph { content });
         para.clear();
     }
 
@@ -811,8 +807,9 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     }
 
     /// Group a run of lines beginning with a list marker into items, resolve
-    /// each item's child blocks, and build the list [`Section`]. Returns the
-    /// section and the number of input lines consumed.
+    /// each item's child blocks, and append the list [`Section`] (plus its
+    /// pre-order subtree) to the section pool. Returns the number of input
+    /// lines consumed.
     fn build_list(
         lines: &[&'src str],
         pool: &mut Vec<Inline<'src>>,
@@ -820,22 +817,21 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         line_pool: &mut Vec<&'src str>,
         scratch: &mut Scratch<'src>,
         defs: &LinkDefs<'src>,
-    ) -> (Section<'src>, usize) {
+    ) -> usize {
         let first_ind = lines[0].as_bytes().leading_spaces().min(3);
         let first_marker = lines[0].as_bytes()[first_ind..]
             .list_marker()
             .expect("build_list called on a marker line");
         let ordered = first_marker.ordered;
 
-        // Resolve items one at a time into the section pool, reusing a single
-        // scratch buffer for each item's de-indented content lines (one heap
-        // allocation per list level rather than per item). Each item owns its
-        // first line plus continuation lines (indent >= content column W,
-        // blanks, or lazy paragraph continuations) until the next sibling
-        // marker or the list's end. `ranges` holds each item's child-block
-        // range; the ListItem sections are appended together at the end so the
-        // children precede them in the pool.
-        let mut ranges = scratch.take_ranges();
+        // Pre-order layout: push the list node placeholder, then append each
+        // item directly after it. Each item is a ListItem container whose own
+        // subtree (its child blocks) follows it immediately. A single scratch
+        // line buffer is reused for every item's de-indented content (one heap
+        // allocation per list level, not per item).
+        let list_at = section_pool.len();
+        section_pool.push(Section::HorizontalRule); // placeholder, backpatched below
+        let items_start = section_pool.len().pool_offset();
         let mut item = scratch.take_lines();
         let mut loose = false;
         let mut i = 0;
@@ -910,24 +906,21 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 item.pop();
                 pending_blanks += 1;
             }
-            let range =
-                Self::resolve_blocks(&item, pool, section_pool, line_pool, scratch, defs);
-            ranges.push(range);
+            // ListItem placeholder, then append its subtree and backpatch.
+            let item_at = section_pool.len();
+            section_pool.push(Section::ListItem {
+                children: SectionRange::EMPTY,
+            });
+            let range = Self::resolve_blocks(&item, pool, section_pool, line_pool, scratch, defs);
+            section_pool[item_at] = Section::ListItem { children: range };
         }
         scratch.give_lines(item);
 
-        let items_start = section_pool.len().pool_offset();
-        // `drain` (not `into_iter`) so `ranges` keeps its capacity for reuse.
-        #[allow(clippy::iter_with_drain)]
-        for children in ranges.drain(..) {
-            section_pool.push(Section::ListItem { children });
-        }
         let items_len = section_pool.len().pool_offset() - items_start;
-        scratch.give_ranges(ranges);
         let items_range = SectionRange::new(items_start, items_len);
         let tight = !loose;
 
-        let section = if let Some((start, delimiter)) = ordered {
+        section_pool[list_at] = if let Some((start, delimiter)) = ordered {
             Section::OrderedList {
                 start,
                 delimiter,
@@ -940,7 +933,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 items: items_range,
             }
         };
-        (section, i)
+        i
     }
 
     #[must_use]
@@ -952,8 +945,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         let mut pool = Vec::with_capacity(input.len() / 20);
         let mut section_pool = Vec::new();
         let mut line_pool = Vec::new();
-        let sections =
-            Self::resolve_inlines(&ctx, &mut pool, &mut section_pool, &mut line_pool);
+        let sections = Self::resolve_inlines(&ctx, &mut pool, &mut section_pool, &mut line_pool);
 
         Self {
             sections,
@@ -1025,7 +1017,9 @@ impl<'src> ParseCtx<'src> {
             // paragraph; the other six can.
             if (first == Some(b'<')
                 || (first == SpecialChar::Space
-                    && bytes[pos..line_end].get(..4).is_some_and(|w| w.contains(&b'<'))))
+                    && bytes[pos..line_end]
+                        .get(..4)
+                        .is_some_and(|w| w.contains(&b'<'))))
                 && let Some(indent) = bytes[pos..line_end].strip_indent()
             {
                 let spos = pos + indent;
@@ -1048,7 +1042,9 @@ impl<'src> ParseCtx<'src> {
             if !matches!(acc, Accumulator::InParagraph { .. })
                 && (first == Some(b'[')
                     || (first == SpecialChar::Space
-                        && bytes[pos..line_end].get(..4).is_some_and(|w| w.contains(&b'['))))
+                        && bytes[pos..line_end]
+                            .get(..4)
+                            .is_some_and(|w| w.contains(&b'['))))
                 && let Some(indent) = bytes[pos..line_end].strip_indent()
                 && let Some((def, resume)) = scan_link_def(ctx.input, pos + indent)
             {
@@ -1245,8 +1241,11 @@ impl<'src> ParseCtx<'src> {
     /// met), so this walk only tracks the *outermost* item structure.
     fn scan_list(&mut self, start: usize) -> ListScan {
         let bytes = self.bytes;
-        let line_end_of =
-            |p: usize| bytes.find_byte(p, SpecialChar::Newline.byte()).unwrap_or(bytes.len());
+        let line_end_of = |p: usize| {
+            bytes
+                .find_byte(p, SpecialChar::Newline.byte())
+                .unwrap_or(bytes.len())
+        };
 
         let items_start = self.list_items.len().lines_offset();
         let ind0 = bytes[start..line_end_of(start)].leading_spaces();
@@ -1354,7 +1353,11 @@ impl<'src> ParseCtx<'src> {
     /// so an empty item (`-` alone) contributes zero lines and does not look
     /// like a trailing blank that would mark the list loose.
     fn push_marker_content(&mut self, pos: usize, le: usize, col: usize) {
-        let content = self.input.get(pos..le).and_then(|l| l.get(col..)).unwrap_or("");
+        let content = self
+            .input
+            .get(pos..le)
+            .and_then(|l| l.get(col..))
+            .unwrap_or("");
         if !content.is_empty() {
             self.lines.push(content);
         }

@@ -18,15 +18,15 @@ impl<'md, 'src> Checker<'md, 'src> {
     fn quote_single_paragraph(&self, section: &Section<'src>) -> InlineSpan {
         match section {
             Section::Blockquote { children } => {
-                let kids = self.md.child_sections(*children);
+                let kids: Vec<_> = self.md.child_sections(*children).collect();
                 assert_eq!(
                     kids.len(),
                     1,
                     "expected blockquote with one child, got {kids:?}"
                 );
                 match kids[0] {
-                    Section::Paragraph { content } => content,
-                    ref other => panic!("expected paragraph in blockquote, got {other:?}"),
+                    Section::Paragraph { content } => *content,
+                    other => panic!("expected paragraph in blockquote, got {other:?}"),
                 }
             }
             other => panic!("expected blockquote, got {other:?}"),
@@ -39,18 +39,17 @@ impl<'md, 'src> Checker<'md, 'src> {
     fn item_paragraphs(&self, items: SectionRange) -> Vec<InlineSpan> {
         self.md
             .child_sections(items)
-            .iter()
             .map(|item| match item {
                 Section::ListItem { children } => {
-                    let kids = self.md.child_sections(*children);
+                    let kids: Vec<_> = self.md.child_sections(*children).collect();
                     assert_eq!(
                         kids.len(),
                         1,
                         "expected single-paragraph list item, got {kids:?}"
                     );
                     match kids[0] {
-                        Section::Paragraph { content } => content,
-                        ref other => {
+                        Section::Paragraph { content } => *content,
+                        other => {
                             panic!("expected paragraph in list item, got {other:?}")
                         }
                     }
@@ -292,10 +291,12 @@ fn test_blockquote() {
 #[test]
 fn test_blockquote_nested() {
     let md: MarkdownFile<'_> = MarkdownFile::parse("> outer\n> > inner");
-    let kids = md.child_sections(match &md.sections[0] {
-        Section::Blockquote { children } => *children,
-        other => panic!("expected blockquote, got {other:?}"),
-    });
+    let kids: Vec<_> = md
+        .child_sections(match &md.sections[0] {
+            Section::Blockquote { children } => *children,
+            other => panic!("expected blockquote, got {other:?}"),
+        })
+        .collect();
     assert_eq!(kids.len(), 2, "got {kids:?}");
     assert!(matches!(kids[0], Section::Paragraph { .. }));
     assert!(
@@ -308,10 +309,12 @@ fn test_blockquote_nested() {
 #[test]
 fn test_blockquote_with_heading() {
     let md: MarkdownFile<'_> = MarkdownFile::parse("> # Foo\n> bar");
-    let kids = md.child_sections(match &md.sections[0] {
-        Section::Blockquote { children } => *children,
-        other => panic!("expected blockquote, got {other:?}"),
-    });
+    let kids: Vec<_> = md
+        .child_sections(match &md.sections[0] {
+            Section::Blockquote { children } => *children,
+            other => panic!("expected blockquote, got {other:?}"),
+        })
+        .collect();
     assert_eq!(kids.len(), 2, "got {kids:?}");
     assert!(matches!(kids[0], Section::Heading { level: 1, .. }));
     assert!(matches!(kids[1], Section::Paragraph { .. }));
@@ -427,11 +430,7 @@ fn test_setext_heading_multiline_paragraph() {
     match &md.sections[0] {
         Section::Heading { level: 2, content } => Checker::new(&md).check_span(
             *content,
-            &[
-                Expect::Text("Foo"),
-                Expect::SoftBreak,
-                Expect::Text("Bar"),
-            ],
+            &[Expect::Text("Foo"), Expect::SoftBreak, Expect::Text("Bar")],
         ),
         other => panic!("expected h2, got {other:?}"),
     }
@@ -579,8 +578,7 @@ fn test_html_block_comment() {
 
 #[test]
 fn test_html_block_script_ends_at_close_tag() {
-    let md: MarkdownFile<'_> =
-        MarkdownFile::parse("<script>\nfoo\n</script>\nokay\n");
+    let md: MarkdownFile<'_> = MarkdownFile::parse("<script>\nfoo\n</script>\nokay\n");
     assert_eq!(md.sections.len(), 2);
     match &md.sections[0] {
         Section::HtmlBlock { html } => {
@@ -1017,11 +1015,7 @@ fn test_paragraph_strips_leading_indentation_each_line() {
     match &md.sections[0] {
         Section::Paragraph { content } => Checker::new(&md).check_span(
             *content,
-            &[
-                Expect::Text("aaa"),
-                Expect::SoftBreak,
-                Expect::Text("bbb"),
-            ],
+            &[Expect::Text("aaa"), Expect::SoftBreak, Expect::Text("bbb")],
         ),
         other => panic!("expected paragraph, got {other:?}"),
     }
@@ -1692,27 +1686,27 @@ fn test_ordered_list_empty_item() {
         } => {
             // The first item is empty: CommonMark gives it no child blocks at
             // all (an empty `<li></li>`), while the second holds one paragraph.
-            let item_sections = md.child_sections(*items);
+            let item_sections: Vec<_> = md.child_sections(*items).collect();
             assert_eq!(item_sections.len(), 2);
             match item_sections[0] {
                 Section::ListItem { children } => {
-                    assert!(md.child_sections(children).is_empty());
+                    assert_eq!(md.child_sections(*children).count(), 0);
                 }
-                ref other => panic!("expected list item, got {other:?}"),
+                other => panic!("expected list item, got {other:?}"),
             }
             let checker = Checker::new(&md);
             match item_sections[1] {
                 Section::ListItem { children } => {
-                    let kids = md.child_sections(children);
+                    let kids: Vec<_> = md.child_sections(*children).collect();
                     assert_eq!(kids.len(), 1);
                     match kids[0] {
                         Section::Paragraph { content } => {
-                            checker.check_span(content, &Expect::text("second"));
+                            checker.check_span(*content, &Expect::text("second"));
                         }
-                        ref other => panic!("expected paragraph, got {other:?}"),
+                        other => panic!("expected paragraph, got {other:?}"),
                     }
                 }
-                ref other => panic!("expected list item, got {other:?}"),
+                other => panic!("expected list item, got {other:?}"),
             }
         }
         other => panic!("expected ordered list, got {other:?}"),

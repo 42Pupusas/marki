@@ -203,7 +203,10 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 out.push_str("</ul>\n");
             }
             Section::OrderedList {
-                start, tight, items, ..
+                start,
+                tight,
+                items,
+                ..
             } => {
                 if *start == 1 {
                     out.push_str("<ol>\n");
@@ -217,7 +220,13 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
             }
             Section::ListItem { children } => {
                 // A bare ListItem (not reached via a list) renders loose.
-                self.render_list_item(&Section::ListItem { children: *children }, false, out);
+                self.render_list_item(
+                    &Section::ListItem {
+                        children: *children,
+                    },
+                    false,
+                    out,
+                );
             }
             Section::Blockquote { children } => {
                 out.push_str("<blockquote>\n");
@@ -247,9 +256,7 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         let kids = self.child_sections(*children);
         out.push_str("<li>");
         for kid in kids {
-            if tight
-                && let Section::Paragraph { content } = kid
-            {
+            if tight && let Section::Paragraph { content } = kid {
                 // Tight paragraph: bare inlines, no wrapper, no leading break.
                 self.render_inlines(*content, out);
             } else {

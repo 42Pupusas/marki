@@ -151,11 +151,18 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         &self[span]
     }
 
-    /// Get the child sections referenced by a [`SectionRange`] (blockquote
-    /// interiors and list items).
-    #[must_use]
-    pub fn child_sections(&self, range: SectionRange) -> &[Section<'src>] {
-        &self[range]
+    /// Iterate the *direct* child sections referenced by a [`SectionRange`]
+    /// (list items, blockquote and list-item interiors).
+    ///
+    /// The section pool is pre-order, so a container's descendants are
+    /// interleaved between its direct children; this iterator skips each
+    /// child's subtree via [`Section::pool_span`] to yield only the immediate
+    /// children.
+    pub fn child_sections(&self, range: SectionRange) -> impl Iterator<Item = &Section<'src>> {
+        ChildSections {
+            forest: &self[range],
+            cursor: 0,
+        }
     }
 
     /// Get the dedented code lines referenced by a [`LineRange`].
@@ -168,11 +175,14 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     /// fuzz targets to assert the parser does not panic on arbitrary input.
     #[cfg(test)]
     pub(crate) fn walk_all_inlines(&self) {
-        self.walk_sections(&self.sections);
+        self.walk_sections(self.sections.iter());
     }
 
     #[cfg(test)]
-    fn walk_sections(&self, sections: &[Section<'src>]) {
+    fn walk_sections<'a>(&'a self, sections: impl Iterator<Item = &'a Section<'src>>)
+    where
+        'src: 'a,
+    {
         for section in sections {
             match section {
                 Section::UnorderedList { items, .. } | Section::OrderedList { items, .. } => {
@@ -215,6 +225,24 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize> std::ops::
         let start = range.start as usize;
         let end = start + range.len as usize;
         &self.section_pool[start..end]
+    }
+}
+
+/// Iterator over the direct children of a pre-order sub-forest, skipping each
+/// child's interleaved subtree. Produced by
+/// [`child_sections`](MarkdownFile::child_sections).
+struct ChildSections<'a, 'src> {
+    forest: &'a [Section<'src>],
+    cursor: usize,
+}
+
+impl<'a, 'src> Iterator for ChildSections<'a, 'src> {
+    type Item = &'a Section<'src>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let child = self.forest.get(self.cursor)?;
+        self.cursor += child.pool_span();
+        Some(child)
     }
 }
 

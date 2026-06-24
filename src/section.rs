@@ -48,10 +48,17 @@ impl LineRange {
     }
 }
 
-/// A range of [`Section`]s stored contiguously in the section pool.
+/// A pre-order sub-forest of [`Section`]s in the section pool.
 ///
-/// Used by blockquotes and list items to reference their child blocks
+/// Used by blockquotes, list items, and lists to reference their child blocks
 /// without a per-block heap allocation, keeping [`Section`] itself `Copy`.
+///
+/// The pool is laid out in **pre-order**: a container is immediately followed
+/// by its entire subtree, so `start` is the index of the container's first
+/// child and `len` counts *every* entry in the sub-forest (direct children
+/// **and** their descendants). Direct children are therefore not adjacent —
+/// iterate them with [`child_sections`](crate::MarkdownFile::child_sections),
+/// which skips each child's subtree via [`Section::pool_span`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SectionRange {
     pub start: u32,
@@ -107,6 +114,25 @@ impl PartialEq<u8> for OrderedListDelimiter {
 impl PartialEq<OrderedListDelimiter> for u8 {
     fn eq(&self, other: &OrderedListDelimiter) -> bool {
         *self == other.byte()
+    }
+}
+
+impl Section<'_> {
+    /// Number of pool entries this section occupies, including itself and its
+    /// entire pre-order subtree. Leaves span 1; containers span `1 + len` of
+    /// their child sub-forest. Used to skip whole subtrees when walking direct
+    /// children.
+    #[must_use]
+    pub const fn pool_span(&self) -> usize {
+        match self {
+            Section::UnorderedList { items, .. } | Section::OrderedList { items, .. } => {
+                1 + items.len as usize
+            }
+            Section::ListItem { children } | Section::Blockquote { children } => {
+                1 + children.len as usize
+            }
+            _ => 1,
+        }
     }
 }
 
