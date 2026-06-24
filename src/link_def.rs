@@ -40,7 +40,15 @@ pub fn normalize_label(label: &str) -> String {
         } else {
             prev_ws = false;
             for lc in ch.to_lowercase() {
-                out.push(lc);
+                // CommonMark matches labels by full Unicode case folding, where
+                // the sharp s folds to "ss". `to_lowercase` only maps the
+                // capital form `ẞ` to `ß`, so finish the fold here; this also
+                // lets a `SS` label (lowercased to "ss") match `ß`/`ẞ`.
+                if lc == '\u{00df}' {
+                    out.push_str("ss");
+                } else {
+                    out.push(lc);
+                }
             }
         }
     }
