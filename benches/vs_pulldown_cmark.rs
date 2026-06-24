@@ -107,9 +107,7 @@ fn main() {
 /// Per-fixture comparison (parse + render to HTML).
 #[divan::bench_group]
 mod fixtures {
-    use super::{
-        FIXTURES, black_box, comrak_render, fixture, marki_render, pulldown_render,
-    };
+    use super::{FIXTURES, black_box, comrak_render, fixture, marki_render, pulldown_render};
 
     #[divan::bench(args = FIXTURES)]
     fn marki(name: &str) {

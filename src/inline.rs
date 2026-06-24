@@ -636,7 +636,9 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         // Trailing segment: paragraph reflow strips whitespace at the end of
         // the final line.
         let tail = if self.strip_lines {
-            self.input.get(plain_start..).map(|t| t.trim_end_matches([' ', '\t']))
+            self.input
+                .get(plain_start..)
+                .map(|t| t.trim_end_matches([' ', '\t']))
         } else {
             self.input.get(plain_start..)
         };
@@ -677,9 +679,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         // Paragraph reflow strips trailing whitespace from each line, even the
         // single trailing space that would otherwise survive a soft break.
         if self.strip_lines {
-            while trim_end > plain_start
-                && matches!(bytes.get(trim_end - 1), Some(b' ' | b'\t'))
-            {
+            while trim_end > plain_start && matches!(bytes.get(trim_end - 1), Some(b' ' | b'\t')) {
                 trim_end -= 1;
             }
         }
@@ -1160,9 +1160,10 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         }
         i += 1;
         let scheme_start = start + 1;
-        while bytes.get(i).is_some_and(|&b| {
-            b.is_ascii_alphanumeric() || b == b'+' || b == b'.' || b == b'-'
-        }) {
+        while bytes
+            .get(i)
+            .is_some_and(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'.' || b == b'-')
+        {
             i += 1;
         }
         let scheme_len = i - scheme_start;
@@ -1190,9 +1191,25 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             b.is_ascii_alphanumeric()
                 || matches!(
                     b,
-                    b'.' | b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+'
-                        | b'/' | b'=' | b'?' | b'^' | b'_' | b'`' | b'{' | b'|'
-                        | b'}' | b'~' | b'-'
+                    b'.' | b'!'
+                        | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'/'
+                        | b'='
+                        | b'?'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'{'
+                        | b'|'
+                        | b'}'
+                        | b'~'
+                        | b'-'
                 )
         }) {
             i += 1;

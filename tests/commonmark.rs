@@ -167,9 +167,7 @@ mod mini_json {
                 }
             }
             _ => {
-                while peek(bytes, *i)
-                    .is_some_and(|b| b != b',' && b != b'}' && b != b']')
-                {
+                while peek(bytes, *i).is_some_and(|b| b != b',' && b != b'}' && b != b']') {
                     *i += 1;
                 }
             }

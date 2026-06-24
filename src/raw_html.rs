@@ -109,8 +109,7 @@ fn scan_attribute_value(b: &[u8], i: usize) -> Option<usize> {
             let start = i;
             let mut j = i;
             while b.get(j).is_some_and(|&c| {
-                !c.is_ascii_whitespace()
-                    && !matches!(c, b'"' | b'\'' | b'=' | b'<' | b'>' | b'`')
+                !c.is_ascii_whitespace() && !matches!(c, b'"' | b'\'' | b'=' | b'<' | b'>' | b'`')
             }) {
                 j += 1;
             }
@@ -229,15 +228,68 @@ impl HtmlBlockKind {
 
 /// HTML block tag names for start condition 6 (`CommonMark` §4.6).
 const BLOCK_TAGS: &[&[u8]] = &[
-    b"address", b"article", b"aside", b"base", b"basefont", b"blockquote",
-    b"body", b"caption", b"center", b"col", b"colgroup", b"dd", b"details",
-    b"dialog", b"dir", b"div", b"dl", b"dt", b"fieldset", b"figcaption",
-    b"figure", b"footer", b"form", b"frame", b"frameset", b"h1", b"h2", b"h3",
-    b"h4", b"h5", b"h6", b"head", b"header", b"hr", b"html", b"iframe",
-    b"legend", b"li", b"link", b"main", b"menu", b"menuitem", b"nav",
-    b"noframes", b"ol", b"optgroup", b"option", b"p", b"param", b"search",
-    b"section", b"summary", b"table", b"tbody", b"td", b"tfoot", b"th",
-    b"thead", b"title", b"tr", b"track", b"ul",
+    b"address",
+    b"article",
+    b"aside",
+    b"base",
+    b"basefont",
+    b"blockquote",
+    b"body",
+    b"caption",
+    b"center",
+    b"col",
+    b"colgroup",
+    b"dd",
+    b"details",
+    b"dialog",
+    b"dir",
+    b"div",
+    b"dl",
+    b"dt",
+    b"fieldset",
+    b"figcaption",
+    b"figure",
+    b"footer",
+    b"form",
+    b"frame",
+    b"frameset",
+    b"h1",
+    b"h2",
+    b"h3",
+    b"h4",
+    b"h5",
+    b"h6",
+    b"head",
+    b"header",
+    b"hr",
+    b"html",
+    b"iframe",
+    b"legend",
+    b"li",
+    b"link",
+    b"main",
+    b"menu",
+    b"menuitem",
+    b"nav",
+    b"noframes",
+    b"ol",
+    b"optgroup",
+    b"option",
+    b"p",
+    b"param",
+    b"search",
+    b"section",
+    b"summary",
+    b"table",
+    b"tbody",
+    b"td",
+    b"tfoot",
+    b"th",
+    b"thead",
+    b"title",
+    b"tr",
+    b"track",
+    b"ul",
 ];
 
 /// Tag names for start condition 1 (raw text elements).
@@ -324,10 +376,7 @@ pub fn html_block_start(line: &[u8], in_paragraph: bool) -> Option<HtmlBlockKind
 
 /// Case-insensitive ASCII byte-slice comparison.
 fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b)
-            .all(|(x, y)| x.eq_ignore_ascii_case(y))
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
 /// True if `line` contains any of the type-1 closing markers.

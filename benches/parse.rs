@@ -89,9 +89,7 @@ fn spec_vectors() -> Vec<String> {
 
 /// Find the first occurrence of `needle` in `haystack`, returning its offset.
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 fn mixed_document() -> String {
@@ -199,13 +197,11 @@ mod spec_vectors {
     /// once via `with_inputs` so JSON extraction is excluded from the timing.
     #[divan::bench]
     fn parse_each(bencher: divan::Bencher) {
-        bencher
-            .with_inputs(spec_vectors)
-            .bench_values(|vectors| {
-                for v in &vectors {
-                    let _ = MarkdownFile::<'_, 16, 32>::parse(black_box(v));
-                }
-            });
+        bencher.with_inputs(spec_vectors).bench_values(|vectors| {
+            for v in &vectors {
+                let _ = MarkdownFile::<'_, 16, 32>::parse(black_box(v));
+            }
+        });
     }
 
     /// Parse all vectors concatenated into one large document.
@@ -222,13 +218,11 @@ mod spec_vectors {
     /// added for conformance testing.
     #[divan::bench]
     fn parse_and_render(bencher: divan::Bencher) {
-        bencher
-            .with_inputs(spec_vectors)
-            .bench_values(|vectors| {
-                for v in &vectors {
-                    let md = MarkdownFile::<'_, 16, 32>::parse(black_box(v));
-                    black_box(md.to_html());
-                }
-            });
+        bencher.with_inputs(spec_vectors).bench_values(|vectors| {
+            for v in &vectors {
+                let md = MarkdownFile::<'_, 16, 32>::parse(black_box(v));
+                black_box(md.to_html());
+            }
+        });
     }
 }

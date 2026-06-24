@@ -84,10 +84,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let iterations: usize = args
-        .next()
-        .and_then(|a| a.parse().ok())
-        .unwrap_or(20_000);
+    let iterations: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(20_000);
     let mode = args.next().unwrap_or_else(|| "parse".to_string());
 
     // Build the corpus once; profiling should only see parsing work.
