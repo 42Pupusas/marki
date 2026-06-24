@@ -1728,18 +1728,13 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             let close_count = SpecialChar::Backtick.count_leading_bytes(&bytes[i..]);
 
             if close_count == backtick_count {
-                // CommonMark §6.1: strip one leading and one trailing space
-                // when the content both starts and ends with a space.
-                let mut cs = content_start;
-                let mut ce = i;
-                if ce - cs >= 2
-                    && bytes.get(cs) == SpecialChar::Space
-                    && bytes.get(ce - 1) == SpecialChar::Space
-                {
-                    cs += 1;
-                    ce -= 1;
-                }
-                return Some((input.get(cs..ce)?, i + close_count));
+                // Return the raw inter-backtick slice. CommonMark §6.1
+                // normalization (line endings -> spaces, then a single
+                // leading/trailing space strip when the content is not all
+                // spaces) happens at render time in `escape_code_span`,
+                // because line-ending collapse requires allocation while this
+                // parser only borrows from the source.
+                return Some((input.get(content_start..i)?, i + close_count));
             }
             i += close_count;
         }

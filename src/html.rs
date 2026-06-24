@@ -9,6 +9,33 @@ use std::fmt::Write as _;
 
 use crate::{Inline, InlineSpan, MarkdownFile, Section};
 
+/// Render a code span's content per `CommonMark` §6.1: first convert interior
+/// line endings (`\n`, with any preceding `\r` already normalized away) to
+/// single spaces, then — if the result contains at least one non-space — strip a
+/// single leading and trailing space. Finally HTML-escape. Entities and
+/// backslashes are *not* interpreted inside a code span.
+fn escape_code_span(s: &str, out: &mut String) {
+    // Step 1: collapse line endings to spaces into a scratch buffer.
+    let mut buf = String::with_capacity(s.len());
+    for ch in s.chars() {
+        buf.push(if ch == '\n' { ' ' } else { ch });
+    }
+
+    // Step 2: strip one leading + trailing space, but only when the content is
+    // not made up entirely of spaces (`` `  ` `` keeps both spaces).
+    let trimmed = if buf.len() >= 2
+        && buf.starts_with(' ')
+        && buf.ends_with(' ')
+        && buf.bytes().any(|b| b != b' ')
+    {
+        &buf[1..buf.len() - 1]
+    } else {
+        &buf[..]
+    };
+
+    escape_html(trimmed, out);
+}
+
 /// Escape the four HTML-significant characters in text content
 /// (`CommonMark` renders these in body text).
 fn escape_html(s: &str, out: &mut String) {
@@ -408,7 +435,7 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
             }
             Inline::Code(c) => {
                 out.push_str("<code>");
-                escape_html(c, out);
+                escape_code_span(c, out);
                 out.push_str("</code>");
             }
             Inline::Autolink { target, is_email } => {

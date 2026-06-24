@@ -115,9 +115,13 @@ Wire the ~2125-entry HTML5 named character reference table into `entity.rs` so
 strings. Unblocks Entities (12/17→17), plus several Links/Images title cases.
 
 ### Phase 4 — Code-span & line-break normalization  (target ~91%)
-Code spans: collapse interior newlines to spaces, strip one leading/trailing
-space unless all-spaces, exact backtick-count matching. Localized to
-`try_parse_inline_code`.
+**DONE (89.4% → 90.5%).** Code-span §6.1 normalization moved to render time
+(`escape_code_span` in `src/html.rs`): collapse interior line endings to spaces,
+then strip one leading/trailing space unless the content is all spaces. The
+parser (`try_parse_inline_code`) now returns the raw inter-backtick slice.
+Code spans 16→20/22, Hard line breaks 13→15/15 (the `` `code  \nspan` `` cases
+fall out of the same pass). Remaining 2 (342, 347) are backtick-vs-link/fence
+*precedence*, deferred to the long tail.
 
 ### Phase 5 — Block-level: tabs + containers  (target ~96%)
 Tab expansion to 4-col stops in `src/block.rs`; fenced-code indent stripping;
@@ -138,3 +142,6 @@ to lock in progress and prevent regressions.
   Autolinks 18→19/19, Backslash 9→12, Link-ref-defs 23→26). Perf gate held
   (render-only + scanner change; commonmark_spec +7%). Next: Phase 2c (inline
   alt + link nesting), then Phase 3 (named entities).
+- 2026-06-24: Phase 4 complete — code-span §6.1 normalization at render time
+  (`escape_code_span`). 89.4% → 90.5% (Code spans 16→20, Hard line breaks
+  13→15/15). Render-only, perf unaffected. Next: Phase 2c or Phase 3.
