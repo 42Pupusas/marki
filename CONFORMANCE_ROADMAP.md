@@ -1,0 +1,116 @@
+# CommonMark Conformance Roadmap
+
+Tracking `marki-parse` toward full CommonMark conformance without sacrificing
+performance. Living document — update the status table and changelog as each
+phase lands.
+
+## Baseline (2026-06-24)
+
+- **Conformance: 485/652 (74.4%)** via `cargo test --test commonmark commonmark_conformance -- --nocapture`
+- The `commonmark_conformance` test **reports but does not gate**; the hard gate
+  is `no_panic_on_any_fixture`. Phase 6 flips conformance into a floor assertion.
+
+### Per-section status (baseline)
+
+| Section                       | Pass    | Target phase |
+|-------------------------------|---------|--------------|
+| Emphasis and strong emphasis  | 68/132  | 1            |
+| Links                         | 54/90   | 2, 3         |
+| Images                        | 14/22   | 2, 3         |
+| Code spans                    | 14/22   | 4            |
+| Entity/numeric references     | 12/17   | 3            |
+| Lists                         | 20/26   | 5            |
+| List items                    | 45/48   | 5            |
+| Block quotes                  | 20/25   | 5            |
+| Tabs                          | 3/11    | 5            |
+| Fenced code blocks            | 25/29   | 5            |
+| Backslash escapes             | 9/13    | 3            |
+| Thematic breaks               | 16/19   | 1, 6         |
+| Hard line breaks              | 13/15   | 4            |
+| Raw HTML                      | 18/20   | 1, 6         |
+| Autolinks                     | 18/19   | 3            |
+| ATX/Setext headings           | 17/18, 26/27 | 5, 6    |
+| HTML blocks                   | 42/44   | 6            |
+| Link reference definitions    | 23/27   | 3            |
+
+## Performance baseline (regression gate)
+
+Every phase must keep conformance green **and** not regress these benchmarks
+dramatically. Rule of thumb: **investigate any median regression > 10%**, and
+do not merge a phase with a > 25% regression on the corpus benches without an
+explicit, documented justification.
+
+`cargo bench --bench parse` medians (2026-06-24, release+LTO):
+
+| Bench                          | Median   |
+|--------------------------------|----------|
+| heading                        | 78.0 ns  |
+| paragraph                      | 87.2 ns  |
+| inline_rich                    | 309.7 ns |
+| code_block                     | 66.7 ns  |
+| unordered_list                 | 394.2 ns |
+| ordered_list                   | 382.9 ns |
+| blockquote                     | 270.7 ns |
+| horizontal_rule                | 53.3 ns  |
+| mixed_document_bench           | 1.292 µs |
+| fixture/awesome                | 87.8 µs  |
+| fixture/commonmark_spec        | 205.8 µs |
+| fixture/rust_readme            | 6.82 µs  |
+| scaling/100                    | 86.3 µs  |
+| spec_vectors/parse_each        | 230 µs   |
+| spec_vectors/parse_concatenated| 126.6 µs |
+| spec_vectors/parse_and_render  | 359 µs   |
+
+The corpus rows (`fixture/*`, `spec_vectors/*`) are the load-bearing gates;
+the tiny single-construct benches are noisy and used only as directional signals.
+
+## Phase plan
+
+Each phase: implement → `cargo test` (conformance breakdown) → `cargo bench`
+(compare to table above) → update this doc → commit.
+
+### Phase 1 — Emphasis delimiter stack  ✅ DONE (74.4% → 85.4%)
+Replaced the naive first-match nesting in `src/inline.rs` with the standard
+CommonMark two-pass **delimiter-stack + flanking** algorithm. Implementation:
+- `EmphArena`: index-based doubly-linked node list + parallel delimiter stack,
+  adapted to marki's flat post-order pool (`emit_list` flushes in post-order).
+- `process_emphasis` mirrors commonmark.js (`openers_bottom` indexed by
+  char/can_open/origdelims%3; odd_match rule-of-3; `use_delims` = 2 iff both ≥2).
+- `scan_delims` for flanking; `contiguous_merge` recombines split text nodes.
+- The no-`*`/`_` fast path (`InlineBuf`) is untouched; only emphasis-bearing
+  contexts take the arena path.
+- Arenas are pooled in a thread-local free-list (`with_arena`) to amortize the
+  `Vec` allocations — without it, inline-heavy benches regressed ~2×.
+
+Results: **Emphasis 68→131/132**, overall **485→557/652**. All 134 lib tests
+pass, clippy clean. Perf gate held: corpus benches within ±7% of baseline
+(awesome −8%, commonmark_spec +6.8%, rust_readme −2%; spec_vectors flat).
+
+### Phase 2 — Link/image inline content + nesting  (target ~85%)
+Parse link text and image alt as inlines; forbid nested links; handle outer
+link suppression (`[foo [bar](/uri)](/uri)`). Falls out of Phase 1's stack.
+
+### Phase 3 — URL/title/entity normalization  (target ~89%)
+One normalization pass for destinations + titles: backslash-escape resolution,
+entity decode (wire in `entity.rs`), percent-encoding, angle-bracket and
+balanced-paren destinations. Fixes Links/Images/Entities/Backslash/Autolinks tails.
+
+### Phase 4 — Code-span & line-break normalization  (target ~91%)
+Code spans: collapse interior newlines to spaces, strip one leading/trailing
+space unless all-spaces, exact backtick-count matching. Localized to
+`try_parse_inline_code`.
+
+### Phase 5 — Block-level: tabs + containers  (target ~96%)
+Tab expansion to 4-col stops in `src/block.rs`; fenced-code indent stripping;
+loose/tight list detection; lazy continuation and nested blockquote/list edges.
+
+### Phase 6 — Long tail + gate
+Remaining thematic-break/setext/raw-HTML/HTML-block edge cases. Then flip the
+conformance test from reporting to asserting a floor (e.g. `assert!(pct >= 95.0)`)
+to lock in progress and prevent regressions.
+
+## Changelog
+
+- 2026-06-24: Baseline recorded (74.4%, perf table above). Roadmap created.
+- 2026-06-24: Phase 1 complete — emphasis delimiter-stack rewrite. 74.4% → 85.4%
+  (Emphasis 68→131/132). Perf gate held (corpus benches within ±7%). Next: Phase 2.

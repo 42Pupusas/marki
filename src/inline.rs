@@ -66,13 +66,425 @@ static PAREN_CLOSE_SET: ByteSet = ByteSet::new(&[
     SpecialChar::Backslash.byte(),
 ]);
 
-/// Pre-computed byte sets for `try_parse_delimited` — one per delimiter type.
-static STAR_DELIM_SET: ByteSet =
-    ByteSet::new(&[SpecialChar::Asterisk.byte(), SpecialChar::Backslash.byte()]);
-static UNDER_DELIM_SET: ByteSet = ByteSet::new(&[
-    SpecialChar::Underscore.byte(),
-    SpecialChar::Backslash.byte(),
-]);
+/// Emphasis delimiter characters (`*` and `_`). A single SIMD scan for this set
+/// decides whether an inline context needs the full delimiter-stack algorithm
+/// (below) or can take the existing allocation-free fast path.
+static EMPH_ONLY_SET: ByteSet =
+    ByteSet::new(&[SpecialChar::Asterisk.byte(), SpecialChar::Underscore.byte()]);
+
+// ===========================================================================
+// CommonMark emphasis: delimiter-stack algorithm (spec §6.2 / Appendix).
+//
+// marki stores inlines in a flat, post-order pool (`InlineSpan { start, len }`):
+// a parent node's children occupy a contiguous range *earlier* in the pool, and
+// the parent is appended after them. The reference algorithm works on a doubly
+// linked list; we mirror it with an index-based arena (`EmphNode`) plus a
+// parallel delimiter stack (`EmphDelim`), then emit the resolved tree into the
+// pool in post-order so the contiguity invariant holds.
+// ===========================================================================
+
+/// Sentinel for "no node / no link" in the index-based linked lists.
+const NIL: i32 = -1;
+
+/// If `a` and `b` are adjacent slices of the same backing string, return the
+/// single slice spanning both (`a` immediately followed by `b`). Used to merge
+/// split text fragments — e.g. an unmatched `*` delimiter and the word after
+/// it — back into one `Text` node so the inline pool stays compact.
+fn contiguous_merge<'src>(a: &'src str, b: &'src str) -> Option<&'src str> {
+    let a_end = a.as_ptr() as usize + a.len();
+    if a_end == b.as_ptr() as usize {
+        // SAFETY: a and b are contiguous slices of the same allocation, so the
+        // combined range is a valid UTF-8 slice of that original `&str`.
+        Some(unsafe {
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(a.as_ptr(), a.len() + b.len()))
+        })
+    } else {
+        None
+    }
+}
+
+/// A node in the inline list processed by the emphasis resolver.
+#[derive(Clone, Copy)]
+enum EmphKind<'src> {
+    /// Literal text. For a delimiter run this is the run's source slice, sliced
+    /// down to the unconsumed length as delimiters are used.
+    Text(&'src str),
+    /// A fully-resolved inline whose children (if any) already live in the pool
+    /// (code spans, links, images, autolinks, raw HTML, line breaks).
+    Resolved(Inline<'src>),
+    /// Emphasis (`Italic`) or strong (`Bold`) wrapping a child sub-list. The
+    /// children are `head ..` following `next` links until `NIL`.
+    Emph { strong: bool, head: i32 },
+    /// An unlinked node; never emitted.
+    Removed,
+}
+
+/// An arena slot: a node plus its neighbours in the (doubly linked) inline list.
+struct EmphNode<'src> {
+    kind: EmphKind<'src>,
+    prev: i32,
+    next: i32,
+}
+
+/// An entry on the delimiter stack: a run of `*` or `_` that may open and/or
+/// close emphasis. Mirrors commonmark.js `delimiters`.
+struct EmphDelim {
+    /// Index of the backing text node in the arena.
+    node: i32,
+    ch: u8,
+    /// Remaining (unconsumed) delimiter count.
+    count: i32,
+    /// Original count, for the rule-of-3 (`origdelims`).
+    orig: i32,
+    can_open: bool,
+    can_close: bool,
+    /// Previous/next on the delimiter stack (not the node list).
+    prev: i32,
+    next: i32,
+}
+
+/// Working state for one emphasis-resolution pass over a single inline context.
+/// Holds the node arena and the delimiter stack; reused per parse call.
+#[derive(Default)]
+struct EmphArena<'src> {
+    nodes: Vec<EmphNode<'src>>,
+    delims: Vec<EmphDelim>,
+    /// Reusable post-order emit stack (see [`EmphArena::emit_list`]).
+    scratch: Vec<Inline<'src>>,
+    /// Head/tail of the top-level node list.
+    head: i32,
+    tail: i32,
+    /// Top of the delimiter stack (most recently pushed), or `NIL`.
+    delim_top: i32,
+}
+
+thread_local! {
+    /// Free-list of emphasis arenas, reused across parse calls to amortize the
+    /// arena's `Vec` allocations. Parsing is re-entrant (a link's text is a
+    /// nested inline context), so this is a stack: each [`with_arena`] call
+    /// checks one out and returns it cleared.
+    static ARENA_POOL: std::cell::RefCell<Vec<EmphArena<'static>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` with a recycled [`EmphArena`], returning it to the thread-local pool
+/// afterwards. The arena is cleared before use and before return, so no `'src`
+/// references ever persist in the `'static` pool.
+fn with_arena<'src, R>(f: impl FnOnce(&mut EmphArena<'src>) -> R) -> R {
+    let mut arena: EmphArena<'static> = ARENA_POOL
+        .with(|p| p.borrow_mut().pop())
+        .unwrap_or_default();
+    arena.reset();
+    // SAFETY: `EmphArena<'a>` has the same layout for every `'a` (the lifetime
+    // only constrains the `&str`s it stores). We hand `f` a correctly-scoped
+    // `'src` borrow; on return the arena is reset (all `Vec`s emptied, dropping
+    // every `&'src str`) before it is moved back as `'static`, so the pool
+    // never observes a dangling reference.
+    let borrow: &mut EmphArena<'src> = unsafe { std::mem::transmute(&mut arena) };
+    let out = f(borrow);
+    arena.reset();
+    ARENA_POOL.with(|p| p.borrow_mut().push(arena));
+    out
+}
+
+// The emphasis arena is an index-based linked list: node/delimiter handles are
+// `i32` (sentinel `NIL = -1`) and index into `Vec`s whose length is bounded by
+// the document's inline-pool cap (already `u32::MAX`). The `i32`<->`usize`
+// conversions are therefore provably in range; suppress the cast lints here
+// rather than threading `try_from` through every hot-loop access.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+impl<'src> EmphArena<'src> {
+    fn reset(&mut self) {
+        self.nodes.clear();
+        self.delims.clear();
+        self.head = NIL;
+        self.tail = NIL;
+        self.delim_top = NIL;
+    }
+
+    /// Append a node to the end of the top-level list, returning its index.
+    fn push_node(&mut self, kind: EmphKind<'src>) -> i32 {
+        let idx = self.nodes.len() as i32;
+        let prev = self.tail;
+        self.nodes.push(EmphNode {
+            kind,
+            prev,
+            next: NIL,
+        });
+        if prev == NIL {
+            self.head = idx;
+        } else {
+            self.nodes[prev as usize].next = idx;
+        }
+        self.tail = idx;
+        idx
+    }
+
+    /// Append plain text, merging into the previous node when it is also text
+    /// (keeps the arena small and avoids adjacent `<text>` fragments).
+    fn push_text(&mut self, s: &'src str) {
+        if s.is_empty() {
+            return;
+        }
+        self.push_node(EmphKind::Text(s));
+    }
+
+    /// Push a delimiter run (its text node and a delimiter-stack entry).
+    fn push_delim(&mut self, src: &'src str, ch: u8, count: i32, can_open: bool, can_close: bool) {
+        let node = self.push_node(EmphKind::Text(src));
+        let idx = self.delims.len() as i32;
+        let prev = self.delim_top;
+        self.delims.push(EmphDelim {
+            node,
+            ch,
+            count,
+            orig: count,
+            can_open,
+            can_close,
+            prev,
+            next: NIL,
+        });
+        if prev != NIL {
+            self.delims[prev as usize].next = idx;
+        }
+        self.delim_top = idx;
+    }
+
+    /// Unlink a node from the top-level list (used when a delimiter is fully
+    /// consumed).
+    fn unlink_node(&mut self, idx: i32) {
+        let (prev, next) = {
+            let n = &self.nodes[idx as usize];
+            (n.prev, n.next)
+        };
+        if prev == NIL {
+            self.head = next;
+        } else {
+            self.nodes[prev as usize].next = next;
+        }
+        if next == NIL {
+            self.tail = prev;
+        } else {
+            self.nodes[next as usize].prev = prev;
+        }
+        self.nodes[idx as usize].kind = EmphKind::Removed;
+    }
+
+    /// Remove a delimiter from the delimiter stack (node list untouched).
+    fn remove_delim(&mut self, idx: i32) {
+        let (prev, next) = {
+            let d = &self.delims[idx as usize];
+            (d.prev, d.next)
+        };
+        if prev != NIL {
+            self.delims[prev as usize].next = next;
+        }
+        if next == NIL {
+            self.delim_top = prev;
+        } else {
+            self.delims[next as usize].prev = prev;
+        }
+    }
+
+    /// commonmark.js `removeDelimitersBetween`: drop stack entries strictly
+    /// between `bottom` and `top`.
+    fn remove_delims_between(&mut self, bottom: i32, top: i32) {
+        if self.delims[bottom as usize].next != top {
+            self.delims[bottom as usize].next = top;
+            self.delims[top as usize].prev = bottom;
+        }
+    }
+
+    /// Shorten a delimiter run's backing text node by `used` characters from
+    /// the *end* (closer) or *start* (opener). Emphasis consumes delimiters
+    /// from the inner edge of each run.
+    fn shorten_text(&mut self, node: i32, used: i32, from_start: bool) {
+        if let EmphKind::Text(s) = self.nodes[node as usize].kind {
+            let used = used as usize;
+            let new = if from_start {
+                &s[used.min(s.len())..]
+            } else {
+                &s[..s.len().saturating_sub(used)]
+            };
+            self.nodes[node as usize].kind = EmphKind::Text(new);
+        }
+    }
+
+    /// Resolve emphasis/strong over the delimiter stack (commonmark.js
+    /// `processEmphasis` with `stack_bottom = NULL`). After this returns, the
+    /// top-level node list (`head`..) is the final inline sequence, with `Emph`
+    /// nodes wrapping their resolved children.
+    fn process_emphasis(&mut self) {
+        // openers_bottom indexed by: 2 buckets (can_open) * 3 (origdelims%3),
+        // separately for `*` and `_`. 12 slots; init to NIL (= stack_bottom).
+        let mut openers_bottom = [NIL; 12];
+
+        // First closer above stack_bottom = bottom of the stack.
+        let mut closer = self.delim_top;
+        if closer == NIL {
+            return;
+        }
+        while self.delims[closer as usize].prev != NIL {
+            closer = self.delims[closer as usize].prev;
+        }
+
+        while closer != NIL {
+            if !self.delims[closer as usize].can_close {
+                closer = self.delims[closer as usize].next;
+                continue;
+            }
+            let cc = self.delims[closer as usize].ch;
+            let closer_can_open = self.delims[closer as usize].can_open;
+            let closer_orig = self.delims[closer as usize].orig;
+            let base = if cc == SpecialChar::Underscore { 0 } else { 6 };
+            let ob_index =
+                base + (if closer_can_open { 3 } else { 0 }) + (closer_orig.rem_euclid(3)) as usize;
+
+            // Look back for the first matching opener.
+            let mut opener = self.delims[closer as usize].prev;
+            let mut opener_found = false;
+            while opener != NIL && opener != openers_bottom[ob_index] {
+                let od = &self.delims[opener as usize];
+                let odd_match = (closer_can_open || od.can_close)
+                    && closer_orig.rem_euclid(3) != 0
+                    && (od.orig + closer_orig).rem_euclid(3) == 0;
+                if od.ch == cc && od.can_open && !odd_match {
+                    opener_found = true;
+                    break;
+                }
+                opener = od.prev;
+            }
+            let old_closer = closer;
+
+            if opener_found {
+                let use_delims = if self.delims[closer as usize].count >= 2
+                    && self.delims[opener as usize].count >= 2
+                {
+                    2
+                } else {
+                    1
+                };
+                let opener_node = self.delims[opener as usize].node;
+                let closer_node = self.delims[closer as usize].node;
+
+                // Consume delimiters from the inner edges.
+                self.delims[opener as usize].count -= use_delims;
+                self.delims[closer as usize].count -= use_delims;
+                self.shorten_text(opener_node, use_delims, false);
+                self.shorten_text(closer_node, use_delims, true);
+
+                // Gather nodes strictly between opener_node and closer_node
+                // into a child sub-list under a new Emph node, inserted right
+                // after opener_node.
+                let head = self.nodes[opener_node as usize].next;
+                // Detach [head .. closer_node) from the main list.
+                let strong = use_delims == 2;
+                let emph = self.push_node_detached(EmphKind::Emph { strong, head });
+                // Re-link child range: terminate it before closer_node.
+                let mut last_child = NIL;
+                let mut t = head;
+                while t != NIL && t != closer_node {
+                    last_child = t;
+                    t = self.nodes[t as usize].next;
+                }
+                if last_child != NIL {
+                    self.nodes[last_child as usize].next = NIL;
+                }
+                // Splice emph between opener_node and closer_node.
+                self.nodes[opener_node as usize].next = emph;
+                self.nodes[emph as usize].prev = opener_node;
+                self.nodes[emph as usize].next = closer_node;
+                self.nodes[closer_node as usize].prev = emph;
+
+                self.remove_delims_between(opener, closer);
+
+                if self.delims[opener as usize].count == 0 {
+                    self.unlink_node(opener_node);
+                    self.remove_delim(opener);
+                }
+                if self.delims[closer as usize].count == 0 {
+                    self.unlink_node(closer_node);
+                    let next = self.delims[closer as usize].next;
+                    self.remove_delim(closer);
+                    closer = next;
+                }
+            } else {
+                closer = self.delims[closer as usize].next;
+            }
+
+            if !opener_found {
+                openers_bottom[ob_index] = self.delims[old_closer as usize].prev;
+                if !self.delims[old_closer as usize].can_open {
+                    self.remove_delim(old_closer);
+                }
+            }
+        }
+    }
+
+    /// Allocate a node without linking it into the top-level list. Used for
+    /// `Emph` wrappers, which are spliced in manually.
+    fn push_node_detached(&mut self, kind: EmphKind<'src>) -> i32 {
+        let idx = self.nodes.len() as i32;
+        self.nodes.push(EmphNode {
+            kind,
+            prev: NIL,
+            next: NIL,
+        });
+        idx
+    }
+
+    /// Emit the resolved node list starting at `head` (following `next` links)
+    /// into `pool` in post-order, returning the span of the top-level run.
+    ///
+    /// `scratch` is used as an explicit stack: each frame appends its own
+    /// top-level markers to `scratch[mark..]`, recursing into `Emph` children
+    /// first (which flush *their* content to `pool` and return a span). When
+    /// the frame finishes it bulk-copies its markers from `scratch` to `pool`,
+    /// keeping every level's run contiguous — the pool's post-order invariant.
+    fn emit_list(&mut self, head: i32, pool: &mut Vec<Inline<'src>>) -> InlineSpan {
+        let mark = self.scratch.len();
+        let mut t = head;
+        while t != NIL {
+            let node = &self.nodes[t as usize];
+            let next = node.next;
+            match node.kind {
+                EmphKind::Text(s) => {
+                    if !s.is_empty() {
+                        // Merge with the previous emitted text node when the two
+                        // source slices are contiguous (e.g. unmatched `*` plus
+                        // the following word), keeping the pool compact.
+                        if let Some(Inline::Text(prev)) = self.scratch.last_mut()
+                            && let Some(merged) = contiguous_merge(prev, s)
+                        {
+                            *prev = merged;
+                        } else {
+                            self.scratch.push(Inline::Text(s));
+                        }
+                    }
+                }
+                EmphKind::Resolved(inl) => self.scratch.push(inl),
+                EmphKind::Emph { strong, head } => {
+                    let span = self.emit_list(head, pool);
+                    self.scratch.push(if strong {
+                        Inline::Bold(span)
+                    } else {
+                        Inline::Italic(span)
+                    });
+                }
+                EmphKind::Removed => {}
+            }
+            t = next;
+        }
+        let start = pool.len().pool_offset();
+        let len = (self.scratch.len() - mark).pool_offset();
+        pool.extend(self.scratch.drain(mark..));
+        InlineSpan::new(start, len)
+    }
+}
 
 /// Character classification for `CommonMark` emphasis flanking rules.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -124,100 +536,6 @@ impl CharClass {
             | '\u{FF3B}'..='\u{FF40}' // Fullwidth brackets
             | '\u{FF5B}'..='\u{FF65}' // Fullwidth punctuation
         )
-    }
-}
-
-/// What emphasis types remain possible for a given delimiter character.
-/// Tracks delimiter availability per character type, avoiding O(n²)
-/// re-scanning in both top-level and recursive parse calls.
-#[derive(Clone, Copy)]
-enum DelimiterAvail {
-    /// Both bold and italic are still possible.
-    Both,
-    /// Bold failed; only italic can be attempted.
-    ItalicOnly,
-    /// Italic failed; only bold can be attempted.
-    BoldOnly,
-    /// Neither bold nor italic can succeed.
-    None,
-}
-
-impl DelimiterAvail {
-    const fn can_bold(self) -> bool {
-        matches!(self, Self::Both | Self::BoldOnly)
-    }
-
-    const fn can_italic(self) -> bool {
-        matches!(self, Self::Both | Self::ItalicOnly)
-    }
-
-    const fn bold_failed(&mut self) {
-        *self = match *self {
-            Self::Both => Self::ItalicOnly,
-            Self::BoldOnly => Self::None,
-            other => other,
-        };
-    }
-
-    const fn italic_failed(&mut self) {
-        *self = match *self {
-            Self::Both => Self::BoldOnly,
-            Self::ItalicOnly => Self::None,
-            other => other,
-        };
-    }
-
-    const fn from_count(count: usize) -> Self {
-        match count {
-            0 | 1 => Self::None,
-            2 => Self::BoldOnly,
-            _ => Self::Both,
-        }
-    }
-}
-
-struct EmphasisState {
-    star: DelimiterAvail,
-    under: DelimiterAvail,
-}
-
-impl EmphasisState {
-    const fn assume_both() -> Self {
-        Self {
-            star: DelimiterAvail::Both,
-            under: DelimiterAvail::Both,
-        }
-    }
-
-    fn from_bytes(bytes: &[u8]) -> Self {
-        static EMPH_SET: ByteSet =
-            ByteSet::new(&[SpecialChar::Asterisk.byte(), SpecialChar::Underscore.byte()]);
-        let mut stars: u8 = 0;
-        let mut unders: u8 = 0;
-        let mut i = 0;
-        while let Some(pos) = bytes.find_byte_set(i, &EMPH_SET) {
-            if bytes[pos] == SpecialChar::Asterisk {
-                stars = stars.saturating_add(1);
-            } else {
-                unders = unders.saturating_add(1);
-            }
-            if stars >= 4 && unders >= 4 {
-                break;
-            }
-            i = pos + 1;
-        }
-        Self {
-            star: DelimiterAvail::from_count(stars as usize),
-            under: DelimiterAvail::from_count(unders as usize),
-        }
-    }
-
-    const fn avail_mut(&mut self, is_star: bool) -> &mut DelimiterAvail {
-        if is_star {
-            &mut self.star
-        } else {
-            &mut self.under
-        }
     }
 }
 
@@ -309,9 +627,6 @@ impl<'src, const CAP: usize> InlineBuf<'src, CAP> {
     }
 }
 
-/// Threshold below which the emphasis pre-scan costs more than it saves.
-const EMPH_SCAN_THRESHOLD: usize = 256;
-
 /// Stateful parser for a single inline parse pass.
 ///
 /// Holds the input slice and a mutable reference to the output pool so that
@@ -374,6 +689,16 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         pool: &'pool mut Vec<Inline<'src>>,
         defs: &'pool LinkDefs<'src>,
     ) -> InlineSpan {
+        // Join the lines with soft breaks and parse as one context so emphasis
+        // can span line boundaries (`CommonMark` reflows joined paragraph
+        // lines). When any line carries emphasis, route the whole run through
+        // the arena path; otherwise keep the allocation-free buffer path.
+        let any_emph = lines
+            .iter()
+            .any(|l| l.as_bytes().find_byte_set(0, &EMPH_ONLY_SET).is_some());
+        if any_emph {
+            return with_arena(|arena| Self::parse_lines_into_arena(lines, arena, pool, defs));
+        }
         let mut buf = InlineBuf::<CAP>::new();
         for (idx, line) in lines.iter().enumerate() {
             if idx > 0 {
@@ -386,18 +711,34 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 }
                 continue;
             }
-            let emph = if bytes.len() < EMPH_SCAN_THRESHOLD {
-                EmphasisState::assume_both()
-            } else {
-                EmphasisState::from_bytes(bytes)
-            };
             // Reborrow the pool for just this line so the next iteration (and
             // the final flush) can borrow it again.
             let mut parser: InlineParser<'src, '_, MAX_DEPTH, CAP> =
                 InlineParser::new(line, &mut *pool, defs);
-            parser.parse_into_buf(bytes, emph, &mut buf, 0);
+            parser.parse_into_buf(bytes, &mut buf, 0);
         }
         buf.flush_to_pool(pool)
+    }
+
+    /// Parse multiple soft-break-joined lines into one [`EmphArena`], so a
+    /// single emphasis run can span line boundaries, then emit to the pool.
+    fn parse_lines_into_arena(
+        lines: &[&'src str],
+        arena: &mut EmphArena<'src>,
+        pool: &'pool mut Vec<Inline<'src>>,
+        defs: &'pool LinkDefs<'src>,
+    ) -> InlineSpan {
+        arena.reset();
+        for (idx, line) in lines.iter().enumerate() {
+            if idx > 0 {
+                arena.push_node(EmphKind::Resolved(Inline::SoftBreak));
+            }
+            let mut parser: InlineParser<'src, '_, MAX_DEPTH, CAP> =
+                InlineParser::new(line, &mut *pool, defs);
+            parser.scan_line_into_arena(line.as_bytes(), arena, 0);
+        }
+        arena.process_emphasis();
+        arena.emit_list(arena.head, pool)
     }
 
     /// Parse inline elements and store them in the pool. Returns a span.
@@ -426,13 +767,13 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             self.pool.push(Inline::Text(text));
             return InlineSpan::new(start, 1);
         }
-        let emph = if bytes.len() < EMPH_SCAN_THRESHOLD {
-            EmphasisState::assume_both()
-        } else {
-            EmphasisState::from_bytes(bytes)
-        };
+        // Emphasis present? Route through the delimiter-stack algorithm.
+        // Otherwise keep the allocation-free `InlineBuf` fast path.
+        if bytes.find_byte_set(0, &EMPH_ONLY_SET).is_some() {
+            return with_arena(|arena| self.parse_into_arena(bytes, arena, depth));
+        }
         let mut buf = InlineBuf::<CAP>::new();
-        self.parse_into_buf(bytes, emph, &mut buf, depth);
+        self.parse_into_buf(bytes, &mut buf, depth);
         // A paragraph never ends with a dangling break (trailing whitespace is
         // stripped, so `foo  \n` is `foo`, not `foo<br />`).
         if self.strip_lines {
@@ -463,14 +804,10 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         .parse_at_depth(depth)
     }
 
+    /// Fast path for inline content with **no** `*`/`_` emphasis delimiters.
+    /// Collects elements straight into the stack-allocated [`InlineBuf`].
     #[allow(clippy::too_many_lines)]
-    fn parse_into_buf(
-        &mut self,
-        bytes: &[u8],
-        mut emph: EmphasisState,
-        buf: &mut InlineBuf<'src, CAP>,
-        depth: u8,
-    ) {
+    fn parse_into_buf(&mut self, bytes: &[u8], buf: &mut InlineBuf<'src, CAP>, depth: u8) {
         // Paragraph reflow strips indentation at the start of the first line.
         let mut plain_start = if self.strip_lines {
             Self::skip_line_leading_ws(bytes, 0)
@@ -617,19 +954,6 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 continue;
             }
 
-            // Bold/Italic: ** __ * _
-            if let Some((elem, end)) = self.try_parse_emphasis(bytes, i, b, &mut emph, depth) {
-                if let Some(text) = self.input.get(plain_start..i)
-                    && !text.is_empty()
-                {
-                    buf.push(Inline::Text(text));
-                }
-                buf.push(elem);
-                plain_start = end;
-                i = end;
-                continue;
-            }
-
             i += 1;
         }
 
@@ -647,6 +971,265 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         {
             buf.push(Inline::Text(text));
         }
+    }
+
+    /// Scan a run of identical `*`/`_` delimiters at `i`, returning
+    /// `(count, can_open, can_close)` per `CommonMark` flanking rules.
+    fn scan_delims(bytes: &[u8], i: usize, ch: u8) -> (usize, bool, bool) {
+        let mut n = 0;
+        while bytes.get(i + n) == Some(&ch) {
+            n += 1;
+        }
+        let before = Self::char_class_before(bytes, i);
+        let after = Self::char_class_after(bytes, i + n);
+        let before_ws = before == CharClass::Whitespace;
+        let after_ws = after == CharClass::Whitespace;
+        let before_punct = before == CharClass::Punctuation;
+        let after_punct = after == CharClass::Punctuation;
+        let left_flanking = !after_ws && (!after_punct || before_ws || before_punct);
+        let right_flanking = !before_ws && (!before_punct || after_ws || after_punct);
+        let (can_open, can_close) = if ch == SpecialChar::Underscore {
+            (
+                left_flanking && (!right_flanking || before_punct),
+                right_flanking && (!left_flanking || after_punct),
+            )
+        } else {
+            (left_flanking, right_flanking)
+        };
+        (n, can_open, can_close)
+    }
+
+    /// Emphasis-aware parse path (`CommonMark` §6.2). Mirrors
+    /// [`parse_into_buf`](Self::parse_into_buf) but feeds elements into an
+    /// [`EmphArena`]: `*`/`_` runs become delimiter-stack entries, everything
+    /// else becomes a resolved node. After scanning, [`process_emphasis`] pairs
+    /// the delimiters and [`emit_list`] flushes the result to the pool.
+    #[allow(clippy::cast_sign_loss)]
+    fn parse_into_arena(
+        &mut self,
+        bytes: &[u8],
+        arena: &mut EmphArena<'src>,
+        depth: u8,
+    ) -> InlineSpan {
+        arena.reset();
+        self.scan_line_into_arena(bytes, arena, depth);
+        // Drop a dangling trailing break for paragraph reflow.
+        if self.strip_lines
+            && arena.tail != NIL
+            && matches!(
+                arena.nodes[arena.tail as usize].kind,
+                EmphKind::Resolved(Inline::SoftBreak | Inline::HardBreak)
+            )
+        {
+            let tail = arena.tail;
+            arena.unlink_node(tail);
+        }
+        arena.process_emphasis();
+        arena.emit_list(arena.head, self.pool)
+    }
+
+    /// Scan one inline context into `arena` without resetting, resolving, or
+    /// emitting. Shared by single-context and multi-line paths.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap
+    )]
+    fn scan_line_into_arena(&mut self, bytes: &[u8], arena: &mut EmphArena<'src>, depth: u8) {
+        let mut plain_start = if self.strip_lines {
+            Self::skip_line_leading_ws(bytes, 0)
+        } else {
+            0
+        };
+        let mut i = plain_start;
+
+        // Flush pending plain text `[plain_start, upto)` as a text node.
+        macro_rules! flush_text {
+            ($upto:expr) => {
+                if let Some(text) = self.input.get(plain_start..$upto)
+                    && !text.is_empty()
+                {
+                    arena.push_text(text);
+                }
+            };
+        }
+
+        while let Some(pos) = bytes.find_byte_set(i, &SPECIAL_SET) {
+            i = pos;
+            let b = bytes[i];
+
+            if b == SpecialChar::Newline {
+                let (trim_end, is_hard) = self.line_break_pieces(bytes, plain_start, i);
+                flush_text!(trim_end);
+                arena.push_node(EmphKind::Resolved(if is_hard {
+                    Inline::HardBreak
+                } else {
+                    Inline::SoftBreak
+                }));
+                plain_start = i + 1;
+                if self.strip_lines {
+                    plain_start = Self::skip_line_leading_ws(bytes, plain_start);
+                }
+                i = plain_start;
+                continue;
+            }
+
+            if b == SpecialChar::Backslash
+                && let Some(&next) = bytes.get(i + 1)
+                && next.is_ascii_punctuation()
+            {
+                flush_text!(i);
+                // Emit the escaped char (drop the backslash).
+                if let Some(text) = self.input.get(i + 1..i + 2) {
+                    arena.push_node(EmphKind::Resolved(Inline::Text(text)));
+                }
+                plain_start = i + 2;
+                i += 2;
+                continue;
+            }
+
+            if b == SpecialChar::Backtick
+                && let Some((code, end)) = Self::try_parse_inline_code(self.input, bytes, i)
+            {
+                flush_text!(i);
+                arena.push_node(EmphKind::Resolved(Inline::Code(code)));
+                plain_start = end;
+                i = end;
+                continue;
+            }
+
+            // Image (inline then reference).
+            if b == SpecialChar::ExclamationMark
+                && bytes.get(i + 1) == SpecialChar::OpenBracket
+                && let Some((alt, url, title, end)) =
+                    Self::try_parse_bracket_paren(self.input, bytes, i + 1)
+            {
+                flush_text!(i);
+                arena.push_node(EmphKind::Resolved(Inline::Image { alt, url, title }));
+                plain_start = end;
+                i = end;
+                continue;
+            }
+            if b == SpecialChar::ExclamationMark
+                && bytes.get(i + 1) == SpecialChar::OpenBracket
+                && let Some((alt, url, title, end)) = self.try_parse_reference(bytes, i + 1)
+            {
+                flush_text!(i);
+                arena.push_node(EmphKind::Resolved(Inline::Image { alt, url, title }));
+                plain_start = end;
+                i = end;
+                continue;
+            }
+
+            // Inline link.
+            if b == SpecialChar::OpenBracket
+                && let Some((text_str, url, title, end)) =
+                    Self::try_parse_bracket_paren(self.input, bytes, i)
+            {
+                flush_text!(i);
+                let text_span = self.parse_inner(text_str, depth.saturating_add(1));
+                arena.push_node(EmphKind::Resolved(Inline::Link {
+                    text: text_span,
+                    url,
+                    title,
+                }));
+                plain_start = end;
+                i = end;
+                continue;
+            }
+            // Reference link.
+            if b == SpecialChar::OpenBracket
+                && let Some((text_str, url, title, end)) = self.try_parse_reference(bytes, i)
+            {
+                flush_text!(i);
+                let text_span = self.parse_inner(text_str, depth.saturating_add(1));
+                arena.push_node(EmphKind::Resolved(Inline::Link {
+                    text: text_span,
+                    url,
+                    title,
+                }));
+                plain_start = end;
+                i = end;
+                continue;
+            }
+
+            // Autolink / raw HTML.
+            if b == SpecialChar::LessThan
+                && let Some((elem, end)) = Self::try_parse_angle(self.input, bytes, i)
+            {
+                flush_text!(i);
+                arena.push_node(EmphKind::Resolved(elem));
+                plain_start = end;
+                i = end;
+                continue;
+            }
+
+            // Emphasis delimiter run.
+            if b == SpecialChar::Asterisk || b == SpecialChar::Underscore {
+                let (count, can_open, can_close) = Self::scan_delims(bytes, i, b);
+                debug_assert!(count > 0);
+                flush_text!(i);
+                let src = self.input.get(i..i + count).unwrap_or_default();
+                if can_open || can_close {
+                    arena.push_delim(src, b, count as i32, can_open, can_close);
+                } else {
+                    arena.push_text(src);
+                }
+                plain_start = i + count;
+                i += count;
+                continue;
+            }
+
+            i += 1;
+        }
+
+        let tail = if self.strip_lines {
+            self.input
+                .get(plain_start..)
+                .map(|t| t.trim_end_matches([' ', '\t']))
+        } else {
+            self.input.get(plain_start..)
+        };
+        if let Some(text) = tail
+            && !text.is_empty()
+        {
+            arena.push_text(text);
+        }
+    }
+
+    /// Compute the text-slice end and break kind at a newline position.
+    /// Hard break if preceded by trailing `\` or 2+ spaces; soft otherwise.
+    /// Returns `(trim_end, is_hard)` where `plain_start..trim_end` is the text
+    /// to emit before the break.
+    #[inline]
+    fn line_break_pieces(
+        &self,
+        bytes: &[u8],
+        plain_start: usize,
+        newline_pos: usize,
+    ) -> (usize, bool) {
+        let preceding = bytes.get(plain_start..newline_pos).unwrap_or_default();
+        let (mut trim_end, is_hard) = if preceding.last() == SpecialChar::Backslash {
+            (newline_pos - 1, true)
+        } else {
+            let mut spaces = 0;
+            let mut j = preceding.len();
+            while j > 0 && preceding[j - 1] == SpecialChar::Space {
+                spaces += 1;
+                j -= 1;
+            }
+            if spaces >= 2 {
+                (newline_pos - spaces, true)
+            } else {
+                (newline_pos, false)
+            }
+        };
+        if self.strip_lines {
+            while trim_end > plain_start && matches!(bytes.get(trim_end - 1), Some(b' ' | b'\t')) {
+                trim_end -= 1;
+            }
+        }
+        (trim_end, is_hard)
     }
 
     /// Emit a hard or soft line break at a newline position.
@@ -693,74 +1276,6 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         } else {
             Inline::SoftBreak
         });
-    }
-
-    #[inline]
-    fn try_parse_emphasis(
-        &mut self,
-        bytes: &[u8],
-        i: usize,
-        b: u8,
-        emph: &mut EmphasisState,
-        depth: u8,
-    ) -> Option<(Inline<'src>, usize)> {
-        let is_star = b == SpecialChar::Asterisk;
-        if !is_star && b != SpecialChar::Underscore {
-            return None;
-        }
-        // Depth limit: treat as plain text to prevent stack overflow.
-        if depth >= MAX_DEPTH {
-            return None;
-        }
-        let avail = emph.avail_mut(is_star);
-        let open_run = if is_star {
-            SpecialChar::Asterisk.count_leading_bytes(&bytes[i..])
-        } else {
-            SpecialChar::Underscore.count_leading_bytes(&bytes[i..])
-        };
-
-        // Triple runs (*** or ___) can open/close both emphasis and strong
-        // emphasis. Match them as strong nested inside emphasis so that
-        // ***text*** becomes Italic(Bold(text)) instead of being split.
-        if open_run >= 3 && avail.can_bold() && avail.can_italic() {
-            if let Some((inner, end)) = Self::try_parse_delimited(self.input, bytes, i, b, 3) {
-                // Only match when the closing run is exactly three characters,
-                // leaving longer runs (e.g. ****text****) to the strong/italic
-                // logic below.
-                let close_run_start = end - 3;
-                let exact_close =
-                    bytes.get(close_run_start - 1) != Some(&b) && bytes.get(end) != Some(&b);
-                if exact_close {
-                    let inner_span = self.parse_inner(inner, depth + 1);
-                    let bold_start = self.pool.len().pool_offset();
-                    self.pool.push(Inline::Bold(inner_span));
-                    let bold_span = InlineSpan::new(bold_start, 1);
-                    return Some((Inline::Italic(bold_span), end));
-                }
-            }
-            // A triple run exists but couldn't be matched; strong and italic
-            // may still succeed from the same starting position.
-        }
-
-        // Bold: ** or __
-        if avail.can_bold() && bytes.get(i + 1) == Some(&b) {
-            if let Some((inner, end)) = Self::try_parse_delimited(self.input, bytes, i, b, 2) {
-                let span = self.parse_inner(inner, depth + 1);
-                return Some((Inline::Bold(span), end));
-            }
-            avail.bold_failed();
-        }
-
-        // Italic: * or _
-        if avail.can_italic() {
-            if let Some((inner, end)) = Self::try_parse_delimited(self.input, bytes, i, b, 1) {
-                let span = self.parse_inner(inner, depth + 1);
-                return Some((Inline::Italic(span), end));
-            }
-            avail.italic_failed();
-        }
-
-        None
     }
 
     /// Find the position of a matching closing delimiter, handling backslash
@@ -1016,100 +1531,6 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             .and_then(|s| s.chars().next())
             .unwrap_or(' ');
         CharClass::of(ch)
-    }
-
-    fn try_parse_delimited(
-        input: &'src str,
-        bytes: &[u8],
-        start: usize,
-        marker: u8,
-        count: usize,
-    ) -> Option<(&'src str, usize)> {
-        let inner_start = start + count;
-        bytes.get(inner_start)?;
-
-        let is_star = marker == SpecialChar::Asterisk;
-
-        // CommonMark §6.2 — emphasis flanking rules:
-        // A left-flanking delimiter run must not be followed by whitespace,
-        // and must not be followed by punctuation unless preceded by whitespace
-        // or punctuation. For `_`, it must also not be right-flanking (unless
-        // preceded by punctuation), preventing intra-word emphasis.
-        let before_open = Self::char_class_before(bytes, start);
-        let after_open = Self::char_class_after(bytes, inner_start);
-
-        let left_flanking = after_open != CharClass::Whitespace
-            && (after_open != CharClass::Punctuation || before_open != CharClass::Other);
-        if !left_flanking {
-            return None;
-        }
-        if !is_star {
-            // _ can open only if left-flanking AND (not right-flanking OR preceded by punctuation)
-            let right_flanking_open = before_open != CharClass::Whitespace
-                && (before_open != CharClass::Punctuation || after_open != CharClass::Other);
-            if right_flanking_open && before_open != CharClass::Punctuation {
-                return None;
-            }
-        }
-
-        // Select pre-computed static ByteSet instead of building one each call.
-        let delim_set = if is_star {
-            &STAR_DELIM_SET
-        } else {
-            &UNDER_DELIM_SET
-        };
-
-        let mut i = inner_start;
-        while let Some(pos) = bytes.find_byte_set(i, delim_set) {
-            i = pos;
-            let b = bytes[i];
-
-            if b == SpecialChar::Backslash && bytes.get(i + 1).is_some_and(u8::is_ascii_punctuation)
-            {
-                i += 2;
-                continue;
-            }
-
-            if b != marker {
-                i += 1;
-                continue;
-            }
-
-            // Found a marker byte — check for a valid closing run.
-            let all_match = (1..count).all(|j| bytes.get(i + j) == Some(&marker));
-            if !all_match {
-                i += 1;
-                continue;
-            }
-
-            let close_end = i + count;
-            let before_close = Self::char_class_before(bytes, i);
-            let after_close = Self::char_class_after(bytes, close_end);
-
-            // CommonMark §6.2 — closing delimiter must be right-flanking:
-            // not preceded by whitespace, and not preceded by punctuation
-            // unless followed by whitespace or punctuation. For `_`, must
-            // also not be left-flanking (unless followed by punctuation).
-            let right_flanking = before_close != CharClass::Whitespace
-                && (before_close != CharClass::Punctuation || after_close != CharClass::Other);
-            if !right_flanking {
-                i += 1;
-                continue;
-            }
-            if !is_star {
-                // _ can close only if right-flanking AND (not left-flanking OR followed by punctuation)
-                let left_flanking_close = after_close != CharClass::Whitespace
-                    && (after_close != CharClass::Punctuation || before_close != CharClass::Other);
-                if left_flanking_close && after_close != CharClass::Punctuation {
-                    i += 1;
-                    continue;
-                }
-            }
-
-            return Some((input.get(inner_start..i)?, close_end));
-        }
-
-        None
     }
 
     /// Parse an angle-bracket construct at `start` (a `<`): an absolute-URI
