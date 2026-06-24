@@ -201,4 +201,44 @@ to lock in progress and prevent regressions.
   `find_matching_close` change within ~3%, others render/block-only).
   Remaining 32: link *nesting* (518/519/520/532/533), block containers
   (tabs 8, blockquotes 5, lists 9, HTML-in-container 2), misc (540 case-fold).
+- 2026-06-24: Push to 98.3% — link nesting + block-container batch (95.1% →
+  98.3% over ten commits). Five sections reached perfect this batch.
+  - **No-link-in-link** (95.1% → 95.9%, Links 84→89): after parsing a link's
+    bracket text, scan its pool span (recursing through `Bold`/`Italic` child
+    spans, since the pool is post-order) for a nested `Link`; on a hit the
+    outer `[` is literal — truncate the pool and rescan. Both parse paths,
+    inline + reference links. Fixes 518/519/520/532/533 (`src/inline.rs`).
+  - **Tabs as columns** (95.9% → 96.3%, Tabs 4→7): `strip_indent` advances a
+    tab to the next 4-column stop instead of counting only spaces, so a
+    leading tab opens/continues indented code (1/2/8). Render-time strip
+    already expands tabs (`src/block.rs`).
+  - **List structure** (96.3% → 96.6%, Thematic breaks 19/19): a `* * *` line
+    in a list is a thematic break, not a bullet; blank lines between sibling
+    items don't split the list (dropped the `item_blanks >= 2` break). Fixes
+    60/306.
+  - **Blockquote lazy continuation across nesting** (96.6% → 97.2%): the
+    nested-quote collector in `resolve_blocks` absorbs lazy paragraph lines and
+    recurses, carrying them to the innermost paragraph (`is_lazy_paragraph_tail`
+    descends nested `>`). Fixes 250/251.
+  - **List loose/tight + empty item** (97.2% → 97.5%, List items 48/48): blank
+    lines inside a fenced code block within an item don't loosen the list
+    (`update_fence`); an empty item followed by a blank line ends there
+    (`empty_then_blank`). Fixes 318/280.
+  - **Blockquote blank-then-lazy** (97.5% → 97.7%): the fold path's
+    `InBlockquote` tracks inner paragraph/fence state; a blank `>` line ends
+    lazy continuation (249).
+  - **Sharp-s case fold** (97.7% → 97.9%, Links 90/90): `normalize_label`
+    folds `ß`/`ẞ` to `ss` so `[ẞ]` matches `[SS]` (540, `src/link_def.rs`).
+  - **HTML blocks in containers** (97.9% → 98.2%, HTML blocks 44/44):
+    `resolve_blocks` detects HTML blocks via `html_block_start` and collects
+    them into a new `Section::HtmlLines` (line-pool backed). Fixes 174/175.
+  - **Blockquote inner-state lazy rule** (98.2% → 98.3%, Block quotes 25/25):
+    generalized to `(para_open, fence)`; lazy continuation only with an open
+    inner paragraph (not after blank/indented-code/fence). Fixes 236/237/250.
+  Perf gate held throughout (same-session A/B vs the pre-batch commit; the
+  no-link-in-link pool scan and the column `strip_indent` are within noise).
+  Remaining 11: tabs needing *partial* expansion inside containers (4/5/6/7,
+  needs owned strings), link-ref-defs defined inside containers (218/317),
+  list-item lazy continuation (292), nested-sublist tightness/indent
+  (307/312/319), setext underline after a blockquote lazy line (93).
   (tabs, lists, blockquotes).
