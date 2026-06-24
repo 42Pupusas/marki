@@ -185,6 +185,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     self.walk_sections(self.child_sections(*children));
                 }
                 Section::CodeBlock { .. }
+                | Section::IndentedCode { .. }
                 | Section::HtmlBlock { .. }
                 | Section::HorizontalRule => {}
             }

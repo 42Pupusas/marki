@@ -38,6 +38,23 @@ fn escape_href(s: &str, out: &mut String) {
     }
 }
 
+/// Strip the four-space (or single-tab) indentation prefix from one line of an
+/// indented code block (`CommonMark` §4.4).
+fn strip_code_indent(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut col = 0;
+    let mut i = 0;
+    while i < bytes.len() && col < 4 {
+        match bytes[i] {
+            b' ' => col += 1,
+            b'\t' => col += 4 - (col % 4),
+            _ => break,
+        }
+        i += 1;
+    }
+    &line[i..]
+}
+
 impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     MarkdownFile<'_, MAX_INLINE_DEPTH, INLINE_STACK_CAP>
 {
@@ -89,6 +106,20 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     out.push('\n');
                 }
                 out.push_str("</code></pre>\n");
+            }
+            Section::IndentedCode { code } => {
+                out.push_str("<pre><code>");
+                // Strip up to four leading spaces (or one leading tab) from
+                // each line; the span is verbatim source otherwise.
+                let mut first = true;
+                for line in code.split('\n') {
+                    if !first {
+                        out.push('\n');
+                    }
+                    first = false;
+                    escape_html(strip_code_indent(line), out);
+                }
+                out.push_str("\n</code></pre>\n");
             }
             Section::UnorderedList { items } => {
                 out.push_str("<ul>\n");

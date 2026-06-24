@@ -121,6 +121,12 @@ pub enum Section<'src> {
         language: Option<&'src str>,
         code: &'src str,
     },
+    /// An indented code block (`CommonMark` §4.4). `code` is the verbatim
+    /// source span, still carrying its leading indentation; the renderer
+    /// strips up to four leading spaces per line.
+    IndentedCode {
+        code: &'src str,
+    },
     UnorderedList {
         items: SpanSlice,
     },

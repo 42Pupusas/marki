@@ -1378,11 +1378,13 @@ fn test_heading_indented_3_spaces() {
 }
 
 #[test]
-fn test_heading_indented_4_spaces_is_paragraph() {
+fn test_heading_indented_4_spaces_is_indented_code() {
+    // CommonMark §4.4 example 69: four leading spaces makes an indented code
+    // block, not a heading.
     let md: MarkdownFile<'_> = MarkdownFile::parse("    # Not a heading");
     match &md.sections[0] {
-        Section::Paragraph { .. } => {}
-        other => panic!("expected paragraph, got {other:?}"),
+        Section::IndentedCode { .. } => {}
+        other => panic!("expected indented code, got {other:?}"),
     }
 }
 
@@ -1393,11 +1395,44 @@ fn test_hr_indented_3_spaces() {
 }
 
 #[test]
-fn test_hr_indented_4_spaces_is_paragraph() {
+fn test_indented_code_block_basic() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("    a simple\n      indented code block");
+    assert_eq!(
+        md.sections,
+        vec![Section::IndentedCode {
+            code: "    a simple\n      indented code block",
+        }]
+    );
+    assert_eq!(
+        md.to_html(),
+        "<pre><code>a simple\n  indented code block\n</code></pre>\n"
+    );
+}
+
+#[test]
+fn test_indented_code_block_interior_blanks() {
+    // Interior blank lines are kept; trailing blanks are trimmed.
+    let md: MarkdownFile<'_> =
+        MarkdownFile::parse("    chunk1\n\n    chunk2\n  \n \n \n    chunk3\n");
+    assert_eq!(
+        md.to_html(),
+        "<pre><code>chunk1\n\nchunk2\n\n\n\nchunk3\n</code></pre>\n"
+    );
+}
+
+#[test]
+fn test_indented_code_does_not_interrupt_paragraph() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("Foo\n    bar");
+    assert_eq!(md.sections.len(), 1);
+    assert!(matches!(md.sections[0], Section::Paragraph { .. }));
+}
+
+#[test]
+fn test_hr_indented_4_spaces_is_indented_code() {
     let md: MarkdownFile<'_> = MarkdownFile::parse("    ---");
     match &md.sections[0] {
-        Section::Paragraph { .. } => {}
-        other => panic!("expected paragraph, got {other:?}"),
+        Section::IndentedCode { .. } => {}
+        other => panic!("expected indented code, got {other:?}"),
     }
 }
 
@@ -1416,11 +1451,11 @@ fn test_unordered_list_indented_2_spaces() {
 }
 
 #[test]
-fn test_unordered_list_indented_4_spaces_is_paragraph() {
+fn test_unordered_list_indented_4_spaces_is_indented_code() {
     let md: MarkdownFile<'_> = MarkdownFile::parse("    - not a list");
     match &md.sections[0] {
-        Section::Paragraph { .. } => {}
-        other => panic!("expected paragraph, got {other:?}"),
+        Section::IndentedCode { .. } => {}
+        other => panic!("expected indented code, got {other:?}"),
     }
 }
 
@@ -1448,11 +1483,11 @@ fn test_blockquote_indented_3_spaces() {
 }
 
 #[test]
-fn test_blockquote_indented_4_spaces_is_paragraph() {
+fn test_blockquote_indented_4_spaces_is_indented_code() {
     let md: MarkdownFile<'_> = MarkdownFile::parse("    > not a quote");
     match &md.sections[0] {
-        Section::Paragraph { .. } => {}
-        other => panic!("expected paragraph, got {other:?}"),
+        Section::IndentedCode { .. } => {}
+        other => panic!("expected indented code, got {other:?}"),
     }
 }
 
@@ -1469,12 +1504,13 @@ fn test_code_fence_indented_3_spaces() {
 }
 
 #[test]
-fn test_code_fence_indented_4_spaces_is_paragraph() {
+fn test_code_fence_indented_4_spaces_is_indented_code() {
     let md: MarkdownFile<'_> = MarkdownFile::parse("    ```\nnot code\n    ```");
-    // 4-space indent: not a code fence, treated as paragraph text
+    // 4-space indent: not a code fence; the whole thing is an indented code
+    // block (CommonMark §4.4 example 134).
     match &md.sections[0] {
-        Section::Paragraph { .. } => {}
-        other => panic!("expected paragraph, got {other:?}"),
+        Section::IndentedCode { .. } => {}
+        other => panic!("expected indented code, got {other:?}"),
     }
 }
 

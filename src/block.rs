@@ -25,6 +25,9 @@ enum RawSection<'src> {
         language: Option<&'src str>,
         code: &'src str,
     },
+    IndentedCode {
+        code: &'src str,
+    },
     UnorderedList {
         items_start: u32,
         items_len: u32,
@@ -75,12 +78,22 @@ enum Accumulator<'src> {
     InParagraph {
         content: &'src str,
     },
+    /// An indented code block (`CommonMark` §4.4). `start` is the byte offset
+    /// of the first content line; `last_nonblank_end` is the end offset of the
+    /// most recent non-blank line, so trailing blank lines are trimmed on
+    /// flush.
+    InIndentedCode {
+        start: usize,
+        last_nonblank_end: usize,
+    },
 }
 
 impl<'src> Accumulator<'src> {
     const fn flush(self, lines_pool_len: u32) -> Option<RawSection<'src>> {
         match self {
-            Self::Empty => None,
+            // Empty produces nothing; indented code needs `input` to slice its
+            // span, so it is handled directly in `flush_acc` and never here.
+            Self::Empty | Self::InIndentedCode { .. } => None,
             Self::InBlockquote { lines_start } => Some(RawSection::Blockquote {
                 lines_start,
                 lines_len: lines_pool_len - lines_start,
@@ -362,6 +375,9 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 }
                 RawSection::CodeBlock { language, code } => {
                     sections.push(Section::CodeBlock { language, code });
+                }
+                RawSection::IndentedCode { code } => {
+                    sections.push(Section::IndentedCode { code });
                 }
                 RawSection::UnorderedList {
                     items_start,
@@ -819,6 +835,19 @@ impl<'src> ParseCtx<'src> {
 
     /// Flush an accumulator into this context's section list.
     fn flush_acc(&mut self, acc: Accumulator<'src>) {
+        if let Accumulator::InIndentedCode {
+            start,
+            last_nonblank_end,
+        } = acc
+        {
+            // The code content is the contiguous span from the first content
+            // line to the end of the last non-blank line. Leading indentation
+            // is preserved here and stripped (up to four spaces) at render
+            // time.
+            let code = self.input.get(start..last_nonblank_end).unwrap_or("");
+            self.sections.push(RawSection::IndentedCode { code });
+            return;
+        }
         let pool_len = self.lines.len().lines_offset();
         if let Some(section) = acc.flush(pool_len) {
             self.sections.push(section);
@@ -837,10 +866,38 @@ impl<'src> ParseCtx<'src> {
         pos: usize,
         line_end: usize,
     ) -> Accumulator<'src> {
-        let first = self.bytes.get(pos).copied();
+        let blank = self.bytes.is_blank_line(pos, line_end);
 
-        if first.is_some_and(|b| b.is_ascii_whitespace()) && self.bytes.is_blank_line(pos, line_end)
+        // Indented code blocks (CommonMark §4.4) own the blank-line handling:
+        // interior blank lines stay part of the block (trimmed only at the
+        // end), and a non-blank line with <4 spaces of indent closes it.
+        if let Accumulator::InIndentedCode {
+            start,
+            last_nonblank_end,
+        } = acc
         {
+            if blank {
+                return Accumulator::InIndentedCode {
+                    start,
+                    last_nonblank_end,
+                };
+            }
+            if self.bytes[pos..line_end].strip_indent().is_none() {
+                // Still indented ≥4 spaces: extend the block.
+                return Accumulator::InIndentedCode {
+                    start,
+                    last_nonblank_end: line_end,
+                };
+            }
+            // Dedented non-blank line: the code block ends here.
+            self.flush_acc(Accumulator::InIndentedCode {
+                start,
+                last_nonblank_end,
+            });
+            return self.fold_block_element(Accumulator::Empty, pos, line_end);
+        }
+
+        if blank {
             self.flush_acc(acc);
             return Accumulator::Empty;
         }
@@ -860,13 +917,23 @@ impl<'src> ParseCtx<'src> {
         // Strip 0-3 spaces of optional indentation (CommonMark §4).
         // Lines with 4+ leading spaces cannot start a block-level construct.
         let Some(indent) = self.bytes[pos..line_end].strip_indent() else {
-            // 4+ leading spaces: only valid as paragraph text or
-            // blockquote lazy continuation.
+            // 4+ leading spaces.
             if let Accumulator::InBlockquote { lines_start } = acc {
+                // Blockquote lazy continuation.
                 self.lines.push(self.input.get(pos..line_end).unwrap_or(""));
                 return Accumulator::InBlockquote { lines_start };
             }
-            return self.fold_paragraph(acc, pos, line_end);
+            if matches!(acc, Accumulator::InParagraph { .. }) {
+                // An indented line cannot interrupt a paragraph (CommonMark
+                // §4.4): it is lazy paragraph continuation text.
+                return self.fold_paragraph(acc, pos, line_end);
+            }
+            // Otherwise this opens an indented code block.
+            self.flush_acc(acc);
+            return Accumulator::InIndentedCode {
+                start: pos,
+                last_nonblank_end: line_end,
+            };
         };
         let spos = pos + indent;
         let line_bytes = &self.bytes[spos..line_end];
