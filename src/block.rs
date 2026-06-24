@@ -1,7 +1,7 @@
 use crate::OffsetExt;
 use crate::inline::InlineParser;
 use crate::link_def::{LinkDefs, normalize_label, scan_link_def};
-use crate::section::{InlineSpan, OrderedListDelimiter, Section, SpanSlice};
+use crate::section::{InlineSpan, OrderedListDelimiter, Section, SectionRange, SpanSlice};
 use crate::simd::ByteSliceExt;
 use crate::special_char::SpecialChar;
 use crate::{Inline, MarkdownFile};
@@ -336,6 +336,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         ctx: &ParseCtx<'src>,
         pool: &mut Vec<Inline<'src>>,
         span_pool: &mut Vec<InlineSpan>,
+        section_pool: &mut Vec<Section<'src>>,
     ) -> Vec<Section<'src>> {
         let lines = &ctx.lines;
         let defs = &ctx.defs;
@@ -413,17 +414,9 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     let raw_lines = lines
                         .get(lines_start as usize..(lines_start + lines_len) as usize)
                         .unwrap_or(&[]);
-                    let start = pool.len().pool_offset();
-                    for (i, line) in raw_lines.iter().enumerate() {
-                        if i > 0 {
-                            pool.push(Inline::Text("\n"));
-                        }
-                        InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_flat_into_configured(line, pool, defs);
-                    }
-                    let len = pool.len().pool_offset() - start;
-                    sections.push(Section::Blockquote {
-                        content: InlineSpan::new(start, len),
-                    });
+                    let children =
+                        Self::resolve_quote(raw_lines, pool, section_pool, defs);
+                    sections.push(Section::Blockquote { children });
                 }
                 RawSection::HtmlBlock { html } => {
                     sections.push(Section::HtmlBlock { html });
@@ -436,6 +429,125 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         sections
     }
 
+    /// Recursively resolve the dequoted content lines of a blockquote into a
+    /// range of child sections, appended to `section_pool`. Handles the block
+    /// constructs representable without owned storage: blank-line-separated
+    /// paragraphs (multi-line, joined by soft breaks), ATX headings, thematic
+    /// breaks, and nested blockquotes (via recursion). Other constructs fall
+    /// back to paragraph text.
+    fn resolve_quote(
+        quote_lines: &[&'src str],
+        pool: &mut Vec<Inline<'src>>,
+        section_pool: &mut Vec<Section<'src>>,
+        defs: &LinkDefs<'src>,
+    ) -> SectionRange {
+        // Build child sections in a local Vec first; the recursion may append
+        // to `section_pool` for *its own* nested quotes, so we cannot hold a
+        // stable range there until we finish. We reserve our slot at the end.
+        let mut children: Vec<Section<'src>> = Vec::new();
+        // Pending paragraph lines (still to be flushed as one paragraph).
+        let mut para: Vec<&'src str> = Vec::new();
+        // Pending nested-quote lines (dequoted one `>` level).
+        let mut nested: Vec<&'src str> = Vec::new();
+
+        let flush_para =
+            |para: &mut Vec<&'src str>,
+             children: &mut Vec<Section<'src>>,
+             pool: &mut Vec<Inline<'src>>| {
+                if para.is_empty() {
+                    return;
+                }
+                let start = pool.len().pool_offset();
+                for (i, line) in para.iter().enumerate() {
+                    if i > 0 {
+                        pool.push(Inline::SoftBreak);
+                    }
+                    InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_flat_into_configured(
+                        line, pool, defs,
+                    );
+                }
+                let len = pool.len().pool_offset() - start;
+                children.push(Section::Paragraph {
+                    content: InlineSpan::new(start, len),
+                });
+                para.clear();
+            };
+
+        let mut i = 0;
+        while i < quote_lines.len() {
+            let line = quote_lines[i];
+            let bytes = line.as_bytes();
+            let indent = bytes.strip_indent().unwrap_or(0);
+            let body = &bytes[indent.min(bytes.len())..];
+
+            // Nested blockquote line: collect consecutive `>`-prefixed lines and
+            // recurse once the run ends.
+            if body.first() == SpecialChar::GreaterThan {
+                flush_para(&mut para, &mut children, pool);
+                let after = indent + 1;
+                let content = if bytes.get(after) == SpecialChar::Space {
+                    line.get(after + 1..).unwrap_or("")
+                } else {
+                    line.get(after..).unwrap_or("")
+                };
+                nested.push(content);
+                i += 1;
+                continue;
+            }
+            // A non-`>` line ends any pending nested quote.
+            if !nested.is_empty() {
+                let range = Self::resolve_quote(&nested, pool, section_pool, defs);
+                children.push(Section::Blockquote { children: range });
+                nested.clear();
+            }
+
+            // Blank line: paragraph break.
+            if body.is_empty() || body.iter().all(u8::is_ascii_whitespace) {
+                flush_para(&mut para, &mut children, pool);
+                i += 1;
+                continue;
+            }
+
+            // ATX heading.
+            if body.first() == SpecialChar::Hash
+                && let Some((level, text)) = body.try_parse_heading(line, indent)
+            {
+                flush_para(&mut para, &mut children, pool);
+                let content =
+                    InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_configured(
+                        text, pool, defs,
+                    );
+                children.push(Section::Heading { level, content });
+                i += 1;
+                continue;
+            }
+
+            // Thematic break.
+            if body.is_horizontal_rule() {
+                flush_para(&mut para, &mut children, pool);
+                children.push(Section::HorizontalRule);
+                i += 1;
+                continue;
+            }
+
+            // Otherwise: paragraph text (trim the 0-3 space indent).
+            para.push(line.get(indent..).unwrap_or(line));
+            i += 1;
+        }
+
+        flush_para(&mut para, &mut children, pool);
+        if !nested.is_empty() {
+            let range = Self::resolve_quote(&nested, pool, section_pool, defs);
+            children.push(Section::Blockquote { children: range });
+        }
+
+        // Append the collected children to the shared pool contiguously.
+        let start = section_pool.len().pool_offset();
+        section_pool.extend(children);
+        let len = section_pool.len().pool_offset() - start;
+        SectionRange::new(start, len)
+    }
+
     #[must_use]
     pub fn parse(input: &'src str) -> Self {
         // --- Pass 1: block-level parsing (no inline work) ---
@@ -444,12 +556,15 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         // --- Pass 2: inline parsing ---
         let mut pool = Vec::with_capacity(input.len() / 20);
         let mut span_pool = Vec::with_capacity(input.len() / 100 + 1);
-        let sections = Self::resolve_inlines(&ctx, &mut pool, &mut span_pool);
+        let mut section_pool = Vec::new();
+        let sections =
+            Self::resolve_inlines(&ctx, &mut pool, &mut span_pool, &mut section_pool);
 
         Self {
             sections,
             pool,
             span_pool,
+            section_pool,
         }
     }
 }

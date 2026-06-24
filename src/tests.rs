@@ -13,6 +13,26 @@ impl<'md, 'src> Checker<'md, 'src> {
         Self { md }
     }
 
+    /// Assert that a blockquote contains exactly one paragraph child, and
+    /// return that paragraph's inline span for further checking.
+    fn quote_single_paragraph(&self, section: &Section<'src>) -> InlineSpan {
+        match section {
+            Section::Blockquote { children } => {
+                let kids = self.md.child_sections(*children);
+                assert_eq!(
+                    kids.len(),
+                    1,
+                    "expected blockquote with one child, got {kids:?}"
+                );
+                match kids[0] {
+                    Section::Paragraph { content } => content,
+                    ref other => panic!("expected paragraph in blockquote, got {other:?}"),
+                }
+            }
+            other => panic!("expected blockquote, got {other:?}"),
+        }
+    }
+
     /// Assert a span contains exactly `expected` inline elements.
     fn check_span(&self, span: InlineSpan, expected: &[Expect]) {
         let actual = self.md.inlines(span);
@@ -226,17 +246,44 @@ fn test_ordered_list() {
 #[test]
 fn test_blockquote() {
     let md: MarkdownFile<'_> = MarkdownFile::parse("> line one\n> line two");
-    match &md.sections[0] {
-        Section::Blockquote { content } => Checker::new(&md).check_span(
-            *content,
-            &[
-                Expect::Text("line one"),
-                Expect::Text("\n"),
-                Expect::Text("line two"),
-            ],
-        ),
+    let checker = Checker::new(&md);
+    let content = checker.quote_single_paragraph(&md.sections[0]);
+    checker.check_span(
+        content,
+        &[
+            Expect::Text("line one"),
+            Expect::SoftBreak,
+            Expect::Text("line two"),
+        ],
+    );
+}
+
+#[test]
+fn test_blockquote_nested() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("> outer\n> > inner");
+    let kids = md.child_sections(match &md.sections[0] {
+        Section::Blockquote { children } => *children,
         other => panic!("expected blockquote, got {other:?}"),
-    }
+    });
+    assert_eq!(kids.len(), 2, "got {kids:?}");
+    assert!(matches!(kids[0], Section::Paragraph { .. }));
+    assert!(
+        matches!(kids[1], Section::Blockquote { .. }),
+        "expected nested blockquote, got {:?}",
+        kids[1]
+    );
+}
+
+#[test]
+fn test_blockquote_with_heading() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("> # Foo\n> bar");
+    let kids = md.child_sections(match &md.sections[0] {
+        Section::Blockquote { children } => *children,
+        other => panic!("expected blockquote, got {other:?}"),
+    });
+    assert_eq!(kids.len(), 2, "got {kids:?}");
+    assert!(matches!(kids[0], Section::Heading { level: 1, .. }));
+    assert!(matches!(kids[1], Section::Paragraph { .. }));
 }
 
 #[test]
@@ -272,11 +319,10 @@ fn test_mixed_document() {
         }
         other => panic!("expected list, got {other:?}"),
     }
-    match &md.sections[3] {
-        Section::Blockquote { content } => {
-            Checker::new(&md).check_span(*content, &Expect::text("quote"));
-        }
-        other => panic!("expected blockquote, got {other:?}"),
+    {
+        let checker = Checker::new(&md);
+        let content = checker.quote_single_paragraph(&md.sections[3]);
+        checker.check_span(content, &Expect::text("quote"));
     }
     assert_eq!(md.sections[4], Section::HorizontalRule);
     assert_eq!(
@@ -986,46 +1032,43 @@ fn test_hard_break_with_inline() {
 #[test]
 fn test_blockquote_lazy_continuation() {
     let md: MarkdownFile<'_> = MarkdownFile::parse("> line one\ncontinuation");
-    match &md.sections[0] {
-        Section::Blockquote { content } => Checker::new(&md).check_span(
-            *content,
-            &[
-                Expect::Text("line one"),
-                Expect::Text("\n"),
-                Expect::Text("continuation"),
-            ],
-        ),
-        other => panic!("expected blockquote, got {other:?}"),
-    }
+    let checker = Checker::new(&md);
+    let content = checker.quote_single_paragraph(&md.sections[0]);
+    checker.check_span(
+        content,
+        &[
+            Expect::Text("line one"),
+            Expect::SoftBreak,
+            Expect::Text("continuation"),
+        ],
+    );
 }
 
 #[test]
 fn test_blockquote_lazy_multiple_lines() {
     let md: MarkdownFile<'_> = MarkdownFile::parse("> first\nsecond\nthird");
-    match &md.sections[0] {
-        Section::Blockquote { content } => Checker::new(&md).check_span(
-            *content,
-            &[
-                Expect::Text("first"),
-                Expect::Text("\n"),
-                Expect::Text("second"),
-                Expect::Text("\n"),
-                Expect::Text("third"),
-            ],
-        ),
-        other => panic!("expected blockquote, got {other:?}"),
-    }
+    let checker = Checker::new(&md);
+    let content = checker.quote_single_paragraph(&md.sections[0]);
+    checker.check_span(
+        content,
+        &[
+            Expect::Text("first"),
+            Expect::SoftBreak,
+            Expect::Text("second"),
+            Expect::SoftBreak,
+            Expect::Text("third"),
+        ],
+    );
 }
 
 #[test]
 fn test_blockquote_lazy_stops_at_heading() {
     let md: MarkdownFile<'_> = MarkdownFile::parse("> quoted\n# Heading");
     assert_eq!(md.sections.len(), 2);
-    match &md.sections[0] {
-        Section::Blockquote { content } => {
-            Checker::new(&md).check_span(*content, &Expect::text("quoted"));
-        }
-        other => panic!("expected blockquote, got {other:?}"),
+    {
+        let checker = Checker::new(&md);
+        let content = checker.quote_single_paragraph(&md.sections[0]);
+        checker.check_span(content, &Expect::text("quoted"));
     }
     match &md.sections[1] {
         Section::Heading { level: 1, content } => {
@@ -1039,11 +1082,10 @@ fn test_blockquote_lazy_stops_at_heading() {
 fn test_blockquote_lazy_stops_at_hr() {
     let md: MarkdownFile<'_> = MarkdownFile::parse("> quoted\n---");
     assert_eq!(md.sections.len(), 2);
-    match &md.sections[0] {
-        Section::Blockquote { content } => {
-            Checker::new(&md).check_span(*content, &Expect::text("quoted"));
-        }
-        other => panic!("expected blockquote, got {other:?}"),
+    {
+        let checker = Checker::new(&md);
+        let content = checker.quote_single_paragraph(&md.sections[0]);
+        checker.check_span(content, &Expect::text("quoted"));
     }
     assert_eq!(md.sections[1], Section::HorizontalRule);
 }
@@ -1052,11 +1094,10 @@ fn test_blockquote_lazy_stops_at_hr() {
 fn test_blockquote_lazy_stops_at_list() {
     let md: MarkdownFile<'_> = MarkdownFile::parse("> quoted\n- item");
     assert_eq!(md.sections.len(), 2);
-    match &md.sections[0] {
-        Section::Blockquote { content } => {
-            Checker::new(&md).check_span(*content, &Expect::text("quoted"));
-        }
-        other => panic!("expected blockquote, got {other:?}"),
+    {
+        let checker = Checker::new(&md);
+        let content = checker.quote_single_paragraph(&md.sections[0]);
+        checker.check_span(content, &Expect::text("quoted"));
     }
     match &md.sections[1] {
         Section::UnorderedList { items } => {
@@ -1071,11 +1112,10 @@ fn test_blockquote_lazy_stops_at_list() {
 fn test_blockquote_lazy_stops_at_code_fence() {
     let md: MarkdownFile<'_> = MarkdownFile::parse("> quoted\n```\ncode\n```");
     assert_eq!(md.sections.len(), 2);
-    match &md.sections[0] {
-        Section::Blockquote { content } => {
-            Checker::new(&md).check_span(*content, &Expect::text("quoted"));
-        }
-        other => panic!("expected blockquote, got {other:?}"),
+    {
+        let checker = Checker::new(&md);
+        let content = checker.quote_single_paragraph(&md.sections[0]);
+        checker.check_span(content, &Expect::text("quoted"));
     }
     assert_eq!(
         md.sections[1],
@@ -1402,12 +1442,9 @@ fn test_ordered_list_indented_1_space() {
 #[test]
 fn test_blockquote_indented_3_spaces() {
     let md: MarkdownFile<'_> = MarkdownFile::parse("   > quoted");
-    match &md.sections[0] {
-        Section::Blockquote { content } => {
-            Checker::new(&md).check_span(*content, &Expect::text("quoted"));
-        }
-        other => panic!("expected blockquote, got {other:?}"),
-    }
+    let checker = Checker::new(&md);
+    let content = checker.quote_single_paragraph(&md.sections[0]);
+    checker.check_span(content, &Expect::text("quoted"));
 }
 
 #[test]

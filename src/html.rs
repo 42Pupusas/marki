@@ -114,10 +114,12 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 }
                 out.push_str("</ol>\n");
             }
-            Section::Blockquote { content } => {
-                out.push_str("<blockquote>\n<p>");
-                self.render_inlines(*content, out);
-                out.push_str("</p>\n</blockquote>\n");
+            Section::Blockquote { children } => {
+                out.push_str("<blockquote>\n");
+                for child in self.child_sections(*children) {
+                    self.render_section(child, out);
+                }
+                out.push_str("</blockquote>\n");
             }
             Section::HtmlBlock { html } => {
                 // Emitted verbatim, with the trailing newline CommonMark adds.

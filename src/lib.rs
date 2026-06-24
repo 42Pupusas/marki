@@ -76,7 +76,7 @@ impl OffsetExt for usize {
     }
 }
 use crate::simd::ByteSliceExt;
-pub use section::{InlineSpan, OrderedListDelimiter, Section, SpanSlice};
+pub use section::{InlineSpan, OrderedListDelimiter, Section, SectionRange, SpanSlice};
 pub use special_char::SpecialChar;
 
 use std::borrow::Cow;
@@ -97,6 +97,9 @@ pub struct MarkdownFile<'src, const MAX_INLINE_DEPTH: u8 = 16, const INLINE_STAC
     pub sections: Vec<Section<'src>>,
     pool: Vec<Inline<'src>>,
     span_pool: Vec<InlineSpan>,
+    /// Pool of child sections referenced by [`SectionRange`] (blockquote
+    /// interiors). Kept flat so [`Section`] stays `Copy`.
+    section_pool: Vec<Section<'src>>,
 }
 
 /// On the default `MarkdownFile` (depth=16, cap=32) we expose `normalize` as
@@ -152,21 +155,34 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         &self[slice]
     }
 
+    /// Get the child sections referenced by a [`SectionRange`] (blockquote
+    /// interiors).
+    #[must_use]
+    pub fn child_sections(&self, range: SectionRange) -> &[Section<'src>] {
+        &self[range]
+    }
+
     /// Walk every section and dereference every inline span. Used in tests and
     /// fuzz targets to assert the parser does not panic on arbitrary input.
     #[cfg(test)]
     pub(crate) fn walk_all_inlines(&self) {
-        for section in &self.sections {
+        self.walk_sections(&self.sections);
+    }
+
+    #[cfg(test)]
+    fn walk_sections(&self, sections: &[Section<'src>]) {
+        for section in sections {
             match section {
                 Section::UnorderedList { items } | Section::OrderedList { items, .. } => {
                     for &span in self.item_spans(*items) {
                         let _ = self.inlines(span);
                     }
                 }
-                Section::Heading { content, .. }
-                | Section::Paragraph { content }
-                | Section::Blockquote { content } => {
+                Section::Heading { content, .. } | Section::Paragraph { content } => {
                     let _ = self.inlines(*content);
+                }
+                Section::Blockquote { children } => {
+                    self.walk_sections(self.child_sections(*children));
                 }
                 Section::CodeBlock { .. }
                 | Section::HtmlBlock { .. }
@@ -197,5 +213,17 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize> std::ops::Index<
         let start = slice.start as usize;
         let end = start + slice.len as usize;
         &self.span_pool[start..end]
+    }
+}
+
+impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize> std::ops::Index<SectionRange>
+    for MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP>
+{
+    type Output = [Section<'src>];
+
+    fn index(&self, range: SectionRange) -> &[Section<'src>] {
+        let start = range.start as usize;
+        let end = start + range.len as usize;
+        &self.section_pool[start..end]
     }
 }
