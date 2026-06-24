@@ -1379,6 +1379,9 @@ impl<'src> ParseCtx<'src> {
         // `Some((char,len))` while the current item's content is inside a fenced
         // code block; blank lines there must not loosen the list.
         let mut fence: Option<(u8, usize)> = None;
+        // Set when the current item is empty (marker only) and a blank line has
+        // followed: a later indented line cannot then join this item.
+        let mut empty_then_blank = false;
 
         // Open the first item.
         {
@@ -1394,6 +1397,15 @@ impl<'src> ParseCtx<'src> {
             let line = &bytes[pos..le];
 
             if line.iter().all(u8::is_ascii_whitespace) {
+                // An empty list item (marker with no content) followed by a
+                // blank line begins with a blank line, so it cannot contain a
+                // following continuation block (CommonMark §5.2). Record this so
+                // the continuation branch below won't absorb the next indented
+                // line into the empty item; a sibling marker can still extend
+                // the list.
+                if self.lines.len().lines_offset() == item_start && fence.is_none() {
+                    empty_then_blank = true;
+                }
                 // A blank line inside a fenced code block stays part of the
                 // block and does not make the list loose.
                 if fence.is_none() {
@@ -1409,6 +1421,11 @@ impl<'src> ParseCtx<'src> {
 
             // Continuation indented to the item's content column.
             if ind >= col {
+                // An empty item followed by a blank line cannot absorb later
+                // content: end the list here so it parses outside.
+                if empty_then_blank {
+                    break;
+                }
                 if item_blanks > 0 {
                     loose = true;
                 }
@@ -1442,6 +1459,7 @@ impl<'src> ParseCtx<'src> {
                 item_start = self.lines.len().lines_offset();
                 col = bytes[pos + ind + m.width..le].item_content_indent(ind, m);
                 item_blanks = 0;
+                empty_then_blank = false;
                 fence = update_fence(None, &bytes[(pos + ind + m.width).min(le)..le]);
                 self.push_marker_content(pos, le, col);
                 pos = le + 1;
