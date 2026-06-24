@@ -21,33 +21,9 @@ impl InlineSpan {
     }
 }
 
-/// A range of `InlineSpan` elements stored contiguously in the span pool.
-/// Used by list sections to avoid per-list `Vec<InlineSpan>` heap allocations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SpanSlice {
-    pub start: u32,
-    pub len: u32,
-}
-
-impl SpanSlice {
-    pub const EMPTY: Self = Self { start: 0, len: 0 };
-
-    #[inline]
-    #[must_use]
-    pub const fn new(start: u32, len: u32) -> Self {
-        Self { start, len }
-    }
-
-    #[inline]
-    #[must_use]
-    pub const fn is_empty(self) -> bool {
-        self.len == 0
-    }
-}
-
 /// A range of [`Section`]s stored contiguously in the section pool.
 ///
-/// Used by blockquotes (and later, list items) to reference their child blocks
+/// Used by blockquotes and list items to reference their child blocks
 /// without a per-block heap allocation, keeping [`Section`] itself `Copy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SectionRange {
@@ -127,13 +103,25 @@ pub enum Section<'src> {
     IndentedCode {
         code: &'src str,
     },
+    /// An unordered (bullet) list (`CommonMark` §5.3). `items` is a range of
+    /// [`Section::ListItem`] sections in the document's section pool. `tight`
+    /// controls rendering: a tight list emits its items' paragraph children
+    /// without `<p>` wrappers.
     UnorderedList {
-        items: SpanSlice,
+        tight: bool,
+        items: SectionRange,
     },
+    /// An ordered list (`CommonMark` §5.3). See [`Section::UnorderedList`].
     OrderedList {
         start: u32,
         delimiter: OrderedListDelimiter,
-        items: SpanSlice,
+        tight: bool,
+        items: SectionRange,
+    },
+    /// A single list item (`CommonMark` §5.2), containing child block-level
+    /// sections stored as a range in the document's section pool.
+    ListItem {
+        children: SectionRange,
     },
     /// A blockquote (`CommonMark` §5.1) containing child block-level sections,
     /// stored as a range in the document's section pool.

@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use crate::section::OrderedListDelimiter;
+use crate::section::{OrderedListDelimiter, SectionRange};
 use crate::{Inline, InlineSpan, MarkdownFile, Section};
 
 /// Assertion helper that carries a reference to the parsed document.
@@ -31,6 +31,33 @@ impl<'md, 'src> Checker<'md, 'src> {
             }
             other => panic!("expected blockquote, got {other:?}"),
         }
+    }
+
+    /// Collect the inline span of each list item's single paragraph child.
+    /// Most list tests assume tight, single-paragraph items, so this flattens
+    /// the `ListItem { Paragraph }` nesting back to one span per item.
+    fn item_paragraphs(&self, items: SectionRange) -> Vec<InlineSpan> {
+        self.md
+            .child_sections(items)
+            .iter()
+            .map(|item| match item {
+                Section::ListItem { children } => {
+                    let kids = self.md.child_sections(*children);
+                    assert_eq!(
+                        kids.len(),
+                        1,
+                        "expected single-paragraph list item, got {kids:?}"
+                    );
+                    match kids[0] {
+                        Section::Paragraph { content } => content,
+                        ref other => {
+                            panic!("expected paragraph in list item, got {other:?}")
+                        }
+                    }
+                }
+                other => panic!("expected list item, got {other:?}"),
+            })
+            .collect()
     }
 
     /// Assert a span contains exactly `expected` inline elements.
@@ -200,12 +227,13 @@ fn test_unordered_list() {
     let md: MarkdownFile<'_> = MarkdownFile::parse("- one\n- two\n- three");
     assert_eq!(md.sections.len(), 1);
     match &md.sections[0] {
-        Section::UnorderedList { items } => {
-            let items = &md[*items];
+        Section::UnorderedList { items, .. } => {
+            let checker = Checker::new(&md);
+            let items = checker.item_paragraphs(*items);
             assert_eq!(items.len(), 3);
-            Checker::new(&md).check_span(items[0], &Expect::text("one"));
-            Checker::new(&md).check_span(items[1], &Expect::text("two"));
-            Checker::new(&md).check_span(items[2], &Expect::text("three"));
+            checker.check_span(items[0], &Expect::text("one"));
+            checker.check_span(items[1], &Expect::text("two"));
+            checker.check_span(items[2], &Expect::text("three"));
         }
         other => panic!("expected list, got {other:?}"),
     }
@@ -215,10 +243,11 @@ fn test_unordered_list() {
 fn test_unordered_list_plus() {
     let md: MarkdownFile<'_> = MarkdownFile::parse("+ one\n+ two\n+ three");
     match &md.sections[0] {
-        Section::UnorderedList { items } => {
-            let items = &md[*items];
+        Section::UnorderedList { items, .. } => {
+            let checker = Checker::new(&md);
+            let items = checker.item_paragraphs(*items);
             assert_eq!(items.len(), 3);
-            Checker::new(&md).check_span(items[0], &Expect::text("one"));
+            checker.check_span(items[0], &Expect::text("one"));
         }
         other => panic!("expected list, got {other:?}"),
     }
@@ -232,12 +261,14 @@ fn test_ordered_list() {
             start: 1,
             delimiter,
             items,
+            ..
         } if *delimiter == OrderedListDelimiter::Dot => {
-            let items = &md[*items];
+            let checker = Checker::new(&md);
+            let items = checker.item_paragraphs(*items);
             assert_eq!(items.len(), 3);
-            Checker::new(&md).check_span(items[0], &Expect::text("first"));
-            Checker::new(&md).check_span(items[1], &Expect::text("second"));
-            Checker::new(&md).check_span(items[2], &Expect::text("third"));
+            checker.check_span(items[0], &Expect::text("first"));
+            checker.check_span(items[1], &Expect::text("second"));
+            checker.check_span(items[2], &Expect::text("third"));
         }
         other => panic!("expected ordered list, got {other:?}"),
     }
@@ -312,10 +343,11 @@ fn test_mixed_document() {
         other => panic!("expected paragraph, got {other:?}"),
     }
     match &md.sections[2] {
-        Section::UnorderedList { items } => {
-            let items = &md[*items];
-            Checker::new(&md).check_span(items[0], &Expect::text("a"));
-            Checker::new(&md).check_span(items[1], &Expect::text("b"));
+        Section::UnorderedList { items, .. } => {
+            let checker = Checker::new(&md);
+            let items = checker.item_paragraphs(*items);
+            checker.check_span(items[0], &Expect::text("a"));
+            checker.check_span(items[1], &Expect::text("b"));
         }
         other => panic!("expected list, got {other:?}"),
     }
@@ -694,10 +726,11 @@ fn test_inline_in_heading() {
 fn test_inline_in_list() {
     let md: MarkdownFile<'_> = MarkdownFile::parse("- *italic item*\n- **bold item**");
     match &md.sections[0] {
-        Section::UnorderedList { items } => {
-            let items = &md[*items];
-            Checker::new(&md).check_span(items[0], &[Expect::Italic(Expect::text("italic item"))]);
-            Checker::new(&md).check_span(items[1], &[Expect::Bold(Expect::text("bold item"))]);
+        Section::UnorderedList { items, .. } => {
+            let checker = Checker::new(&md);
+            let items = checker.item_paragraphs(*items);
+            checker.check_span(items[0], &[Expect::Italic(Expect::text("italic item"))]);
+            checker.check_span(items[1], &[Expect::Bold(Expect::text("bold item"))]);
         }
         other => panic!("expected list, got {other:?}"),
     }
@@ -822,10 +855,12 @@ fn test_ordered_list_paren_delimiter() {
             start: 1,
             delimiter,
             items,
+            ..
         } if *delimiter == OrderedListDelimiter::Paren => {
-            let items = &md[*items];
-            Checker::new(&md).check_span(items[0], &Expect::text("first"));
-            Checker::new(&md).check_span(items[1], &Expect::text("second"));
+            let checker = Checker::new(&md);
+            let items = checker.item_paragraphs(*items);
+            checker.check_span(items[0], &Expect::text("first"));
+            checker.check_span(items[1], &Expect::text("second"));
         }
         other => panic!("expected ordered list, got {other:?}"),
     }
@@ -840,9 +875,11 @@ fn test_ordered_list_different_delimiters_split() {
             start: 1,
             delimiter,
             items,
+            ..
         } if *delimiter == OrderedListDelimiter::Dot => {
-            let items = &md[*items];
-            Checker::new(&md).check_span(items[0], &Expect::text("dot"));
+            let checker = Checker::new(&md);
+            let items = checker.item_paragraphs(*items);
+            checker.check_span(items[0], &Expect::text("dot"));
         }
         other => panic!("expected ordered list dot, got {other:?}"),
     }
@@ -851,9 +888,11 @@ fn test_ordered_list_different_delimiters_split() {
             start: 2,
             delimiter,
             items,
+            ..
         } if *delimiter == OrderedListDelimiter::Paren => {
-            let items = &md[*items];
-            Checker::new(&md).check_span(items[0], &Expect::text("paren"));
+            let checker = Checker::new(&md);
+            let items = checker.item_paragraphs(*items);
+            checker.check_span(items[0], &Expect::text("paren"));
         }
         other => panic!("expected ordered list paren, got {other:?}"),
     }
@@ -867,10 +906,12 @@ fn test_ordered_list_paren_custom_start() {
             start: 5,
             delimiter,
             items,
+            ..
         } if *delimiter == OrderedListDelimiter::Paren => {
-            let items = &md[*items];
-            Checker::new(&md).check_span(items[0], &Expect::text("fifth"));
-            Checker::new(&md).check_span(items[1], &Expect::text("sixth"));
+            let checker = Checker::new(&md);
+            let items = checker.item_paragraphs(*items);
+            checker.check_span(items[0], &Expect::text("fifth"));
+            checker.check_span(items[1], &Expect::text("sixth"));
         }
         other => panic!("expected ordered list, got {other:?}"),
     }
@@ -1132,9 +1173,10 @@ fn test_blockquote_lazy_stops_at_list() {
         checker.check_span(content, &Expect::text("quoted"));
     }
     match &md.sections[1] {
-        Section::UnorderedList { items } => {
-            let items = &md[*items];
-            Checker::new(&md).check_span(items[0], &Expect::text("item"));
+        Section::UnorderedList { items, .. } => {
+            let checker = Checker::new(&md);
+            let items = checker.item_paragraphs(*items);
+            checker.check_span(items[0], &Expect::text("item"));
         }
         other => panic!("expected list, got {other:?}"),
     }
@@ -1472,11 +1514,12 @@ fn test_hr_indented_4_spaces_is_indented_code() {
 fn test_unordered_list_indented_2_spaces() {
     let md: MarkdownFile<'_> = MarkdownFile::parse("  - one\n  - two");
     match &md.sections[0] {
-        Section::UnorderedList { items } => {
-            let items = &md[*items];
+        Section::UnorderedList { items, .. } => {
+            let checker = Checker::new(&md);
+            let items = checker.item_paragraphs(*items);
             assert_eq!(items.len(), 2);
-            Checker::new(&md).check_span(items[0], &Expect::text("one"));
-            Checker::new(&md).check_span(items[1], &Expect::text("two"));
+            checker.check_span(items[0], &Expect::text("one"));
+            checker.check_span(items[1], &Expect::text("two"));
         }
         other => panic!("expected list, got {other:?}"),
     }
@@ -1498,9 +1541,10 @@ fn test_ordered_list_indented_1_space() {
         Section::OrderedList {
             start: 1, items, ..
         } => {
-            let items = &md[*items];
+            let checker = Checker::new(&md);
+            let items = checker.item_paragraphs(*items);
             assert_eq!(items.len(), 2);
-            Checker::new(&md).check_span(items[0], &Expect::text("first"));
+            checker.check_span(items[0], &Expect::text("first"));
         }
         other => panic!("expected ordered list, got {other:?}"),
     }
@@ -1646,10 +1690,11 @@ fn test_ordered_list_empty_item() {
         Section::OrderedList {
             start: 1, items, ..
         } => {
-            let items = &md[*items];
+            let checker = Checker::new(&md);
+            let items = checker.item_paragraphs(*items);
             assert_eq!(items.len(), 2);
-            Checker::new(&md).check_span(items[0], &[]);
-            Checker::new(&md).check_span(items[1], &Expect::text("second"));
+            checker.check_span(items[0], &[]);
+            checker.check_span(items[1], &Expect::text("second"));
         }
         other => panic!("expected ordered list, got {other:?}"),
     }

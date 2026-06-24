@@ -8,6 +8,7 @@
 use std::fmt::Write as _;
 
 use crate::{Inline, InlineSpan, MarkdownFile, Section};
+use crate::section::SectionRange;
 
 /// Escape the four HTML-significant characters in text content
 /// (`CommonMark` renders these in body text).
@@ -169,29 +170,30 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 }
                 out.push_str("\n</code></pre>\n");
             }
-            Section::UnorderedList { items } => {
+            Section::UnorderedList { tight, items } => {
                 out.push_str("<ul>\n");
-                for &span in self.item_spans(*items) {
-                    out.push_str("<li>");
-                    self.render_inlines(span, out);
-                    out.push_str("</li>\n");
+                for item in self.child_sections(*items) {
+                    self.render_list_item(item, *tight, out);
                 }
                 out.push_str("</ul>\n");
             }
             Section::OrderedList {
-                start, items, ..
+                start, tight, items, ..
             } => {
                 if *start == 1 {
                     out.push_str("<ol>\n");
                 } else {
                     let _ = writeln!(out, "<ol start=\"{start}\">");
                 }
-                for &span in self.item_spans(*items) {
-                    out.push_str("<li>");
-                    self.render_inlines(span, out);
-                    out.push_str("</li>\n");
+                for item in self.child_sections(*items) {
+                    self.render_list_item(item, *tight, out);
                 }
                 out.push_str("</ol>\n");
+            }
+            Section::ListItem { children } => {
+                // A bare ListItem (not reached via a list) renders its children
+                // as loose; lists call `render_list_item` directly.
+                self.render_list_item_inner(*children, false, out);
             }
             Section::Blockquote { children } => {
                 out.push_str("<blockquote>\n");
@@ -206,6 +208,57 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 out.push('\n');
             }
             Section::HorizontalRule => out.push_str("<hr />\n"),
+        }
+    }
+
+    /// Render one `<li>` element. `tight` lists suppress the `<p>` wrapper
+    /// around an item's paragraph children (`CommonMark` §5.3).
+    fn render_list_item(&self, item: &Section<'_>, tight: bool, out: &mut String) {
+        let Section::ListItem { children } = item else {
+            // Defensive: a list's items are always ListItem sections.
+            self.render_section(item, out);
+            return;
+        };
+        let kids = self.child_sections(*children);
+        if kids.is_empty() {
+            out.push_str("<li></li>\n");
+            return;
+        }
+        out.push_str("<li>");
+        // Tight items whose sole/first blocks are paragraphs render those
+        // paragraphs' inlines without a wrapper; a leading block forces the
+        // closing tag onto its own line.
+        if tight && kids.iter().all(|k| matches!(k, Section::Paragraph { .. })) {
+            let mut first = true;
+            for kid in kids {
+                if let Section::Paragraph { content } = kid {
+                    if !first {
+                        out.push('\n');
+                    }
+                    first = false;
+                    self.render_inlines(*content, out);
+                }
+            }
+            out.push_str("</li>\n");
+            return;
+        }
+        out.push('\n');
+        self.render_list_item_inner(*children, tight, out);
+        out.push_str("</li>\n");
+    }
+
+    /// Render the child blocks of a list item, suppressing `<p>` wrappers on
+    /// paragraph children when the list is `tight`.
+    fn render_list_item_inner(&self, children: SectionRange, tight: bool, out: &mut String) {
+        for kid in self.child_sections(children) {
+            if tight
+                && let Section::Paragraph { content } = kid
+            {
+                self.render_inlines(*content, out);
+                out.push('\n');
+            } else {
+                self.render_section(kid, out);
+            }
         }
     }
 

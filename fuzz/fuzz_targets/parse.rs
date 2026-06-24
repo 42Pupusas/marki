@@ -2,28 +2,31 @@
 
 use libfuzzer_sys::fuzz_target;
 
-fuzz_target!(|data: &str| {
-    let md: marki::MarkdownFile<'_> = marki::MarkdownFile::parse(data);
-    // Walk all sections to exercise index operations and catch panics.
-    for section in &md.sections {
+use marki::{MarkdownFile, Section};
+
+/// Recursively walk sections, dereferencing every inline span and child-section
+/// range to exercise index operations and catch panics.
+fn walk(md: &MarkdownFile<'_>, sections: &[Section<'_>]) {
+    for section in sections {
         match section {
-            marki::Section::UnorderedList { items } => {
-                for &span in md.item_spans(*items) {
-                    let _ = md.inlines(span);
-                }
+            Section::UnorderedList { items, .. } | Section::OrderedList { items, .. } => {
+                walk(md, md.child_sections(*items));
             }
-            marki::Section::OrderedList { items, .. } => {
-                for &span in md.item_spans(*items) {
-                    let _ = md.inlines(span);
-                }
+            Section::ListItem { children } | Section::Blockquote { children } => {
+                walk(md, md.child_sections(*children));
             }
-            marki::Section::Heading { content, .. }
-            | marki::Section::Paragraph { content }
-            | marki::Section::Blockquote { content } => {
+            Section::Heading { content, .. } | Section::Paragraph { content } => {
                 let _ = md.inlines(*content);
             }
-            marki::Section::CodeBlock { .. }
-            | marki::Section::HorizontalRule => {}
+            Section::CodeBlock { .. }
+            | Section::IndentedCode { .. }
+            | Section::HtmlBlock { .. }
+            | Section::HorizontalRule => {}
         }
     }
+}
+
+fuzz_target!(|data: &str| {
+    let md: MarkdownFile<'_> = MarkdownFile::parse(data);
+    walk(&md, &md.sections);
 });

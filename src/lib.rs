@@ -30,8 +30,7 @@
 //! # Accessing inline elements
 //!
 //! Inline elements are stored in a flat pool for cache efficiency. Use
-//! [`MarkdownFile::inlines`] and [`MarkdownFile::item_spans`] (or index with
-//! [`InlineSpan`] / [`SpanSlice`]) to retrieve them:
+//! [`MarkdownFile::inlines`] (or index with [`InlineSpan`]) to retrieve them:
 //!
 //! ```
 //! use marki_parse::{MarkdownFile, Section};
@@ -77,7 +76,7 @@ impl OffsetExt for usize {
     }
 }
 use crate::simd::ByteSliceExt;
-pub use section::{InlineSpan, OrderedListDelimiter, Section, SectionRange, SpanSlice};
+pub use section::{InlineSpan, OrderedListDelimiter, Section, SectionRange};
 pub use special_char::SpecialChar;
 
 use std::borrow::Cow;
@@ -85,9 +84,9 @@ use std::borrow::Cow;
 /// A parsed Markdown document.
 ///
 /// Contains the block-level [`Section`]s and the internal pools that store
-/// [`Inline`] elements. Use [`inlines`](Self::inlines) and
-/// [`item_spans`](Self::item_spans) to access inline content referenced by
-/// sections.
+/// [`Inline`] elements. Use [`inlines`](Self::inlines) to access inline
+/// content referenced by sections, and [`child_sections`](Self::child_sections)
+/// for the child blocks of blockquotes and list items.
 ///
 /// The const generics `MAX_INLINE_DEPTH` and `INLINE_STACK_CAP` control
 /// recursion depth and stack-allocation size for emphasis parsing. The
@@ -97,9 +96,8 @@ pub struct MarkdownFile<'src, const MAX_INLINE_DEPTH: u8 = 16, const INLINE_STAC
     /// The block-level sections of the document, in order.
     pub sections: Vec<Section<'src>>,
     pool: Vec<Inline<'src>>,
-    span_pool: Vec<InlineSpan>,
     /// Pool of child sections referenced by [`SectionRange`] (blockquote
-    /// interiors). Kept flat so [`Section`] stays `Copy`.
+    /// interiors and list items). Kept flat so [`Section`] stays `Copy`.
     section_pool: Vec<Section<'src>>,
 }
 
@@ -150,14 +148,8 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         &self[span]
     }
 
-    /// Get the item spans referenced by a `SpanSlice` (list items).
-    #[must_use]
-    pub fn item_spans(&self, slice: SpanSlice) -> &[InlineSpan] {
-        &self[slice]
-    }
-
     /// Get the child sections referenced by a [`SectionRange`] (blockquote
-    /// interiors).
+    /// interiors and list items).
     #[must_use]
     pub fn child_sections(&self, range: SectionRange) -> &[Section<'src>] {
         &self[range]
@@ -174,15 +166,13 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     fn walk_sections(&self, sections: &[Section<'src>]) {
         for section in sections {
             match section {
-                Section::UnorderedList { items } | Section::OrderedList { items, .. } => {
-                    for &span in self.item_spans(*items) {
-                        let _ = self.inlines(span);
-                    }
+                Section::UnorderedList { items, .. } | Section::OrderedList { items, .. } => {
+                    self.walk_sections(self.child_sections(*items));
                 }
                 Section::Heading { content, .. } | Section::Paragraph { content } => {
                     let _ = self.inlines(*content);
                 }
-                Section::Blockquote { children } => {
+                Section::Blockquote { children } | Section::ListItem { children } => {
                     self.walk_sections(self.child_sections(*children));
                 }
                 Section::CodeBlock { .. }
@@ -203,18 +193,6 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize> std::ops::
         let start = span.start as usize;
         let end = start + span.len as usize;
         &self.pool[start..end]
-    }
-}
-
-impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize> std::ops::Index<SpanSlice>
-    for MarkdownFile<'_, MAX_INLINE_DEPTH, INLINE_STACK_CAP>
-{
-    type Output = [InlineSpan];
-
-    fn index(&self, slice: SpanSlice) -> &[InlineSpan] {
-        let start = slice.start as usize;
-        let end = start + slice.len as usize;
-        &self.span_pool[start..end]
     }
 }
 

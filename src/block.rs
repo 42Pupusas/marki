@@ -1,7 +1,7 @@
 use crate::OffsetExt;
 use crate::inline::InlineParser;
 use crate::link_def::{LinkDefs, normalize_label, scan_link_def};
-use crate::section::{InlineSpan, OrderedListDelimiter, Section, SectionRange, SpanSlice};
+use crate::section::{InlineSpan, OrderedListDelimiter, Section, SectionRange};
 use crate::simd::ByteSliceExt;
 use crate::special_char::SpecialChar;
 use crate::{Inline, MarkdownFile};
@@ -348,7 +348,6 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     fn resolve_inlines(
         ctx: &ParseCtx<'src>,
         pool: &mut Vec<Inline<'src>>,
-        span_pool: &mut Vec<InlineSpan>,
         section_pool: &mut Vec<Section<'src>>,
     ) -> Vec<Section<'src>> {
         let lines = &ctx.lines;
@@ -386,18 +385,8 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     let raw_items = lines
                         .get(items_start as usize..(items_start + items_len) as usize)
                         .unwrap_or(&[]);
-                    let start = span_pool.len().pool_offset();
-                    for item in raw_items {
-                        let span =
-                            InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_configured(
-                                item, pool, defs,
-                            );
-                        span_pool.push(span);
-                    }
-                    let len = span_pool.len().pool_offset() - start;
-                    sections.push(Section::UnorderedList {
-                        items: SpanSlice::new(start, len),
-                    });
+                    let items = Self::resolve_list_items(raw_items, pool, section_pool, defs);
+                    sections.push(Section::UnorderedList { tight: true, items });
                 }
                 RawSection::OrderedList {
                     start,
@@ -408,19 +397,12 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     let raw_items = lines
                         .get(items_start as usize..(items_start + items_len) as usize)
                         .unwrap_or(&[]);
-                    let sp_start = span_pool.len().pool_offset();
-                    for item in raw_items {
-                        let span =
-                            InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_configured(
-                                item, pool, defs,
-                            );
-                        span_pool.push(span);
-                    }
-                    let sp_len = span_pool.len().pool_offset() - sp_start;
+                    let items = Self::resolve_list_items(raw_items, pool, section_pool, defs);
                     sections.push(Section::OrderedList {
                         start,
                         delimiter,
-                        items: SpanSlice::new(sp_start, sp_len),
+                        tight: true,
+                        items,
                     });
                 }
                 RawSection::Blockquote {
@@ -443,6 +425,38 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
             }
         }
         sections
+    }
+
+    /// Resolve a list's raw item texts (one `&str` per item, from pass 1) into
+    /// a range of [`Section::ListItem`] sections in `section_pool`. Each item
+    /// currently holds a single paragraph child; the upcoming continuation
+    /// rewrite will let items carry arbitrary child blocks.
+    fn resolve_list_items(
+        raw_items: &[&'src str],
+        pool: &mut Vec<Inline<'src>>,
+        section_pool: &mut Vec<Section<'src>>,
+        defs: &LinkDefs<'src>,
+    ) -> SectionRange {
+        // Build each item's children first, then append the ListItem sections
+        // contiguously. Children of a single item are appended immediately so a
+        // ListItem's range is stable before we collect the item-level range.
+        let mut items: Vec<Section<'src>> = Vec::with_capacity(raw_items.len());
+        for item in raw_items {
+            let child_start = section_pool.len().pool_offset();
+            let content =
+                InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_configured(
+                    item, pool, defs,
+                );
+            section_pool.push(Section::Paragraph { content });
+            let child_len = section_pool.len().pool_offset() - child_start;
+            items.push(Section::ListItem {
+                children: SectionRange::new(child_start, child_len),
+            });
+        }
+        let start = section_pool.len().pool_offset();
+        section_pool.extend(items);
+        let len = section_pool.len().pool_offset() - start;
+        SectionRange::new(start, len)
     }
 
     /// Recursively resolve the dequoted content lines of a blockquote into a
@@ -571,15 +585,12 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
 
         // --- Pass 2: inline parsing ---
         let mut pool = Vec::with_capacity(input.len() / 20);
-        let mut span_pool = Vec::with_capacity(input.len() / 100 + 1);
         let mut section_pool = Vec::new();
-        let sections =
-            Self::resolve_inlines(&ctx, &mut pool, &mut span_pool, &mut section_pool);
+        let sections = Self::resolve_inlines(&ctx, &mut pool, &mut section_pool);
 
         Self {
             sections,
             pool,
-            span_pool,
             section_pool,
         }
     }
