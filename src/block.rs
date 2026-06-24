@@ -146,10 +146,14 @@ enum Accumulator<'src> {
     Empty,
     InBlockquote {
         lines_start: u32,
-        /// True when the most recent quoted line was blank (an empty `>` line).
-        /// A blank line closes the inner paragraph, so the next marker-less
-        /// line cannot lazily continue the blockquote (`CommonMark` §5.1).
-        last_blank: bool,
+        /// True when the blockquote's inner content currently leaves an open
+        /// paragraph, the only state in which a marker-less line may lazily
+        /// continue the blockquote (`CommonMark` §5.1). False after a blank
+        /// line, an indented code block, a code fence, or any other block.
+        para_open: bool,
+        /// `Some((char,len))` while the inner content is inside a fenced code
+        /// block, whose lines must not be treated as lazy paragraph text.
+        fence: Option<(u8, usize)>,
     },
     InParagraph {
         content: &'src str,
@@ -1689,21 +1693,24 @@ impl<'src> ParseCtx<'src> {
             // 4+ leading spaces.
             if let Accumulator::InBlockquote {
                 lines_start,
-                last_blank,
+                para_open,
+                fence,
             } = acc
             {
-                // Lazy continuation only when the previous quoted line was not
-                // blank; a blank line closes the inner paragraph.
-                if !last_blank {
+                // Lazy continuation only when an inner paragraph is open and we
+                // are not inside a fenced code block.
+                if para_open && fence.is_none() {
                     self.lines.push(self.input.get(pos..line_end).unwrap_or(""));
                     return Accumulator::InBlockquote {
                         lines_start,
-                        last_blank: false,
+                        para_open: true,
+                        fence: None,
                     };
                 }
                 self.flush_acc(Accumulator::InBlockquote {
                     lines_start,
-                    last_blank,
+                    para_open,
+                    fence,
                 });
                 return self.fold_block_element(Accumulator::Empty, pos, line_end);
             }
@@ -1764,12 +1771,21 @@ impl<'src> ParseCtx<'src> {
                 self.input.get(content_start..line_end).unwrap_or("")
             };
             let cb = content.as_bytes();
-            let last_blank = cb.is_blank_line(0, cb.len());
+            let (prev_para, prev_fence) = match acc {
+                Accumulator::InBlockquote {
+                    para_open, fence, ..
+                } => (para_open, fence),
+                _ => (false, None),
+            };
+            // Track inner paragraph / fenced-code state so a later lazy line is
+            // only absorbed when an inner paragraph is genuinely open.
+            let (para_open, fence) = Self::blockquote_inner_state(cb, prev_para, prev_fence);
             if let Accumulator::InBlockquote { lines_start, .. } = acc {
                 self.lines.push(content);
                 return Accumulator::InBlockquote {
                     lines_start,
-                    last_blank,
+                    para_open,
+                    fence,
                 };
             }
             self.flush_acc(acc);
@@ -1777,7 +1793,8 @@ impl<'src> ParseCtx<'src> {
             self.lines.push(content);
             return Accumulator::InBlockquote {
                 lines_start,
-                last_blank,
+                para_open,
+                fence,
             };
         }
 
@@ -1787,20 +1804,25 @@ impl<'src> ParseCtx<'src> {
         // not blank (a blank line closes the inner paragraph, ending laziness).
         let acc = if let Accumulator::InBlockquote {
             lines_start,
-            last_blank,
+            para_open,
+            fence,
         } = acc
         {
-            if !last_blank && self.blockquote_continues(line_bytes, spos) {
+            // Lazy continuation requires an open inner paragraph (not blank,
+            // not inside indented/fenced code).
+            if para_open && fence.is_none() && self.blockquote_continues(line_bytes, spos) {
                 self.lines.push(self.input.get(pos..line_end).unwrap_or(""));
                 return Accumulator::InBlockquote {
                     lines_start,
-                    last_blank: false,
+                    para_open: true,
+                    fence: None,
                 };
             }
             // Line starts a new block — flush the blockquote and fall through.
             self.flush_acc(Accumulator::InBlockquote {
                 lines_start,
-                last_blank,
+                para_open,
+                fence,
             });
             Accumulator::Empty
         } else {
@@ -1837,6 +1859,52 @@ impl<'src> ParseCtx<'src> {
         }
         self.flush_acc(acc);
         Accumulator::InParagraph { content: line_str }
+    }
+
+    /// Compute the blockquote's inner `(para_open, fence)` state after one
+    /// quoted content line `cb` (the bytes after the `>` marker), given the
+    /// previous state. This decides whether a following marker-less line may
+    /// lazily continue the quote: only when an inner paragraph is open and no
+    /// fenced code block is active.
+    fn blockquote_inner_state(
+        cb: &[u8],
+        prev_para: bool,
+        prev_fence: Option<(u8, usize)>,
+    ) -> (bool, Option<(u8, usize)>) {
+        // Inside a fenced code block: the only thing that matters is whether
+        // this line closes it. No paragraph is open either way.
+        if let Some((fc, flen)) = prev_fence {
+            let cind = cb.leading_spaces().min(3);
+            let body = &cb[cind.min(cb.len())..];
+            if body.is_closing_fence(fc, flen) {
+                return (false, None);
+            }
+            return (false, Some((fc, flen)));
+        }
+        // A blank line closes any open paragraph.
+        if cb.is_blank_line(0, cb.len()) {
+            return (false, None);
+        }
+        let ind = cb.leading_spaces();
+        let body = &cb[ind.min(cb.len())..];
+        // An opening code fence (0-3 indent) starts a fenced block.
+        if ind <= 3
+            && let Some(fence) = body.code_fence_opening()
+        {
+            return (false, Some(fence));
+        }
+        // 4+ spaces of indent with no open paragraph is indented code, which a
+        // lazy line cannot continue.
+        if ind >= 4 && !prev_para {
+            return (false, None);
+        }
+        // A nested blockquote (or list item) can itself leave an inner
+        // paragraph open, which a lazy line continues at the deepest level;
+        // judge laziness by the innermost content via is_lazy_paragraph_tail.
+        if ind <= 3 && body.begins_block() {
+            return (is_lazy_paragraph_tail(body), None);
+        }
+        (true, None)
     }
 
     /// True if a non-blank line should continue the current blockquote rather
