@@ -62,6 +62,10 @@ static BRACKET_CLOSE_SET: ByteSet = ByteSet::new(&[
     SpecialChar::OpenBracket.byte(),
     SpecialChar::CloseBracket.byte(),
     SpecialChar::Backslash.byte(),
+    // Code spans, autolinks, and raw HTML bind tighter than link brackets, so
+    // the closing-bracket scan must recognise and skip over them.
+    SpecialChar::Backtick.byte(),
+    SpecialChar::LessThan.byte(),
 ]);
 static PAREN_CLOSE_SET: ByteSet = ByteSet::new(&[
     SpecialChar::OpenParen.byte(),
@@ -1305,6 +1309,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
     /// Find the position of a matching closing delimiter, handling backslash
     /// escapes and nested pairs.
     fn find_matching_close(
+        input: &'src str,
         bytes: &[u8],
         start: usize,
         open: SpecialChar,
@@ -1325,6 +1330,29 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 && bytes.get(pos + 1).is_some_and(u8::is_ascii_punctuation)
             {
                 j = pos + 2;
+                continue;
+            }
+            // Inline code, autolinks, and raw HTML take precedence over link
+            // structure (CommonMark §6.3): when one begins inside the brackets,
+            // skip past its whole extent so a `]` it contains cannot close the
+            // link (e.g. `[foo`](/uri)`` is text + code span, not a link).
+            if open == SpecialChar::OpenBracket {
+                if b == SpecialChar::Backtick
+                    && let Some((_, end)) = Self::try_parse_inline_code(input, bytes, pos)
+                {
+                    j = end;
+                    continue;
+                }
+                if b == SpecialChar::LessThan
+                    && let Some((_, end)) = Self::try_parse_angle(input, bytes, pos)
+                {
+                    j = end;
+                    continue;
+                }
+            }
+            if b == SpecialChar::Backtick || b == SpecialChar::LessThan {
+                // A lone backtick/`<` that starts no construct is ordinary text.
+                j = pos + 1;
                 continue;
             }
             if b == open {
@@ -1350,6 +1378,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
 
         let bracket_start = start + 1;
         let bracket_end = Self::find_matching_close(
+            input,
             bytes,
             bracket_start,
             SpecialChar::OpenBracket,
@@ -1509,6 +1538,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         }
         let first_start = start + 1;
         let first_end = Self::find_matching_close(
+            self.input,
             bytes,
             first_start,
             SpecialChar::OpenBracket,
@@ -1521,6 +1551,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         if bytes.get(after_first) == SpecialChar::OpenBracket {
             let second_start = after_first + 1;
             let second_end = Self::find_matching_close(
+                self.input,
                 bytes,
                 second_start,
                 SpecialChar::OpenBracket,
