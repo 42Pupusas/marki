@@ -124,8 +124,17 @@ fall out of the same pass). Remaining 2 (342, 347) are backtick-vs-link/fence
 *precedence*, deferred to the long tail.
 
 ### Phase 5 — Block-level: tabs + containers  (target ~96%)
-Tab expansion to 4-col stops in `src/block.rs`; fenced-code indent stripping;
-loose/tight list detection; lazy continuation and nested blockquote/list edges.
+Tab expansion to 4-col stops in `src/block.rs`; ~~fenced-code indent stripping~~
+(**done**, see below); loose/tight list detection; lazy continuation and nested
+blockquote/list edges.
+
+**Fenced-code indent strip DONE (90.5% → 91.0%, Fenced code blocks 26→29/29).**
+`RawSection::CodeBlock` now carries the opening fence's `indent` (0–3). In pass 2
+the common `indent == 0` case stays a zero-copy contiguous `CodeBlock`; when
+`indent > 0`, each content line is dedented by up to `indent` leading spaces
+into the line pool and emitted as the existing line-backed `CodeLines` variant
+(removing interior bytes breaks slice contiguity, so it can't stay one slice).
+Perf gate held (dedent path only runs for the rare indented fence).
 
 ### Phase 6 — Long tail + gate
 Remaining thematic-break/setext/raw-HTML/HTML-block edge cases. Then flip the
@@ -145,3 +154,7 @@ to lock in progress and prevent regressions.
 - 2026-06-24: Phase 4 complete — code-span §6.1 normalization at render time
   (`escape_code_span`). 89.4% → 90.5% (Code spans 16→20, Hard line breaks
   13→15/15). Render-only, perf unaffected. Next: Phase 2c or Phase 3.
+- 2026-06-24: Phase 5 (partial) — fenced-code indent strip. 90.5% → 91.0%
+  (Fenced code blocks 26→29/29). `RawSection::CodeBlock` carries the fence
+  indent; indent>0 dedents into the line pool as `CodeLines`. Perf gate held.
+  Next: Phase 3 (named entities).

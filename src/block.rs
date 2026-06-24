@@ -24,6 +24,11 @@ enum RawSection<'src> {
     CodeBlock {
         language: Option<&'src str>,
         code: &'src str,
+        /// Columns of indentation on the opening fence (0–3). `CommonMark`
+        /// §4.5 strips up to this many leading spaces from each content line.
+        /// When zero the content is emitted as one contiguous slice; otherwise
+        /// pass 2 dedents line-by-line into the line pool.
+        indent: usize,
     },
     IndentedCode {
         code: &'src str,
@@ -444,6 +449,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     /// parsing. Separating passes lets us pre-size the output pools from the
     /// raw section count and avoid interleaving block and inline allocation
     /// patterns.
+    #[allow(clippy::too_many_lines)]
     fn resolve_inlines(
         ctx: &ParseCtx<'src>,
         pool: &mut Vec<Inline<'src>>,
@@ -473,8 +479,33 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                             ),
                     });
                 }
-                RawSection::CodeBlock { language, code } => {
-                    sections.push(Section::CodeBlock { language, code });
+                RawSection::CodeBlock {
+                    language,
+                    code,
+                    indent,
+                } => {
+                    if indent == 0 {
+                        // Common case: no dedent needed, keep the zero-copy slice.
+                        sections.push(Section::CodeBlock { language, code });
+                    } else {
+                        // CommonMark §4.5: strip up to `indent` leading spaces
+                        // from each content line. Removing interior bytes breaks
+                        // contiguity, so dedent into the line pool and emit the
+                        // line-backed `CodeLines` variant instead.
+                        let code_start = line_pool.len().pool_offset();
+                        if !code.is_empty() {
+                            for line in code.split('\n') {
+                                let strip =
+                                    line.bytes().take(indent).take_while(|&b| b == b' ').count();
+                                line_pool.push(line.get(strip..).unwrap_or(""));
+                            }
+                        }
+                        let len = line_pool.len().pool_offset() - code_start;
+                        sections.push(Section::CodeLines {
+                            language,
+                            lines: LineRange::new(code_start, len),
+                        });
+                    }
                 }
                 RawSection::IndentedCode { code } => {
                     sections.push(Section::IndentedCode { code });
@@ -1006,7 +1037,11 @@ impl<'src> ParseCtx<'src> {
                 ctx.flush_acc(acc);
                 let content_start = line_end + 1;
                 let (code, resume) = ctx.scan_code_block_fast(content_start, fence_len, fence_char);
-                ctx.sections.push(RawSection::CodeBlock { language, code });
+                ctx.sections.push(RawSection::CodeBlock {
+                    language,
+                    code,
+                    indent,
+                });
                 pos = resume;
                 acc = Accumulator::Empty;
                 continue;
