@@ -157,8 +157,18 @@ pub fn scan_inline_html(b: &[u8]) -> Option<usize> {
 /// Scan `<!` constructs: comment, CDATA, or declaration.
 fn scan_declarationish(b: &[u8]) -> Option<usize> {
     if b.starts_with(b"<!--") {
-        // Comment: text must not start with `>` or `->`, but CommonMark's
-        // relaxed inline rule just scans to `-->`.
+        // Comment (CommonMark 0.30 §6.6): `<!-->` and `<!--->` are complete
+        // comments. Otherwise the text after `<!--` must not start with `>`
+        // or `->`, then runs up to the closing `-->`.
+        if b.starts_with(b"<!-->") {
+            return Some(5);
+        }
+        if b.starts_with(b"<!--->") {
+            return Some(6);
+        }
+        if matches!(b.get(4), Some(&b'>')) || b[4..].starts_with(b"->") {
+            return None;
+        }
         return scan_until(b, 4, b"-->");
     }
     if b.starts_with(b"<![CDATA[") {
