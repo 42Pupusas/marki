@@ -813,6 +813,20 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         p
     }
 
+    /// True if any node in `span` is a link (`CommonMark` §6.3 "no links in
+    /// links"). The pool is post-order, so an emphasis node's children live at
+    /// indices *below* `span.start`; recurse through `Bold`/`Italic` child
+    /// spans to catch a link nested inside emphasis (e.g. `[foo *[bar](/u)*]`).
+    fn span_has_link(&self, span: InlineSpan) -> bool {
+        let s = span.start as usize;
+        let e = s + span.len as usize;
+        self.pool[s..e].iter().any(|n| match *n {
+            Inline::Link { .. } => true,
+            Inline::Bold(child) | Inline::Italic(child) => self.span_has_link(child),
+            _ => false,
+        })
+    }
+
     fn parse_inner(&mut self, input: &'src str, depth: u8) -> InlineSpan {
         InlineParser::<MAX_DEPTH, CAP> {
             input,
@@ -934,12 +948,21 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 && let Some((text_str, url, title, end)) =
                     Self::try_parse_bracket_paren(self.input, bytes, i)
             {
+                let saved = self.pool.len();
+                let text_span = self.parse_inner(text_str, depth.saturating_add(1));
+                if self.span_has_link(text_span) {
+                    // "No links in links" (CommonMark §6.3): the outer `[` is
+                    // literal and the inner link wins. Revert the text we just
+                    // parsed and let the scanner rediscover it from i+1.
+                    self.pool.truncate(saved);
+                    i += 1;
+                    continue;
+                }
                 if let Some(text) = self.input.get(plain_start..i)
                     && !text.is_empty()
                 {
                     buf.push(Inline::Text(text));
                 }
-                let text_span = self.parse_inner(text_str, depth.saturating_add(1));
                 buf.push(Inline::Link {
                     text: text_span,
                     url,
@@ -954,12 +977,18 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             if b == SpecialChar::OpenBracket
                 && let Some((text_str, url, title, end)) = self.try_parse_reference(bytes, i)
             {
+                let saved = self.pool.len();
+                let text_span = self.parse_inner(text_str, depth.saturating_add(1));
+                if self.span_has_link(text_span) {
+                    self.pool.truncate(saved);
+                    i += 1;
+                    continue;
+                }
                 if let Some(text) = self.input.get(plain_start..i)
                     && !text.is_empty()
                 {
                     buf.push(Inline::Text(text));
                 }
-                let text_span = self.parse_inner(text_str, depth.saturating_add(1));
                 buf.push(Inline::Link {
                     text: text_span,
                     url,
@@ -1163,8 +1192,16 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 && let Some((text_str, url, title, end)) =
                     Self::try_parse_bracket_paren(self.input, bytes, i)
             {
-                flush_text!(i);
+                let saved = self.pool.len();
                 let text_span = self.parse_inner(text_str, depth.saturating_add(1));
+                if self.span_has_link(text_span) {
+                    // "No links in links" (CommonMark §6.3): outer `[` is
+                    // literal, the inner link wins. Revert and rescan from i+1.
+                    self.pool.truncate(saved);
+                    i += 1;
+                    continue;
+                }
+                flush_text!(i);
                 arena.push_node(EmphKind::Resolved(Inline::Link {
                     text: text_span,
                     url,
@@ -1178,8 +1215,14 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             if b == SpecialChar::OpenBracket
                 && let Some((text_str, url, title, end)) = self.try_parse_reference(bytes, i)
             {
-                flush_text!(i);
+                let saved = self.pool.len();
                 let text_span = self.parse_inner(text_str, depth.saturating_add(1));
+                if self.span_has_link(text_span) {
+                    self.pool.truncate(saved);
+                    i += 1;
+                    continue;
+                }
+                flush_text!(i);
                 arena.push_node(EmphKind::Resolved(Inline::Link {
                     text: text_span,
                     url,
