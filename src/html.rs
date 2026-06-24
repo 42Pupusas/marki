@@ -400,6 +400,18 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 out.push_str(html);
                 out.push('\n');
             }
+            Section::HtmlLines { lines } => {
+                // Dedented container HTML block: emit each line verbatim.
+                let mut first = true;
+                for line in self.code_lines(*lines) {
+                    if !first {
+                        out.push('\n');
+                    }
+                    first = false;
+                    out.push_str(line);
+                }
+                out.push('\n');
+            }
             Section::HorizontalRule => out.push_str("<hr />\n"),
         }
     }

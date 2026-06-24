@@ -193,5 +193,11 @@ pub enum Section<'src> {
     HtmlBlock {
         html: &'src str,
     },
+    /// A raw HTML block whose content lines were dedented out of a container
+    /// (list item or blockquote) and so live in the line pool rather than as
+    /// one contiguous source slice. Emitted verbatim, line by line.
+    HtmlLines {
+        lines: LineRange,
+    },
     HorizontalRule,
 }

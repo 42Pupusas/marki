@@ -836,6 +836,22 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     continue;
                 }
 
+                // HTML block (CommonMark §4.6). Detect a start condition on the
+                // de-indented line; type 7 cannot interrupt an open paragraph.
+                if body.first() == SpecialChar::LessThan
+                    && let Some(kind) =
+                        crate::raw_html::html_block_start(body, !para.is_empty())
+                {
+                    Self::flush_para(&mut para, section_pool, pool, defs);
+                    let html_start = line_pool.len().pool_offset();
+                    i += Self::collect_html_block(&lines[i..], kind, line_pool);
+                    let len = line_pool.len().pool_offset() - html_start;
+                    section_pool.push(Section::HtmlLines {
+                        lines: LineRange::new(html_start, len),
+                    });
+                    continue;
+                }
+
                 // Setext heading underline promotes the open paragraph. The
                 // promoted lines keep soft breaks between them, matching how a
                 // paragraph would have rendered.
@@ -882,6 +898,43 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         scratch.give_lines(para);
         let len = section_pool.len().pool_offset() - start;
         SectionRange::new(start, len)
+    }
+
+    /// Collect the lines of an HTML block (`CommonMark` §4.6) from a container's
+    /// already-dedented `lines`, pushing each verbatim onto the line pool.
+    /// Returns the number of lines consumed. Types 1–5 end on the line holding
+    /// their end marker; types 6–7 end at (but exclude) a blank line.
+    fn collect_html_block(
+        lines: &[&'src str],
+        kind: crate::raw_html::HtmlBlockKind,
+        line_pool: &mut Vec<&'src str>,
+    ) -> usize {
+        use crate::raw_html::HtmlBlockKind;
+        let mut n = 0;
+        while n < lines.len() {
+            let l = lines[n];
+            let lb = l.as_bytes();
+            // Types 6 and 7 terminate before a blank line.
+            if matches!(kind, HtmlBlockKind::Type6 | HtmlBlockKind::Type7)
+                && lb.is_blank_line(0, lb.len())
+            {
+                break;
+            }
+            line_pool.push(l);
+            n += 1;
+            // Types 1–5 terminate on the line containing their end marker.
+            let ends = match kind {
+                HtmlBlockKind::Type1 => crate::raw_html::type1_end(lb),
+                HtmlBlockKind::Type6 | HtmlBlockKind::Type7 => false,
+                other => other
+                    .end_marker()
+                    .is_some_and(|m| lb.windows(m.len()).any(|w| w == m)),
+            };
+            if ends {
+                break;
+            }
+        }
+        n
     }
 
     /// Flush pending paragraph lines into one [`Section::Paragraph`] appended

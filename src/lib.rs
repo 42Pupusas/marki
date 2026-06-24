@@ -199,6 +199,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 | Section::CodeLines { .. }
                 | Section::IndentedCode { .. }
                 | Section::HtmlBlock { .. }
+                | Section::HtmlLines { .. }
                 | Section::HorizontalRule => {}
             }
         }
