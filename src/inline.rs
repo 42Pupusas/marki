@@ -268,6 +268,26 @@ impl<'src, const CAP: usize> InlineBuf<'src, CAP> {
         self.overflow.push(item);
     }
 
+    /// Drop the last element if it is a soft or hard line break. Used to
+    /// discard a trailing break at the end of a paragraph (`CommonMark` strips
+    /// trailing whitespace, so `foo  \n` renders as `foo`, not `foo<br />`).
+    fn pop_trailing_break(&mut self) {
+        if !self.overflow.is_empty() {
+            if matches!(
+                self.overflow.last(),
+                Some(Inline::SoftBreak | Inline::HardBreak)
+            ) {
+                self.overflow.pop();
+            }
+        } else if self.len > 0 {
+            // SAFETY: element len-1 was initialized via push.
+            let last = unsafe { self.stack[self.len - 1].assume_init_ref() };
+            if matches!(last, Inline::SoftBreak | Inline::HardBreak) {
+                self.len -= 1;
+            }
+        }
+    }
+
     /// Get initialized stack elements as a slice.
     #[inline]
     const fn initialized_stack(&self) -> &[Inline<'src>] {
@@ -301,6 +321,11 @@ pub struct InlineParser<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> {
     input: &'src str,
     pool: &'pool mut Vec<Inline<'src>>,
     defs: &'pool LinkDefs<'src>,
+    /// When true, strip leading whitespace at each line start and trailing
+    /// whitespace at each line end (`CommonMark` §4.8 / §6.8). Enabled for
+    /// paragraph bodies, where joined lines are reflowed; disabled for nested
+    /// contexts like link text and image alt, which preserve whitespace.
+    strip_lines: bool,
 }
 
 impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'pool, MAX_DEPTH, CAP> {
@@ -309,7 +334,12 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         pool: &'pool mut Vec<Inline<'src>>,
         defs: &'pool LinkDefs<'src>,
     ) -> Self {
-        Self { input, pool, defs }
+        Self {
+            input,
+            pool,
+            defs,
+            strip_lines: false,
+        }
     }
 
     /// Parse inline elements with configurable depth and stack limits.
@@ -319,6 +349,20 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         defs: &'pool LinkDefs<'src>,
     ) -> InlineSpan {
         Self::new(input, pool, defs).parse()
+    }
+
+    /// Like [`parse_configured`](Self::parse_configured), but treats the input
+    /// as a paragraph body: leading whitespace at each line start and trailing
+    /// whitespace at each line end are stripped (`CommonMark` reflows joined
+    /// paragraph lines).
+    pub(crate) fn parse_paragraph_configured(
+        input: &'src str,
+        pool: &'pool mut Vec<Inline<'src>>,
+        defs: &'pool LinkDefs<'src>,
+    ) -> InlineSpan {
+        let mut parser = Self::new(input, pool, defs);
+        parser.strip_lines = true;
+        parser.parse()
     }
 
     /// Push parsed inline elements directly into the pool without wrapping
@@ -344,11 +388,17 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         let bytes = self.input.as_bytes();
         // Fast path: if no special bytes exist, the entire input is plain text.
         if bytes.find_byte_set(0, &SPECIAL_SET).is_none() {
-            if self.input.is_empty() {
+            // A single line with no newline: paragraph reflow trims both ends.
+            let text = if self.strip_lines {
+                self.input.trim_matches([' ', '\t'])
+            } else {
+                self.input
+            };
+            if text.is_empty() {
                 return InlineSpan::EMPTY;
             }
             let start = self.pool.len().pool_offset();
-            self.pool.push(Inline::Text(self.input));
+            self.pool.push(Inline::Text(text));
             return InlineSpan::new(start, 1);
         }
         let emph = if bytes.len() < EMPH_SCAN_THRESHOLD {
@@ -358,7 +408,22 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         };
         let mut buf = InlineBuf::<CAP>::new();
         self.parse_into_buf(bytes, emph, &mut buf, depth);
+        // A paragraph never ends with a dangling break (trailing whitespace is
+        // stripped, so `foo  \n` is `foo`, not `foo<br />`).
+        if self.strip_lines {
+            buf.pop_trailing_break();
+        }
         buf.flush_to_pool(self.pool)
+    }
+
+    /// Skip leading spaces/tabs from `p` (a line start). Used for paragraph
+    /// reflow, where each continuation line's indentation is removed.
+    #[inline]
+    fn skip_line_leading_ws(bytes: &[u8], mut p: usize) -> usize {
+        while matches!(bytes.get(p), Some(b' ' | b'\t')) {
+            p += 1;
+        }
+        p
     }
 
     fn parse_inner(&mut self, input: &'src str, depth: u8) -> InlineSpan {
@@ -366,6 +431,9 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             input,
             pool: self.pool,
             defs: self.defs,
+            // Nested contexts (link text, image alt, emphasis bodies) preserve
+            // whitespace; only top-level paragraph reflow strips it.
+            strip_lines: false,
         }
         .parse_at_depth(depth)
     }
@@ -406,8 +474,13 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         buf: &mut InlineBuf<'src, CAP>,
         depth: u8,
     ) {
-        let mut plain_start = 0;
-        let mut i = 0;
+        // Paragraph reflow strips indentation at the start of the first line.
+        let mut plain_start = if self.strip_lines {
+            Self::skip_line_leading_ws(bytes, 0)
+        } else {
+            0
+        };
+        let mut i = plain_start;
 
         // SIMD-accelerated scan: find next special byte.
         while let Some(pos) = bytes.find_byte_set(i, &SPECIAL_SET) {
@@ -417,6 +490,10 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             if b == SpecialChar::Newline {
                 self.emit_line_break(bytes, plain_start, i, buf);
                 plain_start = i + 1;
+                // Paragraph reflow strips indentation at each line start.
+                if self.strip_lines {
+                    plain_start = Self::skip_line_leading_ws(bytes, plain_start);
+                }
                 i = plain_start;
                 continue;
             }
@@ -559,7 +636,14 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             i += 1;
         }
 
-        if let Some(text) = self.input.get(plain_start..)
+        // Trailing segment: paragraph reflow strips whitespace at the end of
+        // the final line.
+        let tail = if self.strip_lines {
+            self.input.get(plain_start..).map(|t| t.trim_end_matches([' ', '\t']))
+        } else {
+            self.input.get(plain_start..)
+        };
+        if let Some(text) = tail
             && !text.is_empty()
         {
             buf.push(Inline::Text(text));
@@ -577,7 +661,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         buf: &mut InlineBuf<'src, CAP>,
     ) {
         let preceding = bytes.get(plain_start..newline_pos).unwrap_or_default();
-        let (trim_end, is_hard) = if preceding.last() == SpecialChar::Backslash {
+        let (mut trim_end, is_hard) = if preceding.last() == SpecialChar::Backslash {
             (newline_pos - 1, true)
         } else {
             // Count trailing spaces with a simple backward loop.
@@ -593,6 +677,15 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 (newline_pos, false)
             }
         };
+        // Paragraph reflow strips trailing whitespace from each line, even the
+        // single trailing space that would otherwise survive a soft break.
+        if self.strip_lines {
+            while trim_end > plain_start
+                && matches!(bytes.get(trim_end - 1), Some(b' ' | b'\t'))
+            {
+                trim_end -= 1;
+            }
+        }
         if let Some(text) = self.input.get(plain_start..trim_end)
             && !text.is_empty()
         {

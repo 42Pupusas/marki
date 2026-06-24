@@ -368,7 +368,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 RawSection::Paragraph { text } => {
                     sections.push(Section::Paragraph {
                         content:
-                            InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_configured(
+                            InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_paragraph_configured(
                                 text, pool, defs,
                             ),
                     });

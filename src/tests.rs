@@ -951,16 +951,48 @@ fn test_soft_break_in_paragraph() {
 
 #[test]
 fn test_soft_break_single_trailing_space() {
+    // A single trailing space before a soft break is stripped (CommonMark
+    // reflows paragraph lines): the space is too few for a hard break and is
+    // removed as trailing line whitespace.
     let md: MarkdownFile<'_> = MarkdownFile::parse("line one \nline two");
     match &md.sections[0] {
         Section::Paragraph { content } => Checker::new(&md).check_span(
             *content,
             &[
-                Expect::Text("line one "),
+                Expect::Text("line one"),
                 Expect::SoftBreak,
                 Expect::Text("line two"),
             ],
         ),
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_paragraph_strips_leading_indentation_each_line() {
+    // CommonMark reflows paragraph lines: leading indentation on every line
+    // (including the first) is removed.
+    let md: MarkdownFile<'_> = MarkdownFile::parse("  aaa\n bbb");
+    match &md.sections[0] {
+        Section::Paragraph { content } => Checker::new(&md).check_span(
+            *content,
+            &[
+                Expect::Text("aaa"),
+                Expect::SoftBreak,
+                Expect::Text("bbb"),
+            ],
+        ),
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_paragraph_strips_trailing_whitespace_final_line() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("aaa   ");
+    match &md.sections[0] {
+        Section::Paragraph { content } => {
+            Checker::new(&md).check_span(*content, &[Expect::Text("aaa")]);
+        }
         other => panic!("expected paragraph, got {other:?}"),
     }
 }
