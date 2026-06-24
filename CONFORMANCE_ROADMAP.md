@@ -183,4 +183,22 @@ to lock in progress and prevent regressions.
   the image path). Next: Phase 2c part 2 — brackets on the delimiter stack for
   link/image *nesting precedence* (518/519/520/532/533), then the block-level
   tail (tabs, lists, blockquotes).
+- 2026-06-24: Quick wins batch. 93.3% → 95.1% over four commits:
+  - **ATX heading edges** (93.3% → 93.7%, ATX 18/18): the opening hash run may
+    be followed by a space, a tab, **or** end-of-line — bare `#` is an empty
+    heading and `#\tFoo` is valid (`src/block.rs`).
+  - **Raw HTML comments** (93.7% → 93.9%, Raw HTML 20/20): CommonMark 0.30
+    rules — `<!-->`/`<!--->` are complete comments, otherwise the text after
+    `<!--` may not begin with `>` or `->` (`src/raw_html.rs`).
+  - **Inline-code/autolink/raw-HTML precedence over link brackets** (93.9% →
+    94.9%, Links 78→84): `find_matching_close` now skips over any code span,
+    autolink, or raw HTML beginning inside the brackets so a `]` within one
+    can't close the link (`src/inline.rs`, examples 342/524/525/526/536/537/538).
+  - **Unmatched backtick run is literal** (94.9% → 95.1%, Code spans 22/22):
+    an opening run of N backticks with no closing run of exactly N is literal;
+    skip the whole run so a shorter sub-run can't re-open (example 347).
+  Perf gate held throughout (verified against a same-session baseline:
+  `find_matching_close` change within ~3%, others render/block-only).
+  Remaining 32: link *nesting* (518/519/520/532/533), block containers
+  (tabs 8, blockquotes 5, lists 9, HTML-in-container 2), misc (540 case-fold).
   (tabs, lists, blockquotes).
