@@ -45,6 +45,7 @@
 //! ```
 
 mod block;
+pub(crate) mod entity;
 mod html;
 mod inline;
 mod link_def;

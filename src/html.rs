@@ -23,6 +23,54 @@ fn escape_html(s: &str, out: &mut String) {
     }
 }
 
+/// Like [`escape_html`], but first resolves numeric character references
+/// (`CommonMark` §2.5). Entities are decoded *late*, at render time, because
+/// they never affect document structure. Used only for `Inline::Text`; code
+/// spans and code blocks keep entities verbatim.
+fn escape_text(s: &str, out: &mut String) {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'&'
+            && let Some((ch, consumed)) = crate::entity::decode_numeric(&bytes[i..])
+        {
+            // A decoded character is emitted as literal text, so it must still
+            // be HTML-escaped (e.g. `&#34;` -> `"` -> `&quot;`).
+            push_escaped_char(ch, out);
+            i += consumed;
+            continue;
+        }
+        match b {
+            b'&' => out.push_str("&amp;"),
+            b'<' => out.push_str("&lt;"),
+            b'>' => out.push_str("&gt;"),
+            b'"' => out.push_str("&quot;"),
+            // ASCII fast path; multi-byte UTF-8 falls through to a char decode.
+            _ if b < 0x80 => out.push(b as char),
+            _ => {
+                let ch = s[i..].chars().next().unwrap_or('\u{FFFD}');
+                out.push(ch);
+                i += ch.len_utf8();
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Push a single already-decoded character, HTML-escaping the four significant
+/// metacharacters.
+fn push_escaped_char(ch: char, out: &mut String) {
+    match ch {
+        '&' => out.push_str("&amp;"),
+        '<' => out.push_str("&lt;"),
+        '>' => out.push_str("&gt;"),
+        '"' => out.push_str("&quot;"),
+        _ => out.push(ch),
+    }
+}
+
 /// Escape a URL for use in an `href`/`src` attribute. The reference renderer
 /// percent-encodes a handful of bytes; for our simple corpus only the HTML
 /// metacharacters matter.
@@ -169,7 +217,7 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
 
     fn render_inline(&self, inline: &Inline<'_>, out: &mut String) {
         match inline {
-            Inline::Text(t) => escape_html(t, out),
+            Inline::Text(t) => escape_text(t, out),
             Inline::Bold(span) => {
                 out.push_str("<strong>");
                 self.render_inlines(*span, out);
