@@ -232,12 +232,25 @@ impl BlockBytes for [u8] {
     }
 
     fn strip_indent(&self) -> Option<usize> {
+        // Measure leading whitespace in *columns* (a tab advances to the next
+        // 4-column stop, CommonMark §2.2): return the byte length of 0-3
+        // columns of indentation, or None once it reaches ≥4 columns (the line
+        // can then only open indented code or continue it). Because a tab from
+        // column 0-3 always lands on column 4, a sub-4-column result is always
+        // pure spaces, so the byte length still equals the column count for
+        // every caller that uses it as a strip offset.
+        let mut col = 0;
         let mut n = 0;
-        while n < self.len() && self[n] == SpecialChar::Space {
-            n += 1;
-            if n > 3 {
+        while let Some(&b) = self.get(n) {
+            match b {
+                b' ' => col += 1,
+                b'\t' => col += 4 - (col % 4),
+                _ => break,
+            }
+            if col >= 4 {
                 return None;
             }
+            n += 1;
         }
         Some(n)
     }
