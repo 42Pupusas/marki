@@ -433,6 +433,26 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         }
     }
 
+    /// Render an image's `alt` attribute: the plain-text content of the parsed
+    /// alt inlines (`CommonMark` §6.4). Emphasis/link/code markup is dropped,
+    /// keeping only textual content; nested images contribute their own alt.
+    /// Line breaks become a single space and the result is HTML-escaped.
+    fn render_alt_text(&self, span: InlineSpan, out: &mut String) {
+        for inline in self.inlines(span) {
+            match inline {
+                Inline::Text(t) => escape_text(t, out),
+                Inline::Code(c) => escape_html(c, out),
+                Inline::Autolink { target, .. } => escape_html(target, out),
+                Inline::RawHtml(h) => escape_html(h, out),
+                Inline::Bold(s) | Inline::Italic(s) | Inline::Link { text: s, .. } => {
+                    self.render_alt_text(*s, out);
+                }
+                Inline::Image { alt, .. } => self.render_alt_text(*alt, out),
+                Inline::SoftBreak | Inline::HardBreak => out.push('\n'),
+            }
+        }
+    }
+
     fn render_inline(&self, inline: &Inline<'_>, out: &mut String) {
         match inline {
             Inline::Text(t) => escape_text(t, out),
@@ -479,7 +499,7 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 out.push_str("<img src=\"");
                 escape_href(url, out);
                 out.push_str("\" alt=\"");
-                escape_html(alt, out);
+                self.render_alt_text(*alt, out);
                 out.push('"');
                 if let Some(title) = title {
                     out.push_str(" title=\"");

@@ -18,7 +18,10 @@ pub enum Inline<'src> {
         title: Option<&'src str>,
     },
     Image {
-        alt: &'src str,
+        /// The alt text parsed as inlines (`CommonMark` §6.4): the renderer
+        /// flattens it to plain text, dropping emphasis/link markup but keeping
+        /// the textual content (e.g. `![foo *bar*]` → alt `foo bar`).
+        alt: InlineSpan,
         url: &'src str,
         title: Option<&'src str>,
     },
@@ -894,6 +897,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 {
                     buf.push(Inline::Text(text));
                 }
+                let alt = self.parse_inner(alt, depth.saturating_add(1));
                 buf.push(Inline::Image { alt, url, title });
                 plain_start = end;
                 i = end;
@@ -908,11 +912,8 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 {
                     buf.push(Inline::Text(text));
                 }
-                buf.push(Inline::Image {
-                    alt: text_str,
-                    url,
-                    title,
-                });
+                let alt = self.parse_inner(text_str, depth.saturating_add(1));
+                buf.push(Inline::Image { alt, url, title });
                 plain_start = end;
                 i = end;
                 continue;
@@ -1125,6 +1126,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                     Self::try_parse_bracket_paren(self.input, bytes, i + 1)
             {
                 flush_text!(i);
+                let alt = self.parse_inner(alt, depth.saturating_add(1));
                 arena.push_node(EmphKind::Resolved(Inline::Image { alt, url, title }));
                 plain_start = end;
                 i = end;
@@ -1135,6 +1137,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 && let Some((alt, url, title, end)) = self.try_parse_reference(bytes, i + 1)
             {
                 flush_text!(i);
+                let alt = self.parse_inner(alt, depth.saturating_add(1));
                 arena.push_node(EmphKind::Resolved(Inline::Image { alt, url, title }));
                 plain_start = end;
                 i = end;

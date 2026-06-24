@@ -173,4 +173,14 @@ to lock in progress and prevent regressions.
   sections now perfect that weren't. Perf gate held (verified against a
   same-session stashed baseline; render-path change, parse benches flat).
   Next: Phase 2c (link nesting + inline alt) or the block-level long tail
+- 2026-06-24: Phase 2c (part 1) — image alt as parsed inlines. 92.2% → 93.3%
+  (Images 15→22/22, all perfect). `Inline::Image.alt` is now an `InlineSpan`
+  parsed like link text; the renderer flattens it to plain text
+  (`render_alt_text`), dropping emphasis/link/code markup but keeping textual
+  content and recursing into nested images (`![foo *bar*]` → alt `foo bar`,
+  `![foo ![bar](/u)](/v)` → alt `foo bar`). Fixed examples 573/574/575/576/577/
+  585/589. Perf gate held (same-session stashed baseline; nested parse only on
+  the image path). Next: Phase 2c part 2 — brackets on the delimiter stack for
+  link/image *nesting precedence* (518/519/520/532/533), then the block-level
+  tail (tabs, lists, blockquotes).
   (tabs, lists, blockquotes).

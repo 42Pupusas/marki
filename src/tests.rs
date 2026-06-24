@@ -105,9 +105,9 @@ impl<'md, 'src> Checker<'md, 'src> {
                     title: eti,
                 },
             ) => {
-                assert_eq!(alt, ea, "Image alt mismatch at index {idx}");
                 assert_eq!(url, eu, "Image url mismatch at index {idx}");
                 assert_eq!(title, eti, "Image title mismatch at index {idx}");
+                self.check_span(*alt, ea);
             }
             (
                 Inline::Autolink { target, is_email },
@@ -143,7 +143,7 @@ enum Expect<'a> {
         title: Option<&'a str>,
     },
     Image {
-        alt: &'a str,
+        alt: Vec<Self>,
         url: &'a str,
         title: Option<&'a str>,
     },
@@ -491,7 +491,7 @@ fn test_link_ref_image() {
         Section::Paragraph { content } => Checker::new(&md).check_span(
             *content,
             &[Expect::Image {
-                alt: "alt",
+                alt: vec![Expect::Text("alt")],
                 url: "/img.png",
                 title: Some("t"),
             }],
@@ -679,7 +679,7 @@ fn test_image() {
         Section::Paragraph { content } => Checker::new(&md).check_span(
             *content,
             &[Expect::Image {
-                alt: "alt text",
+                alt: vec![Expect::Text("alt text")],
                 url: "image.png",
                 title: None,
             }],
@@ -1265,7 +1265,7 @@ fn test_image_with_title() {
         Section::Paragraph { content } => Checker::new(&md).check_span(
             *content,
             &[Expect::Image {
-                alt: "alt",
+                alt: vec![Expect::Text("alt")],
                 url: "img.png",
                 title: Some("photo"),
             }],
