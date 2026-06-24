@@ -146,6 +146,10 @@ enum Accumulator<'src> {
     Empty,
     InBlockquote {
         lines_start: u32,
+        /// True when the most recent quoted line was blank (an empty `>` line).
+        /// A blank line closes the inner paragraph, so the next marker-less
+        /// line cannot lazily continue the blockquote (`CommonMark` §5.1).
+        last_blank: bool,
     },
     InParagraph {
         content: &'src str,
@@ -166,7 +170,7 @@ impl<'src> Accumulator<'src> {
             // Empty produces nothing; indented code needs `input` to slice its
             // span, so it is handled directly in `flush_acc` and never here.
             Self::Empty | Self::InIndentedCode { .. } => None,
-            Self::InBlockquote { lines_start } => Some(RawSection::Blockquote {
+            Self::InBlockquote { lines_start, .. } => Some(RawSection::Blockquote {
                 lines_start,
                 lines_len: lines_pool_len - lines_start,
             }),
@@ -1619,6 +1623,7 @@ impl<'src> ParseCtx<'src> {
     /// Detect and fold all block-level constructs. Computes `CommonMark` 0-3
     /// space indentation internally.
     #[inline]
+    #[allow(clippy::too_many_lines)]
     fn fold_block_element(
         &mut self,
         acc: Accumulator<'src>,
@@ -1629,10 +1634,25 @@ impl<'src> ParseCtx<'src> {
         // Lines with 4+ leading spaces cannot start a block-level construct.
         let Some(indent) = self.bytes[pos..line_end].strip_indent() else {
             // 4+ leading spaces.
-            if let Accumulator::InBlockquote { lines_start } = acc {
-                // Blockquote lazy continuation.
-                self.lines.push(self.input.get(pos..line_end).unwrap_or(""));
-                return Accumulator::InBlockquote { lines_start };
+            if let Accumulator::InBlockquote {
+                lines_start,
+                last_blank,
+            } = acc
+            {
+                // Lazy continuation only when the previous quoted line was not
+                // blank; a blank line closes the inner paragraph.
+                if !last_blank {
+                    self.lines.push(self.input.get(pos..line_end).unwrap_or(""));
+                    return Accumulator::InBlockquote {
+                        lines_start,
+                        last_blank: false,
+                    };
+                }
+                self.flush_acc(Accumulator::InBlockquote {
+                    lines_start,
+                    last_blank,
+                });
+                return self.fold_block_element(Accumulator::Empty, pos, line_end);
             }
             if matches!(acc, Accumulator::InParagraph { .. }) {
                 // An indented line cannot interrupt a paragraph (CommonMark
@@ -1690,26 +1710,45 @@ impl<'src> ParseCtx<'src> {
             } else {
                 self.input.get(content_start..line_end).unwrap_or("")
             };
-            if let Accumulator::InBlockquote { lines_start } = acc {
+            let cb = content.as_bytes();
+            let last_blank = cb.is_blank_line(0, cb.len());
+            if let Accumulator::InBlockquote { lines_start, .. } = acc {
                 self.lines.push(content);
-                return Accumulator::InBlockquote { lines_start };
+                return Accumulator::InBlockquote {
+                    lines_start,
+                    last_blank,
+                };
             }
             self.flush_acc(acc);
             let lines_start = self.lines.len().lines_offset();
             self.lines.push(content);
-            return Accumulator::InBlockquote { lines_start };
+            return Accumulator::InBlockquote {
+                lines_start,
+                last_blank,
+            };
         }
 
         // Blockquote lazy continuation (CommonMark §5.1): a non-blank line
         // that doesn't start a new block-level construct continues the
-        // current blockquote.
-        let acc = if let Accumulator::InBlockquote { lines_start } = acc {
-            if self.blockquote_continues(line_bytes, spos) {
+        // current blockquote — but only when the blockquote's last line was
+        // not blank (a blank line closes the inner paragraph, ending laziness).
+        let acc = if let Accumulator::InBlockquote {
+            lines_start,
+            last_blank,
+        } = acc
+        {
+            if !last_blank && self.blockquote_continues(line_bytes, spos) {
                 self.lines.push(self.input.get(pos..line_end).unwrap_or(""));
-                return Accumulator::InBlockquote { lines_start };
+                return Accumulator::InBlockquote {
+                    lines_start,
+                    last_blank: false,
+                };
             }
             // Line starts a new block — flush the blockquote and fall through.
-            self.flush_acc(Accumulator::InBlockquote { lines_start });
+            self.flush_acc(Accumulator::InBlockquote {
+                lines_start,
+                last_blank,
+            });
             Accumulator::Empty
         } else {
             acc
