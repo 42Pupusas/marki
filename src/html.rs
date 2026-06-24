@@ -71,18 +71,138 @@ fn push_escaped_char(ch: char, out: &mut String) {
     }
 }
 
-/// Escape a URL for use in an `href`/`src` attribute. The reference renderer
-/// percent-encodes a handful of bytes; for our simple corpus only the HTML
-/// metacharacters matter.
+/// Per-byte URL safety table mirroring the `CommonMark` reference renderer
+/// (`houdini_escape_href` / JavaScript `encodeURI`). `true` means the byte is
+/// emitted verbatim; `false` means it is percent-encoded as `%XX`. All bytes
+/// ≥ 0x80 are encoded (their UTF-8 representation). `&` is handled specially
+/// (→ `&amp;`) before this table is consulted.
+static HREF_SAFE: [bool; 256] = {
+    let mut t = [false; 256];
+    let mut b = b'!';
+    while b <= b'~' {
+        t[b as usize] = true;
+        b += 1;
+    }
+    // Carve out the unsafe ASCII punctuation that `encodeURI` percent-encodes.
+    let unsafe_bytes = [
+        b'"', b'<', b'>', b'[', b'\\', b']', b'^', b'`', b'{', b'|', b'}',
+    ];
+    let mut i = 0;
+    while i < unsafe_bytes.len() {
+        t[unsafe_bytes[i] as usize] = false;
+        i += 1;
+    }
+    t
+};
+
+/// Percent-encode a single byte as `%XX` (uppercase hex), or emit it verbatim
+/// when [`HREF_SAFE`] permits.
+fn push_href_byte(b: u8, out: &mut String) {
+    if HREF_SAFE[b as usize] {
+        out.push(b as char);
+    } else {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        out.push('%');
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+}
+
+/// Encode one already-decoded character into an `href`: `&` becomes `&amp;`,
+/// everything else is percent-encoded byte-by-byte (safe bytes pass through).
+fn push_href_char(ch: char, out: &mut String) {
+    if ch == '&' {
+        out.push_str("&amp;");
+        return;
+    }
+    let mut buf = [0u8; 4];
+    for &b in ch.encode_utf8(&mut buf).as_bytes() {
+        push_href_byte(b, out);
+    }
+}
+
+/// Escape a link/image **destination** for an `href`/`src` attribute, matching
+/// the `CommonMark` reference renderer: resolve backslash escapes, decode
+/// numeric character references, preserve existing `%XX` sequences, then
+/// percent-encode unsafe bytes. `&` becomes `&amp;` (or a decoded entity).
 fn escape_href(s: &str, out: &mut String) {
-    for ch in s.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '"' => out.push_str("&quot;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            _ => out.push(ch),
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' && bytes.get(i + 1).is_some_and(u8::is_ascii_punctuation) {
+            push_href_char(bytes[i + 1] as char, out);
+            i += 2;
+            continue;
         }
+        if b == b'&' {
+            if let Some((ch, consumed)) = crate::entity::decode_numeric(&bytes[i..]) {
+                push_href_char(ch, out);
+                i += consumed;
+            } else {
+                // Named entities need the full HTML5 table (deferred); emit the
+                // literal ampersand HTML-escaped.
+                out.push_str("&amp;");
+                i += 1;
+            }
+            continue;
+        }
+        push_href_byte(b, out);
+        i += 1;
+    }
+}
+
+/// Escape an **autolink** target. Like [`escape_href`] but backslash escapes
+/// are *not* resolved (autolink content is literal per `CommonMark` §6.5), so a
+/// `\` is percent-encoded like any other unsafe byte.
+fn escape_href_autolink(s: &str, out: &mut String) {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'&' {
+            out.push_str("&amp;");
+            i += 1;
+            continue;
+        }
+        push_href_byte(b, out);
+        i += 1;
+    }
+}
+
+/// Escape a link/image **title**: resolve backslash escapes and numeric
+/// character references, then HTML-escape the result.
+fn escape_link_title(s: &str, out: &mut String) {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' && bytes.get(i + 1).is_some_and(u8::is_ascii_punctuation) {
+            push_escaped_char(bytes[i + 1] as char, out);
+            i += 2;
+            continue;
+        }
+        if b == b'&'
+            && let Some((ch, consumed)) = crate::entity::decode_numeric(&bytes[i..])
+        {
+            push_escaped_char(ch, out);
+            i += consumed;
+            continue;
+        }
+        match b {
+            b'&' => out.push_str("&amp;"),
+            b'<' => out.push_str("&lt;"),
+            b'>' => out.push_str("&gt;"),
+            b'"' => out.push_str("&quot;"),
+            _ if b < 0x80 => out.push(b as char),
+            _ => {
+                let ch = s[i..].chars().next().unwrap_or('\u{FFFD}');
+                out.push(ch);
+                i += ch.len_utf8();
+                continue;
+            }
+        }
+        i += 1;
     }
 }
 
@@ -296,7 +416,7 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 if *is_email {
                     out.push_str("mailto:");
                 }
-                escape_href(target, out);
+                escape_href_autolink(target, out);
                 out.push_str("\">");
                 escape_html(target, out);
                 out.push_str("</a>");
@@ -308,7 +428,7 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 out.push('"');
                 if let Some(title) = title {
                     out.push_str(" title=\"");
-                    escape_html(title, out);
+                    escape_link_title(title, out);
                     out.push('"');
                 }
                 out.push('>');
@@ -323,7 +443,7 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 out.push('"');
                 if let Some(title) = title {
                     out.push_str(" title=\"");
-                    escape_html(title, out);
+                    escape_link_title(title, out);
                     out.push('"');
                 }
                 out.push_str(" />");

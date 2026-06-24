@@ -86,14 +86,33 @@ Results: **Emphasis 68→131/132**, overall **485→557/652**. All 134 lib tests
 pass, clippy clean. Perf gate held: corpus benches within ±7% of baseline
 (awesome −8%, commonmark_spec +6.8%, rust_readme −2%; spec_vectors flat).
 
-### Phase 2 — Link/image inline content + nesting  (target ~85%)
-Parse link text and image alt as inlines; forbid nested links; handle outer
-link suppression (`[foo [bar](/uri)](/uri)`). Falls out of Phase 1's stack.
+### Phase 2 — Links/images: destination/title parsing + normalization
+**2a + 2b DONE (85.4% → 89.4%). 2c remaining.**
 
-### Phase 3 — URL/title/entity normalization  (target ~89%)
-One normalization pass for destinations + titles: backslash-escape resolution,
-entity decode (wire in `entity.rs`), percent-encoding, angle-bracket and
-balanced-paren destinations. Fixes Links/Images/Entities/Backslash/Autolinks tails.
+- **2a ✅ destination/title syntax** (85.4% → 87.1%): replaced the naive
+  "grab between parens + guess title backwards" with a real `CommonMark` §6.3
+  link-tail parser in `src/inline.rs` (`scan_link_tail` / `scan_link_destination`
+  / `scan_link_title` / `skip_link_ws`). Handles the angle `<…>` form, balanced
+  bare destinations, space/newline/control rejection, and the three title quote
+  forms. Pure source-slicing — no type or render change. Deleted `split_url_title`.
+- **2b ✅ URL/title normalization** (87.1% → 89.4%): render-time encoders in
+  `src/html.rs`. `escape_href` now resolves backslash escapes + numeric entities,
+  preserves existing `%XX`, and percent-encodes unsafe bytes via the `HREF_SAFE`
+  table (`encodeURI` semantics). `escape_href_autolink` does the same minus
+  backslash resolution (autolinks are literal). `escape_link_title` resolves
+  escapes + numeric entities then HTML-escapes. Autolinks now **19/19**.
+- **2c TODO — inline content in link-text/image-alt + link nesting**: parse alt
+  as inlines (573–589), forbid links-in-links and handle outer-link suppression
+  (`[foo [bar](/uri)](/uri)` → 518/519/532/533). Needs brackets on the
+  delimiter stack — the hardest piece. ~12 examples.
+
+Note: the remaining Entities/title failures (25, 32–34, 41, 506, 503) need the
+full HTML5 **named-entity** table — moved to Phase 3.
+
+### Phase 3 — Named-entity table  (target ~91%)
+Wire the ~2125-entry HTML5 named character reference table into `entity.rs` so
+`&ouml;`/`&copy;`/`&quot;` decode in text, hrefs, titles, and code-fence info
+strings. Unblocks Entities (12/17→17), plus several Links/Images title cases.
 
 ### Phase 4 — Code-span & line-break normalization  (target ~91%)
 Code spans: collapse interior newlines to spaces, strip one leading/trailing
@@ -114,3 +133,8 @@ to lock in progress and prevent regressions.
 - 2026-06-24: Baseline recorded (74.4%, perf table above). Roadmap created.
 - 2026-06-24: Phase 1 complete — emphasis delimiter-stack rewrite. 74.4% → 85.4%
   (Emphasis 68→131/132). Perf gate held (corpus benches within ±7%). Next: Phase 2.
+- 2026-06-24: Phase 2a+2b complete — real link destination/title parser +
+  render-time URL/title normalization. 85.4% → 89.4% (Links 59→76, Images 14→15,
+  Autolinks 18→19/19, Backslash 9→12, Link-ref-defs 23→26). Perf gate held
+  (render-only + scanner change; commonmark_spec +7%). Next: Phase 2c (inline
+  alt + link nesting), then Phase 3 (named entities).

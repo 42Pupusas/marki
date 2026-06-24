@@ -1337,23 +1337,128 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             return None;
         }
 
-        let paren_start = paren_pos + 1;
-        let paren_end = Self::find_matching_close(
-            bytes,
-            paren_start,
-            SpecialChar::OpenParen,
-            SpecialChar::CloseParen,
-        )?;
+        let (url, title, end) = Self::scan_link_tail(input, bytes, paren_pos)?;
+        Some((input.get(bracket_start..bracket_end)?, url, title, end))
+    }
 
-        let paren_content = input.get(paren_start..paren_end)?;
-        let (url, title) = Self::split_url_title(paren_content);
+    /// Parse a link/image tail `(destination "title")` beginning at `paren`
+    /// (the `(` byte), per `CommonMark` §6.3. Handles angle-bracket and
+    /// balanced bare destinations, the three title quote forms, and optional
+    /// surrounding whitespace. Returns the raw source slices for url and title
+    /// (backslash/entity decoding and percent-encoding happen later, at render
+    /// time) plus the index just past the closing `)`.
+    fn scan_link_tail(
+        input: &'src str,
+        bytes: &[u8],
+        paren: usize,
+    ) -> Option<(&'src str, Option<&'src str>, usize)> {
+        let mut i = Self::skip_link_ws(bytes, paren + 1);
+        let (url, after_dest) = Self::scan_link_destination(input, bytes, i)?;
+        i = after_dest;
 
-        Some((
-            input.get(bracket_start..bracket_end)?,
-            url,
-            title,
-            paren_end + 1,
-        ))
+        // A title, if present, must be separated from the destination by
+        // whitespace; otherwise only trailing whitespace before `)` is allowed.
+        let ws_end = Self::skip_link_ws(bytes, i);
+        let mut title = None;
+        if ws_end > i
+            && let Some((t, after_title)) = Self::scan_link_title(input, bytes, ws_end)
+        {
+            title = Some(t);
+            i = Self::skip_link_ws(bytes, after_title);
+        } else {
+            i = ws_end;
+        }
+
+        if bytes.get(i).copied() != Some(SpecialChar::CloseParen.byte()) {
+            return None;
+        }
+        Some((url, title, i + 1))
+    }
+
+    /// Scan a link destination at `start`. Returns the destination slice (inner
+    /// content for the `<...>` form, without the angle brackets) and the index
+    /// just past it. The bare form requires balanced parentheses and forbids
+    /// ASCII spaces and control characters; the angle form forbids line breaks
+    /// and unescaped `<`/`>`.
+    fn scan_link_destination(
+        input: &'src str,
+        bytes: &[u8],
+        start: usize,
+    ) -> Option<(&'src str, usize)> {
+        if bytes.get(start).copied() == Some(SpecialChar::LessThan.byte()) {
+            let mut j = start + 1;
+            loop {
+                match bytes.get(j).copied() {
+                    None | Some(b'\n' | b'<') => return None,
+                    Some(b'>') => return Some((input.get(start + 1..j)?, j + 1)),
+                    Some(b'\\') if bytes.get(j + 1).is_some_and(u8::is_ascii_punctuation) => {
+                        j += 2;
+                    }
+                    Some(_) => j += 1,
+                }
+            }
+        } else {
+            let mut j = start;
+            let mut depth = 0u32;
+            loop {
+                match bytes.get(j).copied() {
+                    None => break,
+                    Some(b'\\') if bytes.get(j + 1).is_some_and(u8::is_ascii_punctuation) => {
+                        j += 2;
+                    }
+                    Some(b'(') => {
+                        depth += 1;
+                        j += 1;
+                    }
+                    Some(b')') => {
+                        if depth == 0 {
+                            break;
+                        }
+                        depth -= 1;
+                        j += 1;
+                    }
+                    // ASCII space or any control character ends the destination.
+                    Some(b) if b <= b' ' || b == 0x7f => break,
+                    Some(_) => j += 1,
+                }
+            }
+            if depth != 0 {
+                return None;
+            }
+            Some((input.get(start..j)?, j))
+        }
+    }
+
+    /// Scan an optional link title at `start` (`"..."`, `'...'`, or `(...)`),
+    /// returning the inner slice and the index just past the closing delimiter.
+    /// In the `(...)` form an unescaped `(` is disallowed.
+    fn scan_link_title(input: &'src str, bytes: &[u8], start: usize) -> Option<(&'src str, usize)> {
+        let (open, close) = match bytes.get(start).copied()? {
+            b'"' => (b'"', b'"'),
+            b'\'' => (b'\'', b'\''),
+            b'(' => (b'(', b')'),
+            _ => return None,
+        };
+        let mut j = start + 1;
+        loop {
+            match bytes.get(j).copied() {
+                None => return None,
+                Some(b'\\') if bytes.get(j + 1).is_some_and(u8::is_ascii_punctuation) => {
+                    j += 2;
+                }
+                Some(b) if b == open && open != close => return None,
+                Some(b) if b == close => return Some((input.get(start + 1..j)?, j + 1)),
+                Some(_) => j += 1,
+            }
+        }
+    }
+
+    /// Skip spaces, tabs, and line endings around link destinations/titles.
+    fn skip_link_ws(bytes: &[u8], mut i: usize) -> usize {
+        while matches!(bytes.get(i).copied(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            i += 1;
+        }
+        i
     }
 
     /// Try to parse a reference link/image at `start` (the `[`). Handles all
@@ -1422,71 +1527,6 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             return None;
         }
         self.defs.get(&normalize_label(label)).copied()
-    }
-
-    /// Split the content inside `(...)` into a URL and optional title
-    /// (`CommonMark` §6.3).
-    ///
-    /// Titles are delimited by `"..."`, `'...'`, or `(...)`.
-    ///
-    /// We scan **backwards** because the title, if present, is always at the
-    /// end. The algorithm:
-    ///  1. Check the last byte for a closing title delimiter (`"`, `'`, `)`).
-    ///  2. Walk backwards to find the matching opener.
-    ///  3. The opener must be preceded by whitespace — this separates the URL
-    ///     from the title. If no whitespace is found, there is no title.
-    ///  4. For **paired** delimiters (`(…)`), if the first candidate opener
-    ///     lacks preceding whitespace we keep scanning for an earlier `(`
-    ///     that does. For **same-char** delimiters (`"…"`, `'…'`), the first
-    ///     match is the only candidate (no nesting possible).
-    fn split_url_title(content: &'src str) -> (&'src str, Option<&'src str>) {
-        let trimmed = content.trim();
-        // A valid title needs at minimum: url, space, open+close quotes (e.g. `u "t"`).
-        // With fewer than 3 bytes the backward scan would underflow.
-        if trimmed.len() < 3 {
-            return (trimmed, None);
-        }
-
-        let bytes = trimmed.as_bytes();
-        let last = bytes[bytes.len() - 1];
-        let (open, close) = match SpecialChar::from_byte(last) {
-            Some(SpecialChar::DoubleQuote) => (SpecialChar::DoubleQuote, SpecialChar::DoubleQuote),
-            Some(SpecialChar::SingleQuote) => (SpecialChar::SingleQuote, SpecialChar::SingleQuote),
-            Some(SpecialChar::CloseParen) => (SpecialChar::OpenParen, SpecialChar::CloseParen),
-            // No trailing title delimiter — the entire content is the URL.
-            _ => return (trimmed, None),
-        };
-
-        // Scan backwards for the matching opening delimiter.
-        let mut j = bytes.len() - 2;
-        loop {
-            if bytes[j] == open {
-                // Whitespace before the opener separates URL from title.
-                if j > 0 && bytes[j - 1].is_ascii_whitespace() {
-                    let url = trimmed.get(..j).unwrap_or(trimmed).trim_end();
-                    let title = trimmed.get(j + 1..bytes.len() - 1).unwrap_or("");
-                    return (url, Some(title));
-                }
-                // For paired delimiters (open != close), keep scanning for an
-                // earlier opener that *does* have preceding whitespace.
-                if open != close {
-                    if j == 0 {
-                        break;
-                    }
-                    j -= 1;
-                    continue;
-                }
-                // Same-char delimiter: first match is the only candidate.
-                break;
-            }
-            if j == 0 {
-                break;
-            }
-            j -= 1;
-        }
-
-        // No valid title found — treat entire content as URL.
-        (trimmed, None)
     }
 
     #[inline]
