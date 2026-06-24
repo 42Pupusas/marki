@@ -543,6 +543,7 @@ impl CharClass {
             '\u{00A1}'..='\u{00BF}' // Latin punctuation/symbols
             | '\u{2010}'..='\u{2027}' // General punctuation
             | '\u{2030}'..='\u{205E}' // More general punctuation
+            | '\u{20A0}'..='\u{20CF}' // Currency symbols (Sc), e.g. U+20AC EURO
             | '\u{2190}'..='\u{23FF}' // Arrows, math operators, misc technical
             | '\u{2500}'..='\u{2BFF}' // Box drawing, block elements, symbols
             | '\u{3000}'..='\u{303F}' // CJK symbols and punctuation

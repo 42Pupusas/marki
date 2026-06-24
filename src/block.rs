@@ -300,7 +300,11 @@ impl BlockBytes for [u8] {
         line_offset: usize,
     ) -> Option<(u8, &'src str)> {
         let level = SpecialChar::Hash.count_leading_bytes(self);
-        if !(1..=6).contains(&level) || self.get(level) != SpecialChar::Space {
+        // The opening hash sequence must be followed by a space, a tab, or the
+        // end of the line (CommonMark §4.2).
+        if !(1..=6).contains(&level)
+            || !matches!(self.get(level), None | Some(&b' ' | &b'\t'))
+        {
             return None;
         }
         // Trim leading whitespace after '#'s.
