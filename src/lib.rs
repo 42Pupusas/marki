@@ -44,6 +44,7 @@
 //! ```
 
 mod block;
+pub(crate) mod entities_table;
 pub(crate) mod entity;
 mod html;
 mod inline;

@@ -50,21 +50,24 @@ fn escape_html(s: &str, out: &mut String) {
     }
 }
 
-/// Like [`escape_html`], but first resolves numeric character references
-/// (`CommonMark` §2.5). Entities are decoded *late*, at render time, because
-/// they never affect document structure. Used only for `Inline::Text`; code
-/// spans and code blocks keep entities verbatim.
+/// Like [`escape_html`], but first resolves character references (`CommonMark`
+/// §2.5): numeric (`&#35;`, `&#x22;`) and the full set of named references
+/// (`&ouml;`). Entities are decoded *late*, at render time, because they never
+/// affect document structure. Used only for `Inline::Text`; code spans and code
+/// blocks keep entities verbatim.
 fn escape_text(s: &str, out: &mut String) {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
         if b == b'&'
-            && let Some((ch, consumed)) = crate::entity::decode_numeric(&bytes[i..])
+            && let Some((entity, consumed)) = crate::entity::decode_entity(&bytes[i..])
         {
             // A decoded character is emitted as literal text, so it must still
             // be HTML-escaped (e.g. `&#34;` -> `"` -> `&quot;`).
-            push_escaped_char(ch, out);
+            for ch in entity.chars() {
+                push_escaped_char(ch, out);
+            }
             i += consumed;
             continue;
         }
@@ -150,8 +153,8 @@ fn push_href_char(ch: char, out: &mut String) {
 
 /// Escape a link/image **destination** for an `href`/`src` attribute, matching
 /// the `CommonMark` reference renderer: resolve backslash escapes, decode
-/// numeric character references, preserve existing `%XX` sequences, then
-/// percent-encode unsafe bytes. `&` becomes `&amp;` (or a decoded entity).
+/// character references (numeric and named), preserve existing `%XX` sequences,
+/// then percent-encode unsafe bytes. `&` becomes `&amp;` (or a decoded entity).
 fn escape_href(s: &str, out: &mut String) {
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -163,12 +166,12 @@ fn escape_href(s: &str, out: &mut String) {
             continue;
         }
         if b == b'&' {
-            if let Some((ch, consumed)) = crate::entity::decode_numeric(&bytes[i..]) {
-                push_href_char(ch, out);
+            if let Some((entity, consumed)) = crate::entity::decode_entity(&bytes[i..]) {
+                for ch in entity.chars() {
+                    push_href_char(ch, out);
+                }
                 i += consumed;
             } else {
-                // Named entities need the full HTML5 table (deferred); emit the
-                // literal ampersand HTML-escaped.
                 out.push_str("&amp;");
                 i += 1;
             }
@@ -197,8 +200,15 @@ fn escape_href_autolink(s: &str, out: &mut String) {
     }
 }
 
-/// Escape a link/image **title**: resolve backslash escapes and numeric
-/// character references, then HTML-escape the result.
+/// Escape a fenced code block's **info string** (its language word): resolve
+/// backslash escapes and character references, then HTML-escape. Identical
+/// processing to a link title (`CommonMark` §4.5 / §2.5).
+fn escape_info_string(s: &str, out: &mut String) {
+    escape_link_title(s, out);
+}
+
+/// Escape a link/image **title**: resolve backslash escapes and character
+/// references (numeric and named), then HTML-escape the result.
 fn escape_link_title(s: &str, out: &mut String) {
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -210,9 +220,11 @@ fn escape_link_title(s: &str, out: &mut String) {
             continue;
         }
         if b == b'&'
-            && let Some((ch, consumed)) = crate::entity::decode_numeric(&bytes[i..])
+            && let Some((entity, consumed)) = crate::entity::decode_entity(&bytes[i..])
         {
-            push_escaped_char(ch, out);
+            for ch in entity.chars() {
+                push_escaped_char(ch, out);
+            }
             i += consumed;
             continue;
         }
@@ -292,11 +304,12 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 out.push_str("<pre><code");
                 if let Some(lang) = language {
                     // CommonMark uses the first word of the info string as the
-                    // language class.
+                    // language class, with backslash escapes and entities
+                    // resolved (e.g. `foo\+bar` -> `foo+bar`, `f&ouml;` -> `fö`).
                     let first = lang.split_whitespace().next().unwrap_or("");
                     if !first.is_empty() {
                         out.push_str(" class=\"language-");
-                        escape_html(first, out);
+                        escape_info_string(first, out);
                         out.push('"');
                     }
                 }
@@ -317,7 +330,7 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     let first = lang.split_whitespace().next().unwrap_or("");
                     if !first.is_empty() {
                         out.push_str(" class=\"language-");
-                        escape_html(first, out);
+                        escape_info_string(first, out);
                         out.push('"');
                     }
                 }

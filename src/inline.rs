@@ -448,6 +448,13 @@ impl<'src> EmphArena<'src> {
     fn emit_list(&mut self, head: i32, pool: &mut Vec<Inline<'src>>) -> InlineSpan {
         let mark = self.scratch.len();
         let mut t = head;
+        // Tracks whether the last pushed scratch entry is a backslash-escaped
+        // ampersand (`Resolved(Inline::Text("&"))`). Such a node must not absorb
+        // a following contiguous text run: `\&ouml;` splits into `&` and
+        // `ouml;`, and merging them back would let the renderer decode the
+        // (escaped, hence literal) `&` as an entity. Other escaped punctuation
+        // is harmless to merge, so we keep that compaction.
+        let mut last_is_escaped = false;
         while t != NIL {
             let node = &self.nodes[t as usize];
             let next = node.next;
@@ -457,16 +464,21 @@ impl<'src> EmphArena<'src> {
                         // Merge with the previous emitted text node when the two
                         // source slices are contiguous (e.g. unmatched `*` plus
                         // the following word), keeping the pool compact.
-                        if let Some(Inline::Text(prev)) = self.scratch.last_mut()
+                        if !last_is_escaped
+                            && let Some(Inline::Text(prev)) = self.scratch.last_mut()
                             && let Some(merged) = contiguous_merge(prev, s)
                         {
                             *prev = merged;
                         } else {
                             self.scratch.push(Inline::Text(s));
                         }
+                        last_is_escaped = false;
                     }
                 }
-                EmphKind::Resolved(inl) => self.scratch.push(inl),
+                EmphKind::Resolved(inl) => {
+                    self.scratch.push(inl);
+                    last_is_escaped = matches!(inl, Inline::Text("&"));
+                }
                 EmphKind::Emph { strong, head } => {
                     let span = self.emit_list(head, pool);
                     self.scratch.push(if strong {
@@ -474,6 +486,7 @@ impl<'src> EmphArena<'src> {
                     } else {
                         Inline::Italic(span)
                     });
+                    last_is_escaped = false;
                 }
                 EmphKind::Removed => {}
             }
@@ -843,7 +856,14 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 {
                     buf.push(Inline::Text(text));
                 }
-                plain_start = i + 1;
+                // Emit the escaped char as its own text node (dropping the
+                // backslash). Isolating it prevents an escaped `&` from later
+                // merging with a following `name;` and being decoded as an
+                // entity at render time (e.g. `\&ouml;` must stay literal).
+                if let Some(text) = self.input.get(i + 1..i + 2) {
+                    buf.push(Inline::Text(text));
+                }
+                plain_start = i + 2;
                 i += 2;
                 continue;
             }

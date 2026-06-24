@@ -110,9 +110,19 @@ Note: the remaining Entities/title failures (25, 32–34, 41, 506, 503) need the
 full HTML5 **named-entity** table — moved to Phase 3.
 
 ### Phase 3 — Named-entity table  (target ~91%)
-Wire the ~2125-entry HTML5 named character reference table into `entity.rs` so
-`&ouml;`/`&copy;`/`&quot;` decode in text, hrefs, titles, and code-fence info
-strings. Unblocks Entities (12/17→17), plus several Links/Images title cases.
+**DONE (91.0% → 92.2%).** Vendored the full ~2125-entry HTML5 named character
+reference table (`src/entities_table.rs`, from `pulldown-cmark` 0.12.2 under
+MIT, sorted for binary search). `entity.rs` gained a unified `decode_entity`
+returning an `Entity` (one scalar for numeric, a one/two-scalar `&'static str`
+for named) with a non-allocating `chars()` iterator; the three `html.rs`
+encoders (`escape_text`, `escape_href`, `escape_link_title`) and a new
+`escape_info_string` for code-fence languages now resolve named refs.
+
+Two follow-on fixes were needed: a backslash-escaped `&` must stay literal
+(`\&ouml;` → `&amp;ouml;`), so the fast-path splits the escaped char into its
+own text node and `emit_list` suppresses the contiguous-text merge when the last
+node is an escaped `&`. Result: Entities **17/17**, Backslash escapes **13/13**,
+Fenced code blocks stay 29/29 (info-string `foo\+bar`/`f&ouml;` now decode).
 
 ### Phase 4 — Code-span & line-break normalization  (target ~91%)
 **DONE (89.4% → 90.5%).** Code-span §6.1 normalization moved to render time
@@ -158,3 +168,9 @@ to lock in progress and prevent regressions.
   (Fenced code blocks 26→29/29). `RawSection::CodeBlock` carries the fence
   indent; indent>0 dedents into the line pool as `CodeLines`. Perf gate held.
   Next: Phase 3 (named entities).
+- 2026-06-24: Phase 3 complete — vendored HTML5 named-entity table + unified
+  `decode_entity`. 91.0% → 92.2% (Entities 17/17, Backslash 13/13). Three
+  sections now perfect that weren't. Perf gate held (verified against a
+  same-session stashed baseline; render-path change, parse benches flat).
+  Next: Phase 2c (link nesting + inline alt) or the block-level long tail
+  (tabs, lists, blockquotes).
