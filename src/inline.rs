@@ -877,17 +877,22 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             }
 
             // Inline code: `code` or ``code``
-            if b == SpecialChar::Backtick
-                && let Some((code, end)) = Self::try_parse_inline_code(self.input, bytes, i)
-            {
-                if let Some(text) = self.input.get(plain_start..i)
-                    && !text.is_empty()
-                {
-                    buf.push(Inline::Text(text));
+            if b == SpecialChar::Backtick {
+                if let Some((code, end)) = Self::try_parse_inline_code(self.input, bytes, i) {
+                    if let Some(text) = self.input.get(plain_start..i)
+                        && !text.is_empty()
+                    {
+                        buf.push(Inline::Text(text));
+                    }
+                    buf.push(Inline::Code(code));
+                    plain_start = end;
+                    i = end;
+                    continue;
                 }
-                buf.push(Inline::Code(code));
-                plain_start = end;
-                i = end;
+                // No matching closing run: the entire opening run of backticks
+                // is literal text (CommonMark §6.1, the opening run is
+                // maximal). Skip past it so a shorter sub-run can't re-open.
+                i += SpecialChar::Backtick.count_leading_bytes(&bytes[i..]);
                 continue;
             }
 
@@ -1114,13 +1119,17 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 continue;
             }
 
-            if b == SpecialChar::Backtick
-                && let Some((code, end)) = Self::try_parse_inline_code(self.input, bytes, i)
-            {
-                flush_text!(i);
-                arena.push_node(EmphKind::Resolved(Inline::Code(code)));
-                plain_start = end;
-                i = end;
+            if b == SpecialChar::Backtick {
+                if let Some((code, end)) = Self::try_parse_inline_code(self.input, bytes, i) {
+                    flush_text!(i);
+                    arena.push_node(EmphKind::Resolved(Inline::Code(code)));
+                    plain_start = end;
+                    i = end;
+                    continue;
+                }
+                // Unmatched opening run: keep the whole run as literal text
+                // and skip it so a shorter sub-run cannot re-open a code span.
+                i += SpecialChar::Backtick.count_leading_bytes(&bytes[i..]);
                 continue;
             }
 
