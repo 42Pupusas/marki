@@ -179,6 +179,28 @@ impl<'src> Accumulator<'src> {
 // BlockBytes trait — block-level helpers on byte slices.
 // ---------------------------------------------------------------------------
 
+/// True if `line` ends in open paragraph text that a following marker-less
+/// line could lazily continue (`CommonMark` §5.1). Descends through any nested
+/// blockquote `>` markers and 0-3 spaces of indentation so a line like
+/// `> > foo` is judged by its innermost content (`foo`), which is paragraph
+/// text even though the outer line begins a block.
+fn is_lazy_paragraph_tail(mut line: &[u8]) -> bool {
+    loop {
+        let ind = line.leading_spaces().min(line.len());
+        let body = &line[ind..];
+        if body.first() == Some(&SpecialChar::GreaterThan.byte()) {
+            let after = if body.get(1) == Some(&SpecialChar::Space.byte()) {
+                2
+            } else {
+                1
+            };
+            line = &body[after.min(body.len())..];
+            continue;
+        }
+        return !body.is_blank_line(0, body.len()) && !body.begins_block();
+    }
+}
+
 /// Lookup table: true for bytes that could start a block-level element
 /// (heading, blockquote, list marker, HR character, or digit for ordered lists).
 const COULD_START_BLOCK: [bool; 256] = {
@@ -701,22 +723,42 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 if body.first() == SpecialChar::GreaterThan {
                     Self::flush_para(&mut para, section_pool, pool, defs);
                     let mut nested = scratch.take_lines();
+                    // `last_para` tracks whether the previous collected line is
+                    // paragraph content that a following marker-less line may
+                    // lazily continue (CommonMark §5.1). A blank `>` line or a
+                    // line that begins a block closes that paragraph.
+                    let mut last_para = false;
                     while i < lines.len() {
                         let l = lines[i];
                         let lb = l.as_bytes();
                         let qind = lb.leading_spaces().min(3);
                         let lbody = &lb[qind.min(lb.len())..];
-                        if lbody.first() != SpecialChar::GreaterThan {
-                            break;
+                        if lbody.first() == SpecialChar::GreaterThan {
+                            let after = qind + 1;
+                            let content = if lb.get(after) == Some(&SpecialChar::Space.byte()) {
+                                l.get(after + 1..).unwrap_or("")
+                            } else {
+                                l.get(after..).unwrap_or("")
+                            };
+                            last_para = is_lazy_paragraph_tail(content.as_bytes());
+                            nested.push(content);
+                            i += 1;
+                            continue;
                         }
-                        let after = qind + 1;
-                        let content = if lb.get(after) == Some(&SpecialChar::Space.byte()) {
-                            l.get(after + 1..).unwrap_or("")
-                        } else {
-                            l.get(after..).unwrap_or("")
-                        };
-                        nested.push(content);
-                        i += 1;
+                        // Lazy paragraph continuation: a marker-less, non-blank
+                        // line that doesn't begin a block extends the paragraph
+                        // still open inside the blockquote. Recursing on the
+                        // collected lines carries it down to the innermost one.
+                        let indent = lb.leading_spaces().min(lb.len());
+                        if last_para
+                            && !lb.is_blank_line(0, lb.len())
+                            && !lb[indent..].begins_block()
+                        {
+                            nested.push(l.trim());
+                            i += 1;
+                            continue;
+                        }
+                        break;
                     }
                     // Placeholder, recurse to append the subtree, then backpatch.
                     let at = section_pool.len();
