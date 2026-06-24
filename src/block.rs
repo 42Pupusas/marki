@@ -1349,11 +1349,17 @@ impl<'src> ParseCtx<'src> {
                 continue;
             }
 
+            // A thematic break (`* * *`) ends the list rather than opening a
+            // new item, even though its first run looks like a bullet marker.
+            if ind <= 3 && bytes[pos + ind..le].is_horizontal_rule() {
+                break;
+            }
+
             // Dedented sibling marker: close this item, open the next.
             if ind <= 3
                 && let Some(m) = bytes[pos + ind..le].list_marker()
             {
-                if !family.same_family(m) || item_blanks >= 2 {
+                if !family.same_family(m) {
                     break;
                 }
                 self.close_item(item_start, &mut pending_blanks);
