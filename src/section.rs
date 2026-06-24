@@ -21,6 +21,33 @@ impl InlineSpan {
     }
 }
 
+/// A range of `&str` lines stored contiguously in the line pool.
+///
+/// Used by code blocks nested inside list items or blockquotes, whose content
+/// lines are dedented (and therefore no longer a single contiguous source
+/// slice).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineRange {
+    pub start: u32,
+    pub len: u32,
+}
+
+impl LineRange {
+    pub const EMPTY: Self = Self { start: 0, len: 0 };
+
+    #[inline]
+    #[must_use]
+    pub const fn new(start: u32, len: u32) -> Self {
+        Self { start, len }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+}
+
 /// A range of [`Section`]s stored contiguously in the section pool.
 ///
 /// Used by blockquotes and list items to reference their child blocks
@@ -122,6 +149,13 @@ pub enum Section<'src> {
     /// sections stored as a range in the document's section pool.
     ListItem {
         children: SectionRange,
+    },
+    /// A code block whose content lines were dedented out of a container (list
+    /// item or blockquote) and so live in the line pool rather than as one
+    /// contiguous source slice. `language` is `None` for indented code.
+    CodeLines {
+        language: Option<&'src str>,
+        lines: LineRange,
     },
     /// A blockquote (`CommonMark` §5.1) containing child block-level sections,
     /// stored as a range in the document's section pool.

@@ -1,7 +1,7 @@
 use crate::OffsetExt;
 use crate::inline::InlineParser;
 use crate::link_def::{LinkDefs, normalize_label, scan_link_def};
-use crate::section::{InlineSpan, OrderedListDelimiter, Section, SectionRange};
+use crate::section::{LineRange, OrderedListDelimiter, Section, SectionRange};
 use crate::simd::ByteSliceExt;
 use crate::special_char::SpecialChar;
 use crate::{Inline, MarkdownFile};
@@ -28,17 +28,14 @@ enum RawSection<'src> {
     IndentedCode {
         code: &'src str,
     },
-    UnorderedList {
-        items_start: u32,
-        items_len: u32,
-    },
-    OrderedList {
-        start: u32,
-        delimiter: OrderedListDelimiter,
-        items_start: u32,
-        items_len: u32,
-    },
     Blockquote {
+        lines_start: u32,
+        lines_len: u32,
+    },
+    /// A list (`CommonMark` §5.3) captured as a contiguous run of full source
+    /// lines in the line pool. Item boundaries, content indent, nesting, and
+    /// loose/tight are all derived in pass 2 by [`group_list_lines`].
+    List {
         lines_start: u32,
         lines_len: u32,
     },
@@ -46,6 +43,29 @@ enum RawSection<'src> {
         html: &'src str,
     },
     HorizontalRule,
+}
+
+/// A parsed list marker at the start of a (de-indented) line.
+#[derive(Clone, Copy)]
+struct Marker {
+    /// `Some((start, delim))` for an ordered item, `None` for a bullet.
+    ordered: Option<(u32, OrderedListDelimiter)>,
+    /// Width of the marker characters only (bullet = 1; ordered = digits + 1).
+    width: usize,
+    /// Bullet character for unordered markers (`-`, `+`, `*`), else 0.
+    bullet: u8,
+}
+
+impl Marker {
+    /// True if `other` belongs to the same list as `self` (`CommonMark` §5.3:
+    /// a change of bullet character or ordered delimiter starts a new list).
+    fn same_family(self, other: Self) -> bool {
+        match (self.ordered, other.ordered) {
+            (None, None) => self.bullet == other.bullet,
+            (Some((_, d1)), Some((_, d2))) => d1 == d2,
+            _ => false,
+        }
+    }
 }
 
 /// Mutable parsing context for pass 1. Only collects raw sections — no inline
@@ -65,15 +85,6 @@ enum Accumulator<'src> {
     Empty,
     InBlockquote {
         lines_start: u32,
-    },
-    InUnorderedList {
-        marker: SpecialChar,
-        items_start: u32,
-    },
-    InOrderedList {
-        start: u32,
-        delimiter: OrderedListDelimiter,
-        items_start: u32,
     },
     InParagraph {
         content: &'src str,
@@ -97,20 +108,6 @@ impl<'src> Accumulator<'src> {
             Self::InBlockquote { lines_start } => Some(RawSection::Blockquote {
                 lines_start,
                 lines_len: lines_pool_len - lines_start,
-            }),
-            Self::InUnorderedList { items_start, .. } => Some(RawSection::UnorderedList {
-                items_start,
-                items_len: lines_pool_len - items_start,
-            }),
-            Self::InOrderedList {
-                start,
-                delimiter,
-                items_start,
-            } => Some(RawSection::OrderedList {
-                start,
-                delimiter,
-                items_start,
-                items_len: lines_pool_len - items_start,
             }),
             Self::InParagraph { content } => Some(RawSection::Paragraph { text: content }),
         }
@@ -150,10 +147,19 @@ trait BlockBytes {
         input: &'src str,
         line_offset: usize,
     ) -> Option<(u8, &'src str)>;
-    fn try_parse_unordered_item(&self) -> Option<(SpecialChar, usize)>;
-    fn try_parse_ordered_item(&self) -> Option<(u32, OrderedListDelimiter, usize)>;
     fn could_start_block(&self) -> bool;
     fn setext_heading_level(&self) -> Option<u8>;
+    /// Count leading ASCII spaces (no tab expansion).
+    fn leading_spaces(&self) -> usize;
+    /// Parse a list marker at the very start of the slice (no leading indent).
+    fn list_marker(&self) -> Option<Marker>;
+    /// Content-indent column for a freshly-opened item whose marker starts at
+    /// `marker_col` and is described by `m`; `self` is the bytes after the
+    /// marker characters.
+    fn item_content_indent(&self, marker_col: usize, m: Marker) -> usize;
+    /// True if this de-indented slice begins a block a paragraph cannot lazily
+    /// continue across.
+    fn begins_block(&self) -> bool;
 }
 
 impl BlockBytes for [u8] {
@@ -267,47 +273,84 @@ impl BlockBytes for [u8] {
         Some((level, text))
     }
 
-    /// Try to parse an unordered list item.
-    /// Returns `(marker, item_byte_offset)` where offset is relative to line start.
-    fn try_parse_unordered_item(&self) -> Option<(SpecialChar, usize)> {
-        let &first = self.first()?;
-        let marker = SpecialChar::from_byte(first)?;
-        if !marker.is_list_char() {
-            return None;
+    fn leading_spaces(&self) -> usize {
+        let mut n = 0;
+        while self.get(n) == Some(&SpecialChar::Space.byte()) {
+            n += 1;
         }
-        if self.get(1) == SpecialChar::Space {
-            Some((marker, 2))
+        n
+    }
+
+    fn list_marker(&self) -> Option<Marker> {
+        let &first = self.first()?;
+        // Unordered bullet: `-`, `+`, or `*` followed by space/tab/EOL.
+        if first == SpecialChar::Dash.byte()
+            || first == SpecialChar::Plus.byte()
+            || first == SpecialChar::Asterisk.byte()
+        {
+            return match self.get(1) {
+                None | Some(b' ' | b'\t') => Some(Marker {
+                    ordered: None,
+                    width: 1,
+                    bullet: first,
+                }),
+                _ => None,
+            };
+        }
+        // Ordered marker: 1-9 digits, then `.` or `)`, then space/tab/EOL.
+        if first.is_ascii_digit() {
+            let mut num: u32 = 0;
+            let mut digits = 0usize;
+            for &d in self {
+                if d.is_ascii_digit() {
+                    digits += 1;
+                    if digits > 9 {
+                        return None;
+                    }
+                    num = num * 10 + u32::from(d - SpecialChar::Zero.byte());
+                } else {
+                    break;
+                }
+            }
+            let delim = OrderedListDelimiter::from_byte(*self.get(digits)?)?;
+            return match self.get(digits + 1) {
+                None | Some(b' ' | b'\t') => Some(Marker {
+                    ordered: Some((num, delim)),
+                    width: digits + 1,
+                    bullet: 0,
+                }),
+                _ => None,
+            };
+        }
+        None
+    }
+
+    fn item_content_indent(&self, marker_col: usize, m: Marker) -> usize {
+        // `self` is the bytes after the marker characters (spaces + content).
+        let spaces = self.leading_spaces();
+        let after_marker = marker_col + m.width;
+        if spaces == 0 || spaces > 4 || spaces == self.len() {
+            // Empty item or an over-indented first line: one-space indent (the
+            // surplus becomes indented-code content).
+            after_marker + 1
         } else {
-            None
+            after_marker + spaces
         }
     }
 
-    /// Try to parse an ordered list item.
-    /// Returns `(number, delimiter, item_byte_offset)` where offset is relative
-    /// to line start.
-    fn try_parse_ordered_item(&self) -> Option<(u32, OrderedListDelimiter, usize)> {
-        let mut num: u32 = 0;
-        let mut digits = 0usize;
-        for &b in self {
-            if b.is_ascii_digit() {
-                digits += 1;
-                if digits > 9 {
-                    return None;
-                }
-                num = num * 10 + u32::from(b - SpecialChar::Zero.byte());
-            } else {
-                break;
-            }
+    fn begins_block(&self) -> bool {
+        if self.is_empty() || self.first() == SpecialChar::GreaterThan {
+            return true;
         }
-        if digits == 0 {
-            return None;
+        if self.list_marker().is_some()
+            || self.is_horizontal_rule()
+            || self.code_fence_opening().is_some()
+        {
+            return true;
         }
-        let delimiter = OrderedListDelimiter::from_byte(self.get(digits).copied()?)?;
-        if self.get(digits + 1) != SpecialChar::Space {
-            return None;
-        }
-        let item_offset = digits + 2;
-        Some((num, delimiter, item_offset))
+        // ATX heading.
+        let hashes = SpecialChar::Hash.count_leading_bytes(self);
+        (1..=6).contains(&hashes) && matches!(self.get(hashes), None | Some(b' ' | b'\t'))
     }
 
     /// Check whether the first byte of this line could start a block-level element.
@@ -349,6 +392,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         ctx: &ParseCtx<'src>,
         pool: &mut Vec<Inline<'src>>,
         section_pool: &mut Vec<Section<'src>>,
+        line_pool: &mut Vec<&'src str>,
     ) -> Vec<Section<'src>> {
         let lines = &ctx.lines;
         let defs = &ctx.defs;
@@ -378,32 +422,16 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 RawSection::IndentedCode { code } => {
                     sections.push(Section::IndentedCode { code });
                 }
-                RawSection::UnorderedList {
-                    items_start,
-                    items_len,
+                RawSection::List {
+                    lines_start,
+                    lines_len,
                 } => {
-                    let raw_items = lines
-                        .get(items_start as usize..(items_start + items_len) as usize)
+                    let raw_lines = lines
+                        .get(lines_start as usize..(lines_start + lines_len) as usize)
                         .unwrap_or(&[]);
-                    let items = Self::resolve_list_items(raw_items, pool, section_pool, defs);
-                    sections.push(Section::UnorderedList { tight: true, items });
-                }
-                RawSection::OrderedList {
-                    start,
-                    delimiter,
-                    items_start,
-                    items_len,
-                } => {
-                    let raw_items = lines
-                        .get(items_start as usize..(items_start + items_len) as usize)
-                        .unwrap_or(&[]);
-                    let items = Self::resolve_list_items(raw_items, pool, section_pool, defs);
-                    sections.push(Section::OrderedList {
-                        start,
-                        delimiter,
-                        tight: true,
-                        items,
-                    });
+                    let list =
+                        Self::resolve_list(raw_lines, pool, section_pool, line_pool, defs);
+                    sections.push(list);
                 }
                 RawSection::Blockquote {
                     lines_start,
@@ -413,7 +441,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                         .get(lines_start as usize..(lines_start + lines_len) as usize)
                         .unwrap_or(&[]);
                     let children =
-                        Self::resolve_quote(raw_lines, pool, section_pool, defs);
+                        Self::resolve_blocks(raw_lines, pool, section_pool, line_pool, defs);
                     sections.push(Section::Blockquote { children });
                 }
                 RawSection::HtmlBlock { html } => {
@@ -427,155 +455,364 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         sections
     }
 
-    /// Resolve a list's raw item texts (one `&str` per item, from pass 1) into
-    /// a range of [`Section::ListItem`] sections in `section_pool`. Each item
-    /// currently holds a single paragraph child; the upcoming continuation
-    /// rewrite will let items carry arbitrary child blocks.
-    fn resolve_list_items(
-        raw_items: &[&'src str],
+    /// Resolve a top-level list's captured source lines (from pass 1) into the
+    /// final list [`Section`]. Delegates all structure to [`group_list`] and
+    /// [`resolve_blocks`].
+    fn resolve_list(
+        list_lines: &[&'src str],
         pool: &mut Vec<Inline<'src>>,
         section_pool: &mut Vec<Section<'src>>,
+        line_pool: &mut Vec<&'src str>,
         defs: &LinkDefs<'src>,
-    ) -> SectionRange {
-        // Build each item's children first, then append the ListItem sections
-        // contiguously. Children of a single item are appended immediately so a
-        // ListItem's range is stable before we collect the item-level range.
-        let mut items: Vec<Section<'src>> = Vec::with_capacity(raw_items.len());
-        for item in raw_items {
-            let child_start = section_pool.len().pool_offset();
-            let content =
-                InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_configured(
-                    item, pool, defs,
-                );
-            section_pool.push(Section::Paragraph { content });
-            let child_len = section_pool.len().pool_offset() - child_start;
-            items.push(Section::ListItem {
-                children: SectionRange::new(child_start, child_len),
-            });
-        }
-        let start = section_pool.len().pool_offset();
-        section_pool.extend(items);
-        let len = section_pool.len().pool_offset() - start;
-        SectionRange::new(start, len)
+    ) -> Section<'src> {
+        let (section, _consumed) =
+            Self::build_list(list_lines, pool, section_pool, line_pool, defs);
+        section
     }
 
-    /// Recursively resolve the dequoted content lines of a blockquote into a
-    /// range of child sections, appended to `section_pool`. Handles the block
-    /// constructs representable without owned storage: blank-line-separated
-    /// paragraphs (multi-line, joined by soft breaks), ATX headings, thematic
-    /// breaks, and nested blockquotes (via recursion). Other constructs fall
-    /// back to paragraph text.
-    fn resolve_quote(
-        quote_lines: &[&'src str],
+    /// Recursively resolve a sequence of container content lines into a range
+    /// of child block [`Section`]s appended to `section_pool`. This is the
+    /// shared line-based block engine used by both blockquote interiors and
+    /// list items. Handles paragraphs (with soft-break reflow and setext
+    /// promotion), ATX headings, thematic breaks, fenced and indented code,
+    /// nested blockquotes, and nested lists.
+    #[allow(clippy::too_many_lines)]
+    fn resolve_blocks(
+        lines: &[&'src str],
         pool: &mut Vec<Inline<'src>>,
         section_pool: &mut Vec<Section<'src>>,
+        line_pool: &mut Vec<&'src str>,
         defs: &LinkDefs<'src>,
     ) -> SectionRange {
-        // Build child sections in a local Vec first; the recursion may append
-        // to `section_pool` for *its own* nested quotes, so we cannot hold a
-        // stable range there until we finish. We reserve our slot at the end.
         let mut children: Vec<Section<'src>> = Vec::new();
-        // Pending paragraph lines (still to be flushed as one paragraph).
         let mut para: Vec<&'src str> = Vec::new();
-        // Pending nested-quote lines (dequoted one `>` level).
-        let mut nested: Vec<&'src str> = Vec::new();
-
-        let flush_para =
-            |para: &mut Vec<&'src str>,
-             children: &mut Vec<Section<'src>>,
-             pool: &mut Vec<Inline<'src>>| {
-                if para.is_empty() {
-                    return;
-                }
-                let start = pool.len().pool_offset();
-                for (i, line) in para.iter().enumerate() {
-                    if i > 0 {
-                        pool.push(Inline::SoftBreak);
-                    }
-                    InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_flat_into_configured(
-                        line, pool, defs,
-                    );
-                }
-                let len = pool.len().pool_offset() - start;
-                children.push(Section::Paragraph {
-                    content: InlineSpan::new(start, len),
-                });
-                para.clear();
-            };
-
         let mut i = 0;
-        while i < quote_lines.len() {
-            let line = quote_lines[i];
-            let bytes = line.as_bytes();
-            let indent = bytes.strip_indent().unwrap_or(0);
-            let body = &bytes[indent.min(bytes.len())..];
 
-            // Nested blockquote line: collect consecutive `>`-prefixed lines and
-            // recurse once the run ends.
-            if body.first() == SpecialChar::GreaterThan {
-                flush_para(&mut para, &mut children, pool);
-                let after = indent + 1;
-                let content = if bytes.get(after) == SpecialChar::Space {
-                    line.get(after + 1..).unwrap_or("")
-                } else {
-                    line.get(after..).unwrap_or("")
-                };
-                nested.push(content);
-                i += 1;
-                continue;
-            }
-            // A non-`>` line ends any pending nested quote.
-            if !nested.is_empty() {
-                let range = Self::resolve_quote(&nested, pool, section_pool, defs);
-                children.push(Section::Blockquote { children: range });
-                nested.clear();
-            }
+        while i < lines.len() {
+            let line = lines[i];
+            let b = line.as_bytes();
 
-            // Blank line: paragraph break.
-            if body.is_empty() || body.iter().all(u8::is_ascii_whitespace) {
-                flush_para(&mut para, &mut children, pool);
+            if b.iter().all(u8::is_ascii_whitespace) {
+                Self::flush_para(&mut para, &mut children, pool, defs);
                 i += 1;
                 continue;
             }
 
-            // ATX heading.
-            if body.first() == SpecialChar::Hash
-                && let Some((level, text)) = body.try_parse_heading(line, indent)
-            {
-                flush_para(&mut para, &mut children, pool);
-                let content =
-                    InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_configured(
-                        text, pool, defs,
-                    );
-                children.push(Section::Heading { level, content });
-                i += 1;
+            let ind = b.leading_spaces();
+
+            // Indented code block (≥4 spaces), but only when not continuing an
+            // open paragraph (an indented line is lazy paragraph text there).
+            if ind >= 4 && para.is_empty() {
+                let code_start = line_pool.len().pool_offset();
+                while i < lines.len() {
+                    let l = lines[i];
+                    let lb = l.as_bytes();
+                    if lb.iter().all(u8::is_ascii_whitespace) {
+                        // Interior blank: keep, but only if a later indented
+                        // line follows (trailing blanks are trimmed below).
+                        line_pool.push("");
+                        i += 1;
+                        continue;
+                    }
+                    if lb.leading_spaces() < 4 {
+                        break;
+                    }
+                    line_pool.push(l.get(4..).unwrap_or(""));
+                    i += 1;
+                }
+                // Trim trailing blank lines out of the code block.
+                while line_pool.len().pool_offset() > code_start
+                    && line_pool.last().is_some_and(|l| l.is_empty())
+                {
+                    line_pool.pop();
+                }
+                let len = line_pool.len().pool_offset() - code_start;
+                children.push(Section::CodeLines {
+                    language: None,
+                    lines: LineRange::new(code_start, len),
+                });
                 continue;
             }
 
-            // Thematic break.
-            if body.is_horizontal_rule() {
-                flush_para(&mut para, &mut children, pool);
-                children.push(Section::HorizontalRule);
-                i += 1;
-                continue;
+            let body = &b[ind.min(b.len())..];
+
+            if ind <= 3 {
+                // Nested blockquote: collect the run and recurse.
+                if body.first() == SpecialChar::GreaterThan {
+                    Self::flush_para(&mut para, &mut children, pool, defs);
+                    let mut nested: Vec<&'src str> = Vec::new();
+                    while i < lines.len() {
+                        let l = lines[i];
+                        let lb = l.as_bytes();
+                        let qind = lb.leading_spaces().min(3);
+                        let lbody = &lb[qind.min(lb.len())..];
+                        if lbody.first() != SpecialChar::GreaterThan {
+                            break;
+                        }
+                        let after = qind + 1;
+                        let content = if lb.get(after) == Some(&SpecialChar::Space.byte()) {
+                            l.get(after + 1..).unwrap_or("")
+                        } else {
+                            l.get(after..).unwrap_or("")
+                        };
+                        nested.push(content);
+                        i += 1;
+                    }
+                    let range =
+                        Self::resolve_blocks(&nested, pool, section_pool, line_pool, defs);
+                    children.push(Section::Blockquote { children: range });
+                    continue;
+                }
+
+                // ATX heading.
+                if body.first() == SpecialChar::Hash
+                    && let Some((level, text)) = body.try_parse_heading(line, ind)
+                {
+                    Self::flush_para(&mut para, &mut children, pool, defs);
+                    let content =
+                        InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_configured(
+                            text, pool, defs,
+                        );
+                    children.push(Section::Heading { level, content });
+                    i += 1;
+                    continue;
+                }
+
+                // Fenced code block.
+                if let Some((fence_char, fence_len)) = body.code_fence_opening() {
+                    Self::flush_para(&mut para, &mut children, pool, defs);
+                    let language = Self::fence_language(line, ind, fence_len);
+                    let code_start = line_pool.len().pool_offset();
+                    i += 1;
+                    while i < lines.len() {
+                        let l = lines[i];
+                        let lb = l.as_bytes();
+                        let cind = lb.leading_spaces().min(3);
+                        if lb[cind.min(lb.len())..].is_closing_fence(fence_char, fence_len) {
+                            i += 1;
+                            break;
+                        }
+                        // Strip up to the opening fence's indentation.
+                        line_pool.push(l.get(ind.min(l.len())..).unwrap_or(""));
+                        i += 1;
+                    }
+                    let len = line_pool.len().pool_offset() - code_start;
+                    children.push(Section::CodeLines {
+                        language,
+                        lines: LineRange::new(code_start, len),
+                    });
+                    continue;
+                }
+
+                // Setext heading underline promotes the open paragraph. The
+                // promoted lines keep soft breaks between them, matching how a
+                // paragraph would have rendered.
+                if !para.is_empty()
+                    && let Some(level) = body.setext_heading_level()
+                {
+                    let trimmed: Vec<&str> = para.iter().map(|l| l.trim()).collect();
+                    let content =
+                        InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_lines_configured(
+                            &trimmed, pool, defs,
+                        );
+                    children.push(Section::Heading { level, content });
+                    para.clear();
+                    i += 1;
+                    continue;
+                }
+
+                // Thematic break.
+                if body.is_horizontal_rule() {
+                    Self::flush_para(&mut para, &mut children, pool, defs);
+                    children.push(Section::HorizontalRule);
+                    i += 1;
+                    continue;
+                }
+
+                // Nested list (a thematic break takes precedence over a bullet).
+                if !body.is_horizontal_rule() && body.list_marker().is_some() {
+                    Self::flush_para(&mut para, &mut children, pool, defs);
+                    let (section, consumed) =
+                        Self::build_list(&lines[i..], pool, section_pool, line_pool, defs);
+                    children.push(section);
+                    i += consumed;
+                    continue;
+                }
             }
 
-            // Otherwise: paragraph text (trim the 0-3 space indent).
-            para.push(line.get(indent..).unwrap_or(line));
+            // Otherwise: paragraph text. Leading 0-3 indent is stripped; deeper
+            // indentation on a continuation line is lazy paragraph text.
+            para.push(line.trim());
             i += 1;
         }
 
-        flush_para(&mut para, &mut children, pool);
-        if !nested.is_empty() {
-            let range = Self::resolve_quote(&nested, pool, section_pool, defs);
-            children.push(Section::Blockquote { children: range });
-        }
+        Self::flush_para(&mut para, &mut children, pool, defs);
 
-        // Append the collected children to the shared pool contiguously.
         let start = section_pool.len().pool_offset();
         section_pool.extend(children);
         let len = section_pool.len().pool_offset() - start;
         SectionRange::new(start, len)
+    }
+
+    /// Flush pending paragraph lines into one [`Section::Paragraph`] child,
+    /// joining multiple lines with soft breaks.
+    fn flush_para(
+        para: &mut Vec<&'src str>,
+        children: &mut Vec<Section<'src>>,
+        pool: &mut Vec<Inline<'src>>,
+        defs: &LinkDefs<'src>,
+    ) {
+        if para.is_empty() {
+            return;
+        }
+        let content = InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_lines_configured(
+            para, pool, defs,
+        );
+        children.push(Section::Paragraph { content });
+        para.clear();
+    }
+
+    /// Extract the language from a fenced-code opening line, given the line's
+    /// 0-3 space indent and the fence character count.
+    fn fence_language(line: &'src str, ind: usize, fence_len: usize) -> Option<&'src str> {
+        let b = line.as_bytes();
+        let mut i = ind + fence_len;
+        while b.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        let mut end = b.len();
+        while end > i && b[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        if i >= end {
+            return None;
+        }
+        line.get(i..end)
+    }
+
+    /// Group a run of lines beginning with a list marker into items, resolve
+    /// each item's child blocks, and build the list [`Section`]. Returns the
+    /// section and the number of input lines consumed.
+    fn build_list(
+        lines: &[&'src str],
+        pool: &mut Vec<Inline<'src>>,
+        section_pool: &mut Vec<Section<'src>>,
+        line_pool: &mut Vec<&'src str>,
+        defs: &LinkDefs<'src>,
+    ) -> (Section<'src>, usize) {
+        let first_ind = lines[0].as_bytes().leading_spaces().min(3);
+        let first_marker = lines[0].as_bytes()[first_ind..]
+            .list_marker()
+            .expect("build_list called on a marker line");
+        let ordered = first_marker.ordered;
+
+        // Resolve items one at a time into the section pool, reusing a single
+        // scratch buffer for each item's de-indented content lines (one heap
+        // allocation per list level rather than per item). Each item owns its
+        // first line plus continuation lines (indent >= content column W,
+        // blanks, or lazy paragraph continuations) until the next sibling
+        // marker or the list's end. `ranges` holds each item's child-block
+        // range; the ListItem sections are appended together at the end so the
+        // children precede them in the pool.
+        let mut ranges: Vec<SectionRange> = Vec::new();
+        let mut item: Vec<&'src str> = Vec::new();
+        let mut loose = false;
+        let mut i = 0;
+        let mut pending_blanks = 0usize;
+        let mut first = true;
+
+        while i < lines.len() {
+            let head = lines[i].as_bytes();
+            let ind = head.leading_spaces().min(head.len());
+            let body = &head[ind..];
+
+            // A sibling marker at indent <= 3 opens a new item. A thematic
+            // break (`* * *`) takes precedence over a bullet and ends the list.
+            if ind > 3 || body.is_horizontal_rule() {
+                break;
+            }
+            let Some(marker) = body.list_marker() else {
+                break;
+            };
+            if !first && !first_marker.same_family(marker) {
+                break;
+            }
+            first = false;
+
+            if pending_blanks > 0 {
+                loose = true;
+            }
+            pending_blanks = 0;
+            // Content column: every continuation line of this item must be
+            // indented at least this far to belong to it.
+            let col = head[ind + marker.width..].item_content_indent(ind, marker);
+            let first_content = lines[i].get(col.min(lines[i].len())..).unwrap_or("");
+            item.clear();
+            if !first_content.is_empty() {
+                item.push(first_content);
+            }
+            i += 1;
+            // Gather continuation lines for this item.
+            let mut item_blanks = 0usize;
+            while i < lines.len() {
+                let cont = lines[i];
+                let cb = cont.as_bytes();
+                if cb.iter().all(u8::is_ascii_whitespace) {
+                    item_blanks += 1;
+                    item.push("");
+                    i += 1;
+                    continue;
+                }
+                let cind = cb.leading_spaces();
+                if cind >= col {
+                    if item_blanks > 0 {
+                        loose = true;
+                    }
+                    item_blanks = 0;
+                    item.push(cont.get(col..).unwrap_or(""));
+                    i += 1;
+                    continue;
+                }
+                // Dedented sibling marker or lazy paragraph continuation?
+                if cind <= 3 && cb[cind.min(cb.len())..].list_marker().is_some() {
+                    break;
+                }
+                if item_blanks == 0 && !cb[cind.min(cb.len())..].begins_block() {
+                    item.push(cont.trim());
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
+            // Trailing blank lines belong to the list, not the item.
+            while item.last().is_some_and(|l| l.is_empty()) {
+                item.pop();
+                pending_blanks += 1;
+            }
+            let range = Self::resolve_blocks(&item, pool, section_pool, line_pool, defs);
+            ranges.push(range);
+        }
+
+        let items_start = section_pool.len().pool_offset();
+        section_pool.extend(ranges.into_iter().map(|children| Section::ListItem { children }));
+        let items_len = section_pool.len().pool_offset() - items_start;
+        let items_range = SectionRange::new(items_start, items_len);
+        let tight = !loose;
+
+        let section = if let Some((start, delimiter)) = ordered {
+            Section::OrderedList {
+                start,
+                delimiter,
+                tight,
+                items: items_range,
+            }
+        } else {
+            Section::UnorderedList {
+                tight,
+                items: items_range,
+            }
+        };
+        (section, i)
     }
 
     #[must_use]
@@ -586,12 +823,15 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         // --- Pass 2: inline parsing ---
         let mut pool = Vec::with_capacity(input.len() / 20);
         let mut section_pool = Vec::new();
-        let sections = Self::resolve_inlines(&ctx, &mut pool, &mut section_pool);
+        let mut line_pool = Vec::new();
+        let sections =
+            Self::resolve_inlines(&ctx, &mut pool, &mut section_pool, &mut line_pool);
 
         Self {
             sections,
             pool,
             section_pool,
+            line_pool,
         }
     }
 }
@@ -605,6 +845,7 @@ impl<'src> ParseCtx<'src> {
     /// into [`RawSection`]s. Owns the entire block-parsing loop so the public
     /// [`MarkdownFile`] type never touches the `Accumulator`/`RawSection`
     /// intermediates.
+    #[allow(clippy::too_many_lines)]
     fn block_pass(input: &'src str) -> Self {
         let bytes = input.as_bytes();
         let mut ctx = ParseCtx {
@@ -689,6 +930,39 @@ impl<'src> ParseCtx<'src> {
                 pos = resume;
                 acc = Accumulator::Empty;
                 continue;
+            }
+
+            // Lists (CommonMark §5.2/§5.3): when a line opens a list item, scan
+            // the whole list run (all items + their continuation lines) in one
+            // shot and let pass 2 resolve item structure. A list can interrupt
+            // a paragraph only with a non-empty first item, and an ordered list
+            // only when it starts at 1.
+            if let Some(indent) = bytes[pos..line_end].strip_indent()
+                && !bytes[pos + indent..line_end].is_horizontal_rule()
+                && let Some(m) = bytes[pos + indent..line_end].list_marker()
+            {
+                let in_para = matches!(acc, Accumulator::InParagraph { .. });
+                let rest = &bytes[pos + indent + m.width..line_end];
+                let empty_item = rest.iter().all(u8::is_ascii_whitespace);
+                let interrupts_ok = !in_para
+                    || (!empty_item
+                        && match m.ordered {
+                            Some((n, _)) => n == 1,
+                            None => true,
+                        });
+                if interrupts_ok {
+                    ctx.flush_acc(acc);
+                    let lines_start = ctx.lines.len().lines_offset();
+                    let resume = ctx.scan_list(pos);
+                    let lines_len = ctx.lines.len().lines_offset() - lines_start;
+                    ctx.sections.push(RawSection::List {
+                        lines_start,
+                        lines_len,
+                    });
+                    pos = resume;
+                    acc = Accumulator::Empty;
+                    continue;
+                }
             }
 
             acc = ctx.fold_line(acc, pos, line_end);
@@ -828,6 +1102,89 @@ impl<'src> ParseCtx<'src> {
         // Reached end of input: the block ends at the last non-blank line, not
         // the buffer end (which would wrongly include a trailing newline).
         finish(last_end, bytes.len())
+    }
+
+    /// Scan a whole list (`CommonMark` §5.2/§5.3) starting at `start`, pushing
+    /// every source line that belongs to it (verbatim, with indentation) onto
+    /// the line pool. Returns the resume byte offset. Item structure, nesting,
+    /// and loose/tight are all re-derived in pass 2 from the captured lines.
+    fn scan_list(&mut self, start: usize) -> usize {
+        let bytes = self.bytes;
+        let line_end_of =
+            |p: usize| bytes.find_byte(p, SpecialChar::Newline.byte()).unwrap_or(bytes.len());
+
+        // First item.
+        let mut pos = start;
+        let mut le = line_end_of(pos);
+        let ind0 = bytes[pos..le].leading_spaces();
+        let family = bytes[pos + ind0..le]
+            .list_marker()
+            .expect("caller verified a marker");
+        let mut w = bytes[pos + ind0 + family.width..le].item_content_indent(ind0, family);
+        self.lines.push(self.input.get(pos..le).unwrap_or(""));
+        pos = le + 1;
+
+        let mut blanks = 0usize;
+        // Whether the previous captured content line was paragraph text (so a
+        // dedented non-marker line can lazily continue it).
+        let mut last_para = true;
+
+        while pos < bytes.len() {
+            le = line_end_of(pos);
+            let line = &bytes[pos..le];
+
+            if line.iter().all(u8::is_ascii_whitespace) {
+                blanks += 1;
+                self.lines.push(self.input.get(pos..le).unwrap_or(""));
+                pos = le + 1;
+                last_para = false;
+                continue;
+            }
+
+            let ind = line.leading_spaces();
+
+            // Continuation: indented to at least the current item's content
+            // column. Belongs to the current item (paragraph text, sub-block,
+            // or indented code).
+            if ind >= w {
+                blanks = 0;
+                self.lines.push(self.input.get(pos..le).unwrap_or(""));
+                pos = le + 1;
+                last_para = true;
+                continue;
+            }
+
+            // Dedented: a sibling marker, a lazy paragraph continuation, or the
+            // end of the list.
+            if ind <= 3
+                && let Some(m) = bytes[pos + ind..le].list_marker()
+            {
+                if !family.same_family(m) || blanks >= 2 {
+                    break;
+                }
+                w = bytes[pos + ind + m.width..le].item_content_indent(ind, m);
+                blanks = 0;
+                self.lines.push(self.input.get(pos..le).unwrap_or(""));
+                pos = le + 1;
+                last_para = true;
+                continue;
+            }
+
+            // Lazy paragraph continuation (no intervening blank, previous line
+            // was paragraph text, and this line isn't itself a block start).
+            if blanks == 0 && last_para && !bytes[pos + ind..le].begins_block() {
+                self.lines.push(self.input.get(pos..le).unwrap_or(""));
+                pos = le + 1;
+                continue;
+            }
+            break;
+        }
+
+        // Trailing blank lines belong after the list, not inside it.
+        while self.lines.last().is_some_and(|l| l.trim().is_empty()) {
+            self.lines.pop();
+        }
+        pos
     }
 
     /// Merge two subslices of the current input into one contiguous slice
@@ -1023,90 +1380,7 @@ impl<'src> ParseCtx<'src> {
             return Accumulator::Empty;
         }
 
-        if let Some((marker, item_offset)) = line_bytes.try_parse_unordered_item() {
-            let item = self.input.get(spos + item_offset..line_end).unwrap_or("");
-            return self.fold_unordered_list(acc, marker, item);
-        }
-
-        if let Some((num, delim, item_offset)) = line_bytes.try_parse_ordered_item() {
-            let item = self.input.get(spos + item_offset..line_end).unwrap_or("");
-            return self.fold_ordered_list(acc, num, delim, item);
-        }
-
         self.fold_paragraph(acc, pos, line_end)
-    }
-
-    #[inline]
-    fn fold_unordered_list(
-        &mut self,
-        acc: Accumulator<'src>,
-        marker: SpecialChar,
-        item: &'src str,
-    ) -> Accumulator<'src> {
-        if let Accumulator::InUnorderedList {
-            marker: m,
-            items_start,
-        } = acc
-        {
-            if m == marker {
-                self.lines.push(item);
-                return Accumulator::InUnorderedList {
-                    marker,
-                    items_start,
-                };
-            }
-            self.flush_acc(Accumulator::InUnorderedList {
-                marker: m,
-                items_start,
-            });
-        } else {
-            self.flush_acc(acc);
-        }
-        let items_start = self.lines.len().lines_offset();
-        self.lines.push(item);
-        Accumulator::InUnorderedList {
-            marker,
-            items_start,
-        }
-    }
-
-    #[inline]
-    fn fold_ordered_list(
-        &mut self,
-        acc: Accumulator<'src>,
-        num: u32,
-        delim: OrderedListDelimiter,
-        item: &'src str,
-    ) -> Accumulator<'src> {
-        if let Accumulator::InOrderedList {
-            start,
-            delimiter,
-            items_start,
-        } = acc
-        {
-            if delimiter == delim {
-                self.lines.push(item);
-                return Accumulator::InOrderedList {
-                    start,
-                    delimiter,
-                    items_start,
-                };
-            }
-            self.flush_acc(Accumulator::InOrderedList {
-                start,
-                delimiter,
-                items_start,
-            });
-        } else {
-            self.flush_acc(acc);
-        }
-        let items_start = self.lines.len().lines_offset();
-        self.lines.push(item);
-        Accumulator::InOrderedList {
-            start: num,
-            delimiter: delim,
-            items_start,
-        }
     }
 
     #[inline]
@@ -1139,7 +1413,6 @@ impl<'src> ParseCtx<'src> {
         !line_bytes.is_horizontal_rule()
             && line_bytes.try_parse_heading(self.input, spos).is_none()
             && line_bytes.code_fence_opening().is_none()
-            && line_bytes.try_parse_unordered_item().is_none()
-            && line_bytes.try_parse_ordered_item().is_none()
+            && line_bytes.list_marker().is_none()
     }
 }

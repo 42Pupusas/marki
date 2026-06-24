@@ -8,7 +8,6 @@
 use std::fmt::Write as _;
 
 use crate::{Inline, InlineSpan, MarkdownFile, Section};
-use crate::section::SectionRange;
 
 /// Escape the four HTML-significant characters in text content
 /// (`CommonMark` renders these in body text).
@@ -87,6 +86,15 @@ fn escape_href(s: &str, out: &mut String) {
     }
 }
 
+/// Emit a newline only if `out` is non-empty and doesn't already end with one.
+/// Mirrors the `CommonMark` reference renderer's `cr()`, which keeps block
+/// elements on their own lines without doubling up newlines.
+fn cr(out: &mut String) {
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+}
+
 /// Strip the four-space (or single-tab) indentation prefix from one line of an
 /// indented code block (`CommonMark` §4.4).
 fn strip_code_indent(line: &str) -> &str {
@@ -156,6 +164,23 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 }
                 out.push_str("</code></pre>\n");
             }
+            Section::CodeLines { language, lines } => {
+                out.push_str("<pre><code");
+                if let Some(lang) = language {
+                    let first = lang.split_whitespace().next().unwrap_or("");
+                    if !first.is_empty() {
+                        out.push_str(" class=\"language-");
+                        escape_html(first, out);
+                        out.push('"');
+                    }
+                }
+                out.push('>');
+                for line in self.code_lines(*lines) {
+                    escape_html(line, out);
+                    out.push('\n');
+                }
+                out.push_str("</code></pre>\n");
+            }
             Section::IndentedCode { code } => {
                 out.push_str("<pre><code>");
                 // Strip up to four leading spaces (or one leading tab) from
@@ -191,9 +216,8 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 out.push_str("</ol>\n");
             }
             Section::ListItem { children } => {
-                // A bare ListItem (not reached via a list) renders its children
-                // as loose; lists call `render_list_item` directly.
-                self.render_list_item_inner(*children, false, out);
+                // A bare ListItem (not reached via a list) renders loose.
+                self.render_list_item(&Section::ListItem { children: *children }, false, out);
             }
             Section::Blockquote { children } => {
                 out.push_str("<blockquote>\n");
@@ -211,55 +235,29 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         }
     }
 
-    /// Render one `<li>` element. `tight` lists suppress the `<p>` wrapper
-    /// around an item's paragraph children (`CommonMark` §5.3).
+    /// Render one `<li>` element following `CommonMark`'s reference model: a
+    /// tight list's paragraph children render their inlines bare (no `<p>`),
+    /// while every other block is preceded by a soft line break (emitted only
+    /// when the output isn't already at the start of a line).
     fn render_list_item(&self, item: &Section<'_>, tight: bool, out: &mut String) {
         let Section::ListItem { children } = item else {
-            // Defensive: a list's items are always ListItem sections.
             self.render_section(item, out);
             return;
         };
         let kids = self.child_sections(*children);
-        if kids.is_empty() {
-            out.push_str("<li></li>\n");
-            return;
-        }
         out.push_str("<li>");
-        // Tight items whose sole/first blocks are paragraphs render those
-        // paragraphs' inlines without a wrapper; a leading block forces the
-        // closing tag onto its own line.
-        if tight && kids.iter().all(|k| matches!(k, Section::Paragraph { .. })) {
-            let mut first = true;
-            for kid in kids {
-                if let Section::Paragraph { content } = kid {
-                    if !first {
-                        out.push('\n');
-                    }
-                    first = false;
-                    self.render_inlines(*content, out);
-                }
-            }
-            out.push_str("</li>\n");
-            return;
-        }
-        out.push('\n');
-        self.render_list_item_inner(*children, tight, out);
-        out.push_str("</li>\n");
-    }
-
-    /// Render the child blocks of a list item, suppressing `<p>` wrappers on
-    /// paragraph children when the list is `tight`.
-    fn render_list_item_inner(&self, children: SectionRange, tight: bool, out: &mut String) {
-        for kid in self.child_sections(children) {
+        for kid in kids {
             if tight
                 && let Section::Paragraph { content } = kid
             {
+                // Tight paragraph: bare inlines, no wrapper, no leading break.
                 self.render_inlines(*content, out);
-                out.push('\n');
             } else {
+                cr(out);
                 self.render_section(kid, out);
             }
         }
+        out.push_str("</li>\n");
     }
 
     fn render_inlines(&self, span: InlineSpan, out: &mut String) {

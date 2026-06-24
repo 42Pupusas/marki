@@ -365,14 +365,39 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         parser.parse()
     }
 
-    /// Push parsed inline elements directly into the pool without wrapping
-    /// in a span, with configurable depth and stack limits.
-    pub(crate) fn parse_flat_into_configured(
-        input: &'src str,
+    /// Parse a sequence of paragraph lines (joined by soft breaks) into one
+    /// span. Each line is parsed into a shared [`InlineBuf`] so emphasis bodies
+    /// land in the pool *below* the top-level run — the span returned covers
+    /// only the top-level elements, never their nested children.
+    pub(crate) fn parse_lines_configured(
+        lines: &[&'src str],
         pool: &'pool mut Vec<Inline<'src>>,
         defs: &'pool LinkDefs<'src>,
-    ) {
-        Self::new(input, pool, defs).parse_flat();
+    ) -> InlineSpan {
+        let mut buf = InlineBuf::<CAP>::new();
+        for (idx, line) in lines.iter().enumerate() {
+            if idx > 0 {
+                buf.push(Inline::SoftBreak);
+            }
+            let bytes = line.as_bytes();
+            if bytes.find_byte_set(0, &SPECIAL_SET).is_none() {
+                if !line.is_empty() {
+                    buf.push(Inline::Text(line));
+                }
+                continue;
+            }
+            let emph = if bytes.len() < EMPH_SCAN_THRESHOLD {
+                EmphasisState::assume_both()
+            } else {
+                EmphasisState::from_bytes(bytes)
+            };
+            // Reborrow the pool for just this line so the next iteration (and
+            // the final flush) can borrow it again.
+            let mut parser: InlineParser<'src, '_, MAX_DEPTH, CAP> =
+                InlineParser::new(line, &mut *pool, defs);
+            parser.parse_into_buf(bytes, emph, &mut buf, 0);
+        }
+        buf.flush_to_pool(pool)
     }
 
     /// Parse inline elements and store them in the pool. Returns a span.
@@ -436,34 +461,6 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             strip_lines: false,
         }
         .parse_at_depth(depth)
-    }
-
-    /// Push parsed inline elements directly into the pool without wrapping
-    /// in a span. Used for blockquote multi-line accumulation where the caller
-    /// manages span boundaries.
-    fn parse_flat(&mut self) {
-        let bytes = self.input.as_bytes();
-        // Fast path: no special bytes means plain text.
-        if bytes.find_byte_set(0, &SPECIAL_SET).is_none() {
-            if !self.input.is_empty() {
-                self.pool.push(Inline::Text(self.input));
-            }
-            return;
-        }
-        let emph = if bytes.len() < EMPH_SCAN_THRESHOLD {
-            EmphasisState::assume_both()
-        } else {
-            EmphasisState::from_bytes(bytes)
-        };
-        // Parse directly into a buf that flushes to pool (flat, no span wrapper).
-        let mut buf = InlineBuf::<CAP>::new();
-        self.parse_into_buf(bytes, emph, &mut buf, 0);
-        // Flush buf directly to pool (not wrapped in a span).
-        if buf.overflow.is_empty() {
-            self.pool.extend_from_slice(buf.initialized_stack());
-        } else {
-            self.pool.extend(buf.overflow);
-        }
     }
 
     #[allow(clippy::too_many_lines)]

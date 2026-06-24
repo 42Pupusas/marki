@@ -1690,11 +1690,30 @@ fn test_ordered_list_empty_item() {
         Section::OrderedList {
             start: 1, items, ..
         } => {
+            // The first item is empty: CommonMark gives it no child blocks at
+            // all (an empty `<li></li>`), while the second holds one paragraph.
+            let item_sections = md.child_sections(*items);
+            assert_eq!(item_sections.len(), 2);
+            match item_sections[0] {
+                Section::ListItem { children } => {
+                    assert!(md.child_sections(children).is_empty());
+                }
+                ref other => panic!("expected list item, got {other:?}"),
+            }
             let checker = Checker::new(&md);
-            let items = checker.item_paragraphs(*items);
-            assert_eq!(items.len(), 2);
-            checker.check_span(items[0], &[]);
-            checker.check_span(items[1], &Expect::text("second"));
+            match item_sections[1] {
+                Section::ListItem { children } => {
+                    let kids = md.child_sections(children);
+                    assert_eq!(kids.len(), 1);
+                    match kids[0] {
+                        Section::Paragraph { content } => {
+                            checker.check_span(content, &Expect::text("second"));
+                        }
+                        ref other => panic!("expected paragraph, got {other:?}"),
+                    }
+                }
+                ref other => panic!("expected list item, got {other:?}"),
+            }
         }
         other => panic!("expected ordered list, got {other:?}"),
     }
