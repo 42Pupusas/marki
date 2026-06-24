@@ -33,16 +33,41 @@ enum RawSection<'src> {
         lines_len: u32,
     },
     /// A list (`CommonMark` §5.3) captured as a contiguous run of full source
-    /// lines in the line pool. Item boundaries, content indent, nesting, and
-    /// loose/tight are all derived in pass 2 by [`group_list_lines`].
+    /// lines in the line pool. Pass 1 ([`scan_list`]) splits the top-level
+    /// items, dedents each item's content into the line pool, and records one
+    /// [`ItemMeta`] per item plus the loose/tight flag and ordered start, so
+    /// pass 2 ([`assemble_list`]) iterates the items without re-deriving
+    /// boundaries or content columns. Nested sublists are still derived lazily
+    /// by [`build_list`] when [`resolve_blocks`] meets their marker.
     List {
-        lines_start: u32,
-        lines_len: u32,
+        items_start: u32,
+        items_len: u32,
+        tight: bool,
+        ordered: Option<(u32, OrderedListDelimiter)>,
     },
     HtmlBlock {
         html: &'src str,
     },
     HorizontalRule,
+}
+
+/// Pass-1 metadata for one top-level list item: the half-open range of
+/// already-dedented content lines it owns in the line pool. Emitted by
+/// [`scan_list`] and consumed by [`assemble_list`] in pass 2.
+#[derive(Clone, Copy)]
+struct ItemMeta {
+    lines_start: u32,
+    lines_len: u32,
+}
+
+/// Result of [`scan_list`]: the [`ItemMeta`] range for a top-level list, its
+/// loose/tight flag and ordered start, plus the byte offset to resume at.
+struct ListScan {
+    items_start: u32,
+    items_len: u32,
+    tight: bool,
+    ordered: Option<(u32, OrderedListDelimiter)>,
+    resume: usize,
 }
 
 /// A parsed list marker at the start of a (de-indented) line.
@@ -68,6 +93,51 @@ impl Marker {
     }
 }
 
+/// Recycler for the temporary `Vec`s used while resolving container blocks.
+///
+/// `resolve_blocks` runs once per list item and per blockquote, each needing a
+/// short-lived child-section buffer and paragraph-line buffer; `build_list`
+/// also needs an item-range buffer. Allocating these fresh every call made
+/// list-dense documents malloc-bound. Buffers are checked out, used, and
+/// returned, so the live allocation count tracks nesting depth rather than the
+/// number of items.
+#[derive(Default)]
+struct Scratch<'src> {
+    sections: Vec<Vec<Section<'src>>>,
+    lines: Vec<Vec<&'src str>>,
+    ranges: Vec<Vec<SectionRange>>,
+}
+
+impl<'src> Scratch<'src> {
+    fn take_sections(&mut self) -> Vec<Section<'src>> {
+        self.sections.pop().map_or_else(Vec::new, |mut v| {
+            v.clear();
+            v
+        })
+    }
+    fn give_sections(&mut self, v: Vec<Section<'src>>) {
+        self.sections.push(v);
+    }
+    fn take_lines(&mut self) -> Vec<&'src str> {
+        self.lines.pop().map_or_else(Vec::new, |mut v| {
+            v.clear();
+            v
+        })
+    }
+    fn give_lines(&mut self, v: Vec<&'src str>) {
+        self.lines.push(v);
+    }
+    fn take_ranges(&mut self) -> Vec<SectionRange> {
+        self.ranges.pop().map_or_else(Vec::new, |mut v| {
+            v.clear();
+            v
+        })
+    }
+    fn give_ranges(&mut self, v: Vec<SectionRange>) {
+        self.ranges.push(v);
+    }
+}
+
 /// Mutable parsing context for pass 1. Only collects raw sections — no inline
 /// pool or span pool needed.
 struct ParseCtx<'src> {
@@ -77,6 +147,9 @@ struct ParseCtx<'src> {
     /// Shared pool for blockquote lines and list items, avoiding per-section
     /// `Vec<&str>` heap allocations.
     lines: Vec<&'src str>,
+    /// Per-item metadata for top-level lists, referenced by
+    /// [`RawSection::List`]; lets pass 2 skip re-scanning item boundaries.
+    list_items: Vec<ItemMeta>,
     /// Link reference definitions collected during pass 1 (`CommonMark` §4.7).
     defs: LinkDefs<'src>,
 }
@@ -396,6 +469,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     ) -> Vec<Section<'src>> {
         let lines = &ctx.lines;
         let defs = &ctx.defs;
+        let mut scratch = Scratch::default();
         let mut sections = Vec::with_capacity(ctx.sections.len());
         for raw_section in &ctx.sections {
             match *raw_section {
@@ -423,14 +497,19 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     sections.push(Section::IndentedCode { code });
                 }
                 RawSection::List {
-                    lines_start,
-                    lines_len,
+                    items_start,
+                    items_len,
+                    tight,
+                    ordered,
                 } => {
-                    let raw_lines = lines
-                        .get(lines_start as usize..(lines_start + lines_len) as usize)
+                    let metas = ctx
+                        .list_items
+                        .get(items_start as usize..(items_start + items_len) as usize)
                         .unwrap_or(&[]);
-                    let list =
-                        Self::resolve_list(raw_lines, pool, section_pool, line_pool, defs);
+                    let list = Self::assemble_list(
+                        metas, lines, tight, ordered, pool, section_pool, line_pool,
+                        &mut scratch, defs,
+                    );
                     sections.push(list);
                 }
                 RawSection::Blockquote {
@@ -440,8 +519,9 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     let raw_lines = lines
                         .get(lines_start as usize..(lines_start + lines_len) as usize)
                         .unwrap_or(&[]);
-                    let children =
-                        Self::resolve_blocks(raw_lines, pool, section_pool, line_pool, defs);
+                    let children = Self::resolve_blocks(
+                        raw_lines, pool, section_pool, line_pool, &mut scratch, defs,
+                    );
                     sections.push(Section::Blockquote { children });
                 }
                 RawSection::HtmlBlock { html } => {
@@ -455,19 +535,53 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         sections
     }
 
-    /// Resolve a top-level list's captured source lines (from pass 1) into the
-    /// final list [`Section`]. Delegates all structure to [`group_list`] and
-    /// [`resolve_blocks`].
-    fn resolve_list(
-        list_lines: &[&'src str],
+    /// Assemble a top-level list [`Section`] from the per-item metadata that
+    /// [`scan_list`] produced in pass 1. Each [`ItemMeta`] already points at
+    /// its item's dedented content lines, so this just resolves each item's
+    /// child blocks via [`resolve_blocks`] and stitches the `ListItem`s
+    /// together — no item-boundary or content-column work is repeated.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble_list(
+        metas: &[ItemMeta],
+        lines: &[&'src str],
+        tight: bool,
+        ordered: Option<(u32, OrderedListDelimiter)>,
         pool: &mut Vec<Inline<'src>>,
         section_pool: &mut Vec<Section<'src>>,
         line_pool: &mut Vec<&'src str>,
+        scratch: &mut Scratch<'src>,
         defs: &LinkDefs<'src>,
     ) -> Section<'src> {
-        let (section, _consumed) =
-            Self::build_list(list_lines, pool, section_pool, line_pool, defs);
-        section
+        let mut ranges = scratch.take_ranges();
+        for meta in metas {
+            let item_lines = lines
+                .get(meta.lines_start as usize..(meta.lines_start + meta.lines_len) as usize)
+                .unwrap_or(&[]);
+            let range =
+                Self::resolve_blocks(item_lines, pool, section_pool, line_pool, scratch, defs);
+            ranges.push(range);
+        }
+
+        let items_start = section_pool.len().pool_offset();
+        // `drain` (not `into_iter`) so `ranges` keeps its capacity for reuse.
+        #[allow(clippy::iter_with_drain)]
+        for children in ranges.drain(..) {
+            section_pool.push(Section::ListItem { children });
+        }
+        let items_len = section_pool.len().pool_offset() - items_start;
+        scratch.give_ranges(ranges);
+        let items = SectionRange::new(items_start, items_len);
+
+        if let Some((start, delimiter)) = ordered {
+            Section::OrderedList {
+                start,
+                delimiter,
+                tight,
+                items,
+            }
+        } else {
+            Section::UnorderedList { tight, items }
+        }
     }
 
     /// Recursively resolve a sequence of container content lines into a range
@@ -482,10 +596,11 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         pool: &mut Vec<Inline<'src>>,
         section_pool: &mut Vec<Section<'src>>,
         line_pool: &mut Vec<&'src str>,
+        scratch: &mut Scratch<'src>,
         defs: &LinkDefs<'src>,
     ) -> SectionRange {
-        let mut children: Vec<Section<'src>> = Vec::new();
-        let mut para: Vec<&'src str> = Vec::new();
+        let mut children = scratch.take_sections();
+        let mut para = scratch.take_lines();
         let mut i = 0;
 
         while i < lines.len() {
@@ -540,7 +655,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 // Nested blockquote: collect the run and recurse.
                 if body.first() == SpecialChar::GreaterThan {
                     Self::flush_para(&mut para, &mut children, pool, defs);
-                    let mut nested: Vec<&'src str> = Vec::new();
+                    let mut nested = scratch.take_lines();
                     while i < lines.len() {
                         let l = lines[i];
                         let lb = l.as_bytes();
@@ -558,8 +673,10 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                         nested.push(content);
                         i += 1;
                     }
-                    let range =
-                        Self::resolve_blocks(&nested, pool, section_pool, line_pool, defs);
+                    let range = Self::resolve_blocks(
+                        &nested, pool, section_pool, line_pool, scratch, defs,
+                    );
+                    scratch.give_lines(nested);
                     children.push(Section::Blockquote { children: range });
                     continue;
                 }
@@ -610,10 +727,10 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 if !para.is_empty()
                     && let Some(level) = body.setext_heading_level()
                 {
-                    let trimmed: Vec<&str> = para.iter().map(|l| l.trim()).collect();
+                    // `para` already holds trimmed lines, so no further copy.
                     let content =
                         InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_lines_configured(
-                            &trimmed, pool, defs,
+                            &para, pool, defs,
                         );
                     children.push(Section::Heading { level, content });
                     para.clear();
@@ -632,8 +749,9 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 // Nested list (a thematic break takes precedence over a bullet).
                 if !body.is_horizontal_rule() && body.list_marker().is_some() {
                     Self::flush_para(&mut para, &mut children, pool, defs);
-                    let (section, consumed) =
-                        Self::build_list(&lines[i..], pool, section_pool, line_pool, defs);
+                    let (section, consumed) = Self::build_list(
+                        &lines[i..], pool, section_pool, line_pool, scratch, defs,
+                    );
                     children.push(section);
                     i += consumed;
                     continue;
@@ -649,8 +767,10 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         Self::flush_para(&mut para, &mut children, pool, defs);
 
         let start = section_pool.len().pool_offset();
-        section_pool.extend(children);
+        section_pool.append(&mut children);
         let len = section_pool.len().pool_offset() - start;
+        scratch.give_sections(children);
+        scratch.give_lines(para);
         SectionRange::new(start, len)
     }
 
@@ -698,6 +818,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         pool: &mut Vec<Inline<'src>>,
         section_pool: &mut Vec<Section<'src>>,
         line_pool: &mut Vec<&'src str>,
+        scratch: &mut Scratch<'src>,
         defs: &LinkDefs<'src>,
     ) -> (Section<'src>, usize) {
         let first_ind = lines[0].as_bytes().leading_spaces().min(3);
@@ -714,8 +835,8 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         // marker or the list's end. `ranges` holds each item's child-block
         // range; the ListItem sections are appended together at the end so the
         // children precede them in the pool.
-        let mut ranges: Vec<SectionRange> = Vec::new();
-        let mut item: Vec<&'src str> = Vec::new();
+        let mut ranges = scratch.take_ranges();
+        let mut item = scratch.take_lines();
         let mut loose = false;
         let mut i = 0;
         let mut pending_blanks = 0usize;
@@ -789,13 +910,20 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 item.pop();
                 pending_blanks += 1;
             }
-            let range = Self::resolve_blocks(&item, pool, section_pool, line_pool, defs);
+            let range =
+                Self::resolve_blocks(&item, pool, section_pool, line_pool, scratch, defs);
             ranges.push(range);
         }
+        scratch.give_lines(item);
 
         let items_start = section_pool.len().pool_offset();
-        section_pool.extend(ranges.into_iter().map(|children| Section::ListItem { children }));
+        // `drain` (not `into_iter`) so `ranges` keeps its capacity for reuse.
+        #[allow(clippy::iter_with_drain)]
+        for children in ranges.drain(..) {
+            section_pool.push(Section::ListItem { children });
+        }
         let items_len = section_pool.len().pool_offset() - items_start;
+        scratch.give_ranges(ranges);
         let items_range = SectionRange::new(items_start, items_len);
         let tight = !loose;
 
@@ -854,6 +982,7 @@ impl<'src> ParseCtx<'src> {
             // Rough heuristic: ~50 bytes per section on average.
             sections: Vec::with_capacity(input.len() / 50 + 1),
             lines: Vec::with_capacity(input.len() / 80 + 1),
+            list_items: Vec::new(),
             defs: LinkDefs::new(),
         };
         let mut acc = Accumulator::Empty;
@@ -952,14 +1081,14 @@ impl<'src> ParseCtx<'src> {
                         });
                 if interrupts_ok {
                     ctx.flush_acc(acc);
-                    let lines_start = ctx.lines.len().lines_offset();
-                    let resume = ctx.scan_list(pos);
-                    let lines_len = ctx.lines.len().lines_offset() - lines_start;
+                    let scan = ctx.scan_list(pos);
                     ctx.sections.push(RawSection::List {
-                        lines_start,
-                        lines_len,
+                        items_start: scan.items_start,
+                        items_len: scan.items_len,
+                        tight: scan.tight,
+                        ordered: scan.ordered,
                     });
-                    pos = resume;
+                    pos = scan.resume;
                     acc = Accumulator::Empty;
                     continue;
                 }
@@ -1104,38 +1233,52 @@ impl<'src> ParseCtx<'src> {
         finish(last_end, bytes.len())
     }
 
-    /// Scan a whole list (`CommonMark` §5.2/§5.3) starting at `start`, pushing
-    /// every source line that belongs to it (verbatim, with indentation) onto
-    /// the line pool. Returns the resume byte offset. Item structure, nesting,
-    /// and loose/tight are all re-derived in pass 2 from the captured lines.
-    fn scan_list(&mut self, start: usize) -> usize {
+    /// Scan a whole top-level list (`CommonMark` §5.2/§5.3) starting at
+    /// `start`. Splits the list into items in a single byte walk, pushes each
+    /// item's *dedented* content lines onto the line pool, and records an
+    /// [`ItemMeta`] per item plus the loose/tight flag and ordered start.
+    ///
+    /// This subsumes the item-boundary and content-column work that pass 2
+    /// used to redo: [`assemble_list`] now just maps each [`ItemMeta`] through
+    /// [`resolve_blocks`]. Nested sublists are still derived lazily in pass 2
+    /// (the dedented item lines are re-scanned only when their own marker is
+    /// met), so this walk only tracks the *outermost* item structure.
+    fn scan_list(&mut self, start: usize) -> ListScan {
         let bytes = self.bytes;
         let line_end_of =
             |p: usize| bytes.find_byte(p, SpecialChar::Newline.byte()).unwrap_or(bytes.len());
 
-        // First item.
-        let mut pos = start;
-        let mut le = line_end_of(pos);
-        let ind0 = bytes[pos..le].leading_spaces();
-        let family = bytes[pos + ind0..le]
+        let items_start = self.list_items.len().lines_offset();
+        let ind0 = bytes[start..line_end_of(start)].leading_spaces();
+        let family = bytes[start + ind0..line_end_of(start)]
             .list_marker()
             .expect("caller verified a marker");
-        let mut w = bytes[pos + ind0 + family.width..le].item_content_indent(ind0, family);
-        self.lines.push(self.input.get(pos..le).unwrap_or(""));
-        pos = le + 1;
+        let ordered = family.ordered;
 
-        let mut blanks = 0usize;
-        // Whether the previous captured content line was paragraph text (so a
-        // dedented non-marker line can lazily continue it).
+        let mut pos = start;
+        let mut loose = false;
+        // Per-item state, (re)initialised at each marker line.
+        let mut item_start = self.lines.len().lines_offset();
+        let mut col; // content column of the current item
+        let mut item_blanks = 0usize; // blanks seen inside the current item
+        let mut pending_blanks = 0usize; // trailing blanks not yet attributed
         let mut last_para = true;
 
+        // Open the first item.
+        {
+            let le = line_end_of(pos);
+            col = bytes[start + ind0 + family.width..le].item_content_indent(ind0, family);
+            self.push_marker_content(pos, le, col);
+            pos = le + 1;
+        }
+
         while pos < bytes.len() {
-            le = line_end_of(pos);
+            let le = line_end_of(pos);
             let line = &bytes[pos..le];
 
             if line.iter().all(u8::is_ascii_whitespace) {
-                blanks += 1;
-                self.lines.push(self.input.get(pos..le).unwrap_or(""));
+                item_blanks += 1;
+                self.lines.push("");
                 pos = le + 1;
                 last_para = false;
                 continue;
@@ -1143,48 +1286,96 @@ impl<'src> ParseCtx<'src> {
 
             let ind = line.leading_spaces();
 
-            // Continuation: indented to at least the current item's content
-            // column. Belongs to the current item (paragraph text, sub-block,
-            // or indented code).
-            if ind >= w {
-                blanks = 0;
-                self.lines.push(self.input.get(pos..le).unwrap_or(""));
+            // Continuation indented to the item's content column.
+            if ind >= col {
+                if item_blanks > 0 {
+                    loose = true;
+                }
+                item_blanks = 0;
+                self.push_dedented(pos, le, col);
                 pos = le + 1;
                 last_para = true;
                 continue;
             }
 
-            // Dedented: a sibling marker, a lazy paragraph continuation, or the
-            // end of the list.
+            // Dedented sibling marker: close this item, open the next.
             if ind <= 3
                 && let Some(m) = bytes[pos + ind..le].list_marker()
             {
-                if !family.same_family(m) || blanks >= 2 {
+                if !family.same_family(m) || item_blanks >= 2 {
                     break;
                 }
-                w = bytes[pos + ind + m.width..le].item_content_indent(ind, m);
-                blanks = 0;
-                self.lines.push(self.input.get(pos..le).unwrap_or(""));
+                self.close_item(item_start, &mut pending_blanks);
+                if pending_blanks > 0 {
+                    loose = true;
+                    pending_blanks = 0;
+                }
+                item_start = self.lines.len().lines_offset();
+                col = bytes[pos + ind + m.width..le].item_content_indent(ind, m);
+                item_blanks = 0;
+                self.push_marker_content(pos, le, col);
                 pos = le + 1;
                 last_para = true;
                 continue;
             }
 
-            // Lazy paragraph continuation (no intervening blank, previous line
-            // was paragraph text, and this line isn't itself a block start).
-            if blanks == 0 && last_para && !bytes[pos + ind..le].begins_block() {
-                self.lines.push(self.input.get(pos..le).unwrap_or(""));
+            // Lazy paragraph continuation.
+            if item_blanks == 0 && last_para && !bytes[pos + ind..le].begins_block() {
+                // Lazy lines are dedented by trimming (they sit left of `col`).
+                self.lines.push(self.input.get(pos + ind..le).unwrap_or(""));
                 pos = le + 1;
                 continue;
             }
             break;
         }
 
-        // Trailing blank lines belong after the list, not inside it.
-        while self.lines.last().is_some_and(|l| l.trim().is_empty()) {
-            self.lines.pop();
+        // Close the final item.
+        self.close_item(item_start, &mut pending_blanks);
+
+        let items_len = self.list_items.len().lines_offset() - items_start;
+        ListScan {
+            items_start,
+            items_len,
+            tight: !loose,
+            ordered,
+            resume: pos,
         }
-        pos
+    }
+
+    /// Push one source line `[pos..le)` onto the line pool with its first `col`
+    /// columns of indentation removed (the item's content column). Lines
+    /// shorter than `col` (e.g. blanks) collapse to `""`.
+    fn push_dedented(&mut self, pos: usize, le: usize, col: usize) {
+        let line = self.input.get(pos..le).unwrap_or("");
+        self.lines.push(line.get(col..).unwrap_or(""));
+    }
+
+    /// Like [`push_dedented`] but skips a marker line whose content is empty,
+    /// so an empty item (`-` alone) contributes zero lines and does not look
+    /// like a trailing blank that would mark the list loose.
+    fn push_marker_content(&mut self, pos: usize, le: usize, col: usize) {
+        let content = self.input.get(pos..le).and_then(|l| l.get(col..)).unwrap_or("");
+        if !content.is_empty() {
+            self.lines.push(content);
+        }
+    }
+
+    /// Finish the item whose dedented lines start at `item_start`: trim its
+    /// trailing blank lines out of the line pool (they belong to the list, not
+    /// the item), counting them into `pending_blanks`, and record an
+    /// [`ItemMeta`] spanning the remaining lines.
+    fn close_item(&mut self, item_start: u32, pending_blanks: &mut usize) {
+        while self.lines.len().lines_offset() > item_start
+            && self.lines.last().is_some_and(|l| l.is_empty())
+        {
+            self.lines.pop();
+            *pending_blanks += 1;
+        }
+        let lines_len = self.lines.len().lines_offset() - item_start;
+        self.list_items.push(ItemMeta {
+            lines_start: item_start,
+            lines_len,
+        });
     }
 
     /// Merge two subslices of the current input into one contiguous slice
