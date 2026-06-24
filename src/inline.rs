@@ -855,6 +855,11 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         bytes: &[u8],
         start: usize,
     ) -> Option<(&'src str, &'src str, Option<&'src str>, usize)> {
+        // Every reference form requires a matching definition; if the registry
+        // is empty there is nothing to resolve, so skip the bracket scanning.
+        if self.defs.is_empty() {
+            return None;
+        }
         if bytes.get(start) != SpecialChar::OpenBracket {
             return None;
         }
@@ -894,7 +899,13 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
     }
 
     /// Look up a label in the definition registry after normalization.
+    ///
+    /// Fast-exits when there are no definitions (the common case), avoiding the
+    /// allocation + lowercasing that `normalize_label` performs.
     fn lookup(&self, label: &str) -> Option<(&'src str, Option<&'src str>)> {
+        if self.defs.is_empty() {
+            return None;
+        }
         self.defs.get(&normalize_label(label)).copied()
     }
 
