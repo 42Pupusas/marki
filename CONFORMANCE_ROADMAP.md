@@ -241,4 +241,36 @@ to lock in progress and prevent regressions.
   needs owned strings), link-ref-defs defined inside containers (218/317),
   list-item lazy continuation (292), nested-sublist tightness/indent
   (307/312/319), setext underline after a blockquote lazy line (93).
+- 2026-06-24: Lazy continuation through list markers (98.3% → 98.5%).
+  `is_lazy_paragraph_tail` now also descends a list marker into the item's
+  content, so a marker-less line continues a paragraph open inside a list item
+  nested in a blockquote (`> 1. > Blockquote` + `continued here.`). Fixes 292.
+
+## Status: 642/652 (98.5%) — remaining 10
+
+The last ten all need multi-part architectural work, deliberately deferred to
+avoid regressions (each was prototyped and reverted when it broke a sibling):
+- **Tabs 4/5/6/7** — partial tab expansion inside containers. A tab split
+  across a marker/quote boundary yields synthesized indentation (e.g. `→→bar`
+  in a quote → `  bar`). The line pool is zero-copy `Vec<&'src str>`; this needs
+  an owned-string path (`Vec<Cow<'src, str>>` or a `String` arena). Example 4
+  needs only column-aware list continuation, but the minimal change regressed
+  example 9 (a tab+space sublist marker), so it needs the full column rewrite.
+- **218 / 317** — link reference definitions defined *inside* a blockquote or
+  list item. All defs must be collected in pass 1 before any inline resolution;
+  today only top-level defs are scanned. Needs a pass-1 walk of container
+  content (or a dedicated def-collection sweep over the line pool).
+- **307 / 319** — nested-list loose/tight. A blank line *inside a sublist*
+  wrongly loosens the ancestor list because `scan_list` does a flat blank count
+  while sublists are derived lazily in pass 2. The `ind == col` heuristic fixed
+  these two but regressed 264/270/271 (a blank before *direct* indented code in
+  an item, which *should* loosen). Correct fix: compute looseness structurally
+  after the sublist recursion, not during the flat scan.
+- **312** — an over-indented marker in the "dead zone" (indent 4: past the
+  sibling threshold 3, before the content column 5) is lazy paragraph text, not
+  a sublist. Allowing it as lazy text reparses it as a sublist in pass 2
+  (net-neutral), so it needs the over-indent to be marked non-structural.
+- **93** — a setext underline must not form from a blockquote lazy continuation
+  line; needs the recursive `resolve_blocks` to track which collected lines were
+  lazy so it can suppress setext promotion.
   (tabs, lists, blockquotes).
