@@ -1609,6 +1609,13 @@ impl<'src> ParseCtx<'src> {
         // Set when the current item is empty (marker only) and a blank line has
         // followed: a later indented line cannot then join this item.
         let mut empty_then_blank = false;
+        // Looseness must only count a blank that separates two *direct* children
+        // of the item (CommonMark §5.3: "directly contain"). A blank *inside* a
+        // sub-container (a nested list or blockquote) does not loosen the outer
+        // list. `sub_col` is the dedented-indent threshold of the outermost open
+        // sub-container: a post-blank line at or beyond it continues that
+        // sub-container (no loosening); a line below it is a direct child.
+        let mut sub_col: Option<usize> = None;
 
         // Open the first item.
         {
@@ -1653,11 +1660,33 @@ impl<'src> ParseCtx<'src> {
                 if empty_then_blank {
                     break;
                 }
-                if item_blanks > 0 {
+                // Dedented indentation of this line within the item frame, and
+                // its content past that indentation.
+                let dind = ind - col;
+                let content = self.input.get(pos + col..le).unwrap_or("");
+                let inner = &content.as_bytes()[dind.min(content.len())..];
+                // A preceding blank loosens the list only when this line is a
+                // *direct* child of the item. If an inner sub-container (nested
+                // list / blockquote) was open and this line lies within it
+                // (indented past its marker), the blank was interior to that
+                // sub-container and must not loosen the outer list.
+                if item_blanks > 0 && !sub_col.is_some_and(|th| dind >= th) {
                     loose = true;
                 }
                 item_blanks = 0;
-                let content = self.input.get(pos + col..le).unwrap_or("");
+                // Update the open-sub-container threshold. A line that does not
+                // continue the current sub-container becomes a new direct child:
+                // a nested list/blockquote (re)opens a sub-container at its
+                // marker column; anything else closes it.
+                if !sub_col.is_some_and(|th| dind >= th) {
+                    sub_col = if (!inner.is_horizontal_rule() && inner.list_marker().is_some())
+                        || inner.first() == Some(&SpecialChar::GreaterThan.byte())
+                    {
+                        Some(dind + 1)
+                    } else {
+                        None
+                    };
+                }
                 fence = update_fence(fence, content.as_bytes());
                 self.push_dedented(pos, le, col);
                 pos = le + 1;
@@ -1687,6 +1716,7 @@ impl<'src> ParseCtx<'src> {
                 col = bytes[pos + ind + m.width..le].item_content_indent(ind, m);
                 item_blanks = 0;
                 empty_then_blank = false;
+                sub_col = None;
                 fence = update_fence(None, &bytes[(pos + ind + m.width).min(le)..le]);
                 self.push_marker_content(pos, le, col);
                 pos = le + 1;
