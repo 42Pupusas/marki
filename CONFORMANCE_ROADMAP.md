@@ -274,25 +274,66 @@ to lock in progress and prevent regressions.
   or a sublist marker. A "dead-zone" marker in `scan_list` (indent past the
   sibling threshold but short of the content column) is now collected as a
   flagged lazy line, fixing 312. Fixes 93, 312. → Setext 27/27, Lists 26/26.
+- 2026-06-25: **Partial tab expansion in containers — 100% (99.5% → 100.0%).**
+  Closed the documented "hard wall" (Tabs 5/6/7) *without* sacrificing
+  zero-copy. Two stages:
+  - **Stage A** (plumbing, behaviour-neutral): the code/HTML line pool element
+    became `PoolLine { pad: u8, text: &'src str }` (`src/section.rs`); all push
+    sites use `pad = 0`, so output stayed byte-identical (649/652, 141 lib
+    tests green). `html.rs` `CodeLines`/`HtmlLines` emit `pad` leading spaces.
+  - **Stage B** (the fix): a `pad: Vec<u8>` pool parallel to `ParseCtx::lines`,
+    threaded through `resolve_blocks`/`build_list`/`assemble_list`. The
+    split-tab invariant (consume the whole straddled tab → slice resumes on an
+    absolute tab stop → leftover columns become `pad`) is encoded by
+    `strip_columns_padded` / `byte_at_column` / `strip_cols_from_padded`. The
+    blockquote `>` strip (ex 6), the list content-column strip in `scan_list`
+    (ex 7, and ex 5's post-blank continuation) and the `resolve_blocks`
+    indented-code arm are now column-aware and pad-preserving. The list
+    continuation path only emits pad when the remainder is genuinely indented
+    code (≥4 columns past the content column), so nested sublists reached via a
+    tab (ex 9) are untouched. Fast path (`pad == 0`) byte-identical; corpus
+    benches flat. The `commonmark_conformance` test now **gates**
+    (`assert_eq!(passed, total)`). Tabs 11/11. → **652/652 (100%).**
 
-## Status: 649/652 (99.5%) — remaining 3
+## Status: 652/652 (100.0%) — COMPLETE 🎉
 
-All three remaining failures are **one feature**: partial tab expansion inside
-containers (Tabs examples 5, 6, 7), e.g. `>\t\tfoo` → `<pre><code>  foo`.
+Full CommonMark conformance, **zero-copy guarantee intact**. The
+`commonmark_conformance` test now *gates* (`assert_eq!(passed, total)`), so any
+regression fails CI.
 
-This is the parser's single hard architectural wall. When a container prefix
-(blockquote `>` padding, a list content column, or the 4-space indented-code
-strip) ends partway through a tab, the remaining columns must be materialized as
-synthesized spaces — a string that exists in **no** source substring, so it must
-be **owned**.
+### How the "hard architectural wall" fell without owning strings
 
-The obstacle is not the `line_pool` (which feeds only code/HTML and could be
-`Vec<Cow<'src, str>>`): it is that the tab-splitting dedent happens during
-*container content collection* into `ParseCtx::lines`, **before** we know the
-content is code, and `ParseCtx::lines` also feeds the inline parser, whose
-`Inline::Text(&'src str)` is structurally tied to the source lifetime. At
-runtime these owned lines are *always* indented code (never inline text), but
-the type system can't encode that. Closing the last 0.5% therefore requires a
-self-referential owned-string arena that the inline `&'src str` spans can borrow
-from — a redesign that trades away the zero-copy guarantee for three spec
-examples. Deliberately deferred.
+The last three failures were one feature — partial tab expansion inside
+containers (Tabs 5/6/7), e.g. `>\t\tfoo` → `<pre><code>  foo`. When a container
+prefix (blockquote `>` padding, a list content column, or the 4-space
+indented-code strip) ends partway through a tab, the leftover columns must be
+materialized as spaces that exist in no source substring.
+
+The earlier analysis concluded this needed an *owned* self-referential string
+arena. That was **wrong**: those synthetic spaces are only ever needed at the
+*leaf* (code/HTML rendering), never by the inline parser. The fix is a
+per-line **synthetic-space count**, not an owned string:
+
+- **`PoolLine<'src> { pad: u8, text: &'src str }`** (`src/section.rs`) replaces
+  the bare `&'src str` in the code/HTML line pool. `text` stays borrowed; `pad`
+  is the synthetic leading spaces. The line pool feeds only `CodeLines` /
+  `HtmlLines` rendering, so the inline `Inline::Text(&'src str)` lifetime is
+  never involved.
+- **The split-tab invariant**: whenever a prefix strip straddles a tab, we
+  consume the *whole* straddled tab so the stored slice resumes on an absolute
+  tab stop (a column ≡ 0 mod 4). Tab expansion *inside* the slice then stays
+  correct from a local origin of 0, and the tab's leftover columns become
+  `pad`. Helpers `strip_columns_padded` / `byte_at_column` /
+  `strip_cols_from_padded` (`src/block.rs`) encode this; total indent of a
+  pooled line is `pad + leading_columns(text)`.
+- **A `pad: Vec<u8>` pool parallel to `ParseCtx::lines`** (mirroring the
+  existing `lazy` array), threaded through `resolve_blocks` / `build_list` /
+  `assemble_list`. The container collectors (`scan_list` blockquote `>` strip,
+  list content-column strip) compute `pad` only when a strip lands mid-tab; the
+  indented-code arm of `resolve_blocks` measures indent in *columns* and
+  dedents pad-aware.
+- **Fast path preserved**: every code path is byte-identical when `pad == 0`
+  (`indent_cols` reduces to `leading_spaces`; padded strips reduce to the old
+  clean-boundary slice). Same-session corpus benches flat (awesome +3.5%,
+  commonmark_spec −11%, rust_readme −6% — all within run-to-run noise). All
+  141 lib tests + the gating conformance test pass; clippy clean.
