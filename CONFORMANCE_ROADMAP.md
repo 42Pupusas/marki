@@ -246,31 +246,53 @@ to lock in progress and prevent regressions.
   content, so a marker-less line continues a paragraph open inside a list item
   nested in a blockquote (`> 1. > Blockquote` + `continued here.`). Fixes 292.
 
-## Status: 642/652 (98.5%) — remaining 10
+- 2026-06-24: Container-nested link reference definitions (98.5% → 98.8%).
+  A pre-pass in `resolve_inlines` sweeps every blockquote / list-item's
+  collected lines for definitions (`collect_container_defs_in`, descending
+  nested `>`/marker prefixes via `peel_content_offset`) and merges them into the
+  registry *before* any inline resolution, so a reference can resolve against a
+  definition that appears later inside a container. `resolve_blocks` skips the
+  def lines so they produce no output. Fixes 218, 317. → Link ref defs 27/27.
+- 2026-06-24: Sub-container blank rule for list looseness (98.8% → 99.1%).
+  Both `scan_list` and `build_list` track `sub_col`, the dedented-indent
+  threshold of the outermost open nested list/blockquote in the current item. A
+  blank line only loosens the list when the following line is a *direct* child
+  of the item (`dind < sub_col`); a blank interior to a sub-container is ignored.
+  Fixes 307, 319 without regressing 264/270/271 (blank before *direct* indented
+  code still loosens). → Block quotes / List items / Lists all clean here.
+- 2026-06-24: Tab-carried list continuation (99.1% → 99.2%).
+  A continuation line may reach the item content column via a tab even when its
+  leading *spaces* fall short (`\tbar` = 4 columns). `scan_list` takes a
+  column-aware path (`leading_columns` + `strip_columns`) only when the strip
+  lands on a clean byte boundary, yielding a borrowable slice; otherwise it
+  falls through to the space path. Fixes 4 without regressing 9.
+- 2026-06-24: Lazy-line metadata for pass 2 (99.2% → 99.5%).
+  `ParseCtx` gained a `lazy: Vec<bool>` pool parallel to `lines` (kept aligned
+  via `push_line`/`pop_line`), flagging lines collected as lazy paragraph
+  continuations. `resolve_blocks`/`build_list`/`assemble_list` thread the
+  parallel slice so a lazy line is never re-promoted to a setext underline (93)
+  or a sublist marker. A "dead-zone" marker in `scan_list` (indent past the
+  sibling threshold but short of the content column) is now collected as a
+  flagged lazy line, fixing 312. Fixes 93, 312. → Setext 27/27, Lists 26/26.
 
-The last ten all need multi-part architectural work, deliberately deferred to
-avoid regressions (each was prototyped and reverted when it broke a sibling):
-- **Tabs 4/5/6/7** — partial tab expansion inside containers. A tab split
-  across a marker/quote boundary yields synthesized indentation (e.g. `→→bar`
-  in a quote → `  bar`). The line pool is zero-copy `Vec<&'src str>`; this needs
-  an owned-string path (`Vec<Cow<'src, str>>` or a `String` arena). Example 4
-  needs only column-aware list continuation, but the minimal change regressed
-  example 9 (a tab+space sublist marker), so it needs the full column rewrite.
-- **218 / 317** — link reference definitions defined *inside* a blockquote or
-  list item. All defs must be collected in pass 1 before any inline resolution;
-  today only top-level defs are scanned. Needs a pass-1 walk of container
-  content (or a dedicated def-collection sweep over the line pool).
-- **307 / 319** — nested-list loose/tight. A blank line *inside a sublist*
-  wrongly loosens the ancestor list because `scan_list` does a flat blank count
-  while sublists are derived lazily in pass 2. The `ind == col` heuristic fixed
-  these two but regressed 264/270/271 (a blank before *direct* indented code in
-  an item, which *should* loosen). Correct fix: compute looseness structurally
-  after the sublist recursion, not during the flat scan.
-- **312** — an over-indented marker in the "dead zone" (indent 4: past the
-  sibling threshold 3, before the content column 5) is lazy paragraph text, not
-  a sublist. Allowing it as lazy text reparses it as a sublist in pass 2
-  (net-neutral), so it needs the over-indent to be marked non-structural.
-- **93** — a setext underline must not form from a blockquote lazy continuation
-  line; needs the recursive `resolve_blocks` to track which collected lines were
-  lazy so it can suppress setext promotion.
-  (tabs, lists, blockquotes).
+## Status: 649/652 (99.5%) — remaining 3
+
+All three remaining failures are **one feature**: partial tab expansion inside
+containers (Tabs examples 5, 6, 7), e.g. `>\t\tfoo` → `<pre><code>  foo`.
+
+This is the parser's single hard architectural wall. When a container prefix
+(blockquote `>` padding, a list content column, or the 4-space indented-code
+strip) ends partway through a tab, the remaining columns must be materialized as
+synthesized spaces — a string that exists in **no** source substring, so it must
+be **owned**.
+
+The obstacle is not the `line_pool` (which feeds only code/HTML and could be
+`Vec<Cow<'src, str>>`): it is that the tab-splitting dedent happens during
+*container content collection* into `ParseCtx::lines`, **before** we know the
+content is code, and `ParseCtx::lines` also feeds the inline parser, whose
+`Inline::Text(&'src str)` is structurally tied to the source lifetime. At
+runtime these owned lines are *always* indented code (never inline text), but
+the type system can't encode that. Closing the last 0.5% therefore requires a
+self-referential owned-string arena that the inline `&'src str` spans can borrow
+from — a redesign that trades away the zero-copy guarantee for three spec
+examples. Deliberately deferred.
