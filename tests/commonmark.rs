@@ -271,8 +271,13 @@ fn commonmark_conformance() {
         eprintln!("\nFAIL {f}");
     }
 
-    // This test reports; it does not gate. The `no_panic` test is the hard
-    // assertion. Flip this on once a coverage target is agreed.
+    // Full CommonMark conformance reached (652/652). This test now gates:
+    // every spec vector must render byte-for-byte, so any regression fails CI.
+    assert_eq!(
+        passed, total,
+        "CommonMark conformance regressed: {passed}/{total} ({pct:.1}%); {} failing",
+        failures.len()
+    );
 }
 
 /// Sanity: every fixture input must parse and render without panicking, even

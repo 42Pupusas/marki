@@ -9,6 +9,33 @@ use std::fmt::Write as _;
 
 use crate::{Inline, InlineSpan, MarkdownFile, Section};
 
+/// Render a code span's content per `CommonMark` §6.1: first convert interior
+/// line endings (`\n`, with any preceding `\r` already normalized away) to
+/// single spaces, then — if the result contains at least one non-space — strip a
+/// single leading and trailing space. Finally HTML-escape. Entities and
+/// backslashes are *not* interpreted inside a code span.
+fn escape_code_span(s: &str, out: &mut String) {
+    // Step 1: collapse line endings to spaces into a scratch buffer.
+    let mut buf = String::with_capacity(s.len());
+    for ch in s.chars() {
+        buf.push(if ch == '\n' { ' ' } else { ch });
+    }
+
+    // Step 2: strip one leading + trailing space, but only when the content is
+    // not made up entirely of spaces (`` `  ` `` keeps both spaces).
+    let trimmed = if buf.len() >= 2
+        && buf.starts_with(' ')
+        && buf.ends_with(' ')
+        && buf.bytes().any(|b| b != b' ')
+    {
+        &buf[1..buf.len() - 1]
+    } else {
+        &buf[..]
+    };
+
+    escape_html(trimmed, out);
+}
+
 /// Escape the four HTML-significant characters in text content
 /// (`CommonMark` renders these in body text).
 fn escape_html(s: &str, out: &mut String) {
@@ -23,21 +50,24 @@ fn escape_html(s: &str, out: &mut String) {
     }
 }
 
-/// Like [`escape_html`], but first resolves numeric character references
-/// (`CommonMark` §2.5). Entities are decoded *late*, at render time, because
-/// they never affect document structure. Used only for `Inline::Text`; code
-/// spans and code blocks keep entities verbatim.
+/// Like [`escape_html`], but first resolves character references (`CommonMark`
+/// §2.5): numeric (`&#35;`, `&#x22;`) and the full set of named references
+/// (`&ouml;`). Entities are decoded *late*, at render time, because they never
+/// affect document structure. Used only for `Inline::Text`; code spans and code
+/// blocks keep entities verbatim.
 fn escape_text(s: &str, out: &mut String) {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
         if b == b'&'
-            && let Some((ch, consumed)) = crate::entity::decode_numeric(&bytes[i..])
+            && let Some((entity, consumed)) = crate::entity::decode_entity(&bytes[i..])
         {
             // A decoded character is emitted as literal text, so it must still
             // be HTML-escaped (e.g. `&#34;` -> `"` -> `&quot;`).
-            push_escaped_char(ch, out);
+            for ch in entity.chars() {
+                push_escaped_char(ch, out);
+            }
             i += consumed;
             continue;
         }
@@ -71,18 +101,147 @@ fn push_escaped_char(ch: char, out: &mut String) {
     }
 }
 
-/// Escape a URL for use in an `href`/`src` attribute. The reference renderer
-/// percent-encodes a handful of bytes; for our simple corpus only the HTML
-/// metacharacters matter.
+/// Per-byte URL safety table mirroring the `CommonMark` reference renderer
+/// (`houdini_escape_href` / JavaScript `encodeURI`). `true` means the byte is
+/// emitted verbatim; `false` means it is percent-encoded as `%XX`. All bytes
+/// ≥ 0x80 are encoded (their UTF-8 representation). `&` is handled specially
+/// (→ `&amp;`) before this table is consulted.
+static HREF_SAFE: [bool; 256] = {
+    let mut t = [false; 256];
+    let mut b = b'!';
+    while b <= b'~' {
+        t[b as usize] = true;
+        b += 1;
+    }
+    // Carve out the unsafe ASCII punctuation that `encodeURI` percent-encodes.
+    let unsafe_bytes = [
+        b'"', b'<', b'>', b'[', b'\\', b']', b'^', b'`', b'{', b'|', b'}',
+    ];
+    let mut i = 0;
+    while i < unsafe_bytes.len() {
+        t[unsafe_bytes[i] as usize] = false;
+        i += 1;
+    }
+    t
+};
+
+/// Percent-encode a single byte as `%XX` (uppercase hex), or emit it verbatim
+/// when [`HREF_SAFE`] permits.
+fn push_href_byte(b: u8, out: &mut String) {
+    if HREF_SAFE[b as usize] {
+        out.push(b as char);
+    } else {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        out.push('%');
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+}
+
+/// Encode one already-decoded character into an `href`: `&` becomes `&amp;`,
+/// everything else is percent-encoded byte-by-byte (safe bytes pass through).
+fn push_href_char(ch: char, out: &mut String) {
+    if ch == '&' {
+        out.push_str("&amp;");
+        return;
+    }
+    let mut buf = [0u8; 4];
+    for &b in ch.encode_utf8(&mut buf).as_bytes() {
+        push_href_byte(b, out);
+    }
+}
+
+/// Escape a link/image **destination** for an `href`/`src` attribute, matching
+/// the `CommonMark` reference renderer: resolve backslash escapes, decode
+/// character references (numeric and named), preserve existing `%XX` sequences,
+/// then percent-encode unsafe bytes. `&` becomes `&amp;` (or a decoded entity).
 fn escape_href(s: &str, out: &mut String) {
-    for ch in s.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '"' => out.push_str("&quot;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            _ => out.push(ch),
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' && bytes.get(i + 1).is_some_and(u8::is_ascii_punctuation) {
+            push_href_char(bytes[i + 1] as char, out);
+            i += 2;
+            continue;
         }
+        if b == b'&' {
+            if let Some((entity, consumed)) = crate::entity::decode_entity(&bytes[i..]) {
+                for ch in entity.chars() {
+                    push_href_char(ch, out);
+                }
+                i += consumed;
+            } else {
+                out.push_str("&amp;");
+                i += 1;
+            }
+            continue;
+        }
+        push_href_byte(b, out);
+        i += 1;
+    }
+}
+
+/// Escape an **autolink** target. Like [`escape_href`] but backslash escapes
+/// are *not* resolved (autolink content is literal per `CommonMark` §6.5), so a
+/// `\` is percent-encoded like any other unsafe byte.
+fn escape_href_autolink(s: &str, out: &mut String) {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'&' {
+            out.push_str("&amp;");
+            i += 1;
+            continue;
+        }
+        push_href_byte(b, out);
+        i += 1;
+    }
+}
+
+/// Escape a fenced code block's **info string** (its language word): resolve
+/// backslash escapes and character references, then HTML-escape. Identical
+/// processing to a link title (`CommonMark` §4.5 / §2.5).
+fn escape_info_string(s: &str, out: &mut String) {
+    escape_link_title(s, out);
+}
+
+/// Escape a link/image **title**: resolve backslash escapes and character
+/// references (numeric and named), then HTML-escape the result.
+fn escape_link_title(s: &str, out: &mut String) {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' && bytes.get(i + 1).is_some_and(u8::is_ascii_punctuation) {
+            push_escaped_char(bytes[i + 1] as char, out);
+            i += 2;
+            continue;
+        }
+        if b == b'&'
+            && let Some((entity, consumed)) = crate::entity::decode_entity(&bytes[i..])
+        {
+            for ch in entity.chars() {
+                push_escaped_char(ch, out);
+            }
+            i += consumed;
+            continue;
+        }
+        match b {
+            b'&' => out.push_str("&amp;"),
+            b'<' => out.push_str("&lt;"),
+            b'>' => out.push_str("&gt;"),
+            b'"' => out.push_str("&quot;"),
+            _ if b < 0x80 => out.push(b as char),
+            _ => {
+                let ch = s[i..].chars().next().unwrap_or('\u{FFFD}');
+                out.push(ch);
+                i += ch.len_utf8();
+                continue;
+            }
+        }
+        i += 1;
     }
 }
 
@@ -145,11 +304,12 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 out.push_str("<pre><code");
                 if let Some(lang) = language {
                     // CommonMark uses the first word of the info string as the
-                    // language class.
+                    // language class, with backslash escapes and entities
+                    // resolved (e.g. `foo\+bar` -> `foo+bar`, `f&ouml;` -> `fö`).
                     let first = lang.split_whitespace().next().unwrap_or("");
                     if !first.is_empty() {
                         out.push_str(" class=\"language-");
-                        escape_html(first, out);
+                        escape_info_string(first, out);
                         out.push('"');
                     }
                 }
@@ -170,13 +330,16 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     let first = lang.split_whitespace().next().unwrap_or("");
                     if !first.is_empty() {
                         out.push_str(" class=\"language-");
-                        escape_html(first, out);
+                        escape_info_string(first, out);
                         out.push('"');
                     }
                 }
                 out.push('>');
-                for line in self.code_lines(*lines) {
-                    escape_html(line, out);
+                for pl in self.code_lines(*lines) {
+                    for _ in 0..pl.pad {
+                        out.push(' ');
+                    }
+                    escape_html(pl.text, out);
                     out.push('\n');
                 }
                 out.push_str("</code></pre>\n");
@@ -240,6 +403,21 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 out.push_str(html);
                 out.push('\n');
             }
+            Section::HtmlLines { lines } => {
+                // Dedented container HTML block: emit each line verbatim.
+                let mut first = true;
+                for pl in self.code_lines(*lines) {
+                    if !first {
+                        out.push('\n');
+                    }
+                    first = false;
+                    for _ in 0..pl.pad {
+                        out.push(' ');
+                    }
+                    out.push_str(pl.text);
+                }
+                out.push('\n');
+            }
             Section::HorizontalRule => out.push_str("<hr />\n"),
         }
     }
@@ -273,6 +451,26 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         }
     }
 
+    /// Render an image's `alt` attribute: the plain-text content of the parsed
+    /// alt inlines (`CommonMark` §6.4). Emphasis/link/code markup is dropped,
+    /// keeping only textual content; nested images contribute their own alt.
+    /// Line breaks become a single space and the result is HTML-escaped.
+    fn render_alt_text(&self, span: InlineSpan, out: &mut String) {
+        for inline in self.inlines(span) {
+            match inline {
+                Inline::Text(t) => escape_text(t, out),
+                Inline::Code(c) => escape_html(c, out),
+                Inline::Autolink { target, .. } => escape_html(target, out),
+                Inline::RawHtml(h) => escape_html(h, out),
+                Inline::Bold(s) | Inline::Italic(s) | Inline::Link { text: s, .. } => {
+                    self.render_alt_text(*s, out);
+                }
+                Inline::Image { alt, .. } => self.render_alt_text(*alt, out),
+                Inline::SoftBreak | Inline::HardBreak => out.push('\n'),
+            }
+        }
+    }
+
     fn render_inline(&self, inline: &Inline<'_>, out: &mut String) {
         match inline {
             Inline::Text(t) => escape_text(t, out),
@@ -288,7 +486,7 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
             }
             Inline::Code(c) => {
                 out.push_str("<code>");
-                escape_html(c, out);
+                escape_code_span(c, out);
                 out.push_str("</code>");
             }
             Inline::Autolink { target, is_email } => {
@@ -296,7 +494,7 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 if *is_email {
                     out.push_str("mailto:");
                 }
-                escape_href(target, out);
+                escape_href_autolink(target, out);
                 out.push_str("\">");
                 escape_html(target, out);
                 out.push_str("</a>");
@@ -308,7 +506,7 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 out.push('"');
                 if let Some(title) = title {
                     out.push_str(" title=\"");
-                    escape_html(title, out);
+                    escape_link_title(title, out);
                     out.push('"');
                 }
                 out.push('>');
@@ -319,11 +517,11 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 out.push_str("<img src=\"");
                 escape_href(url, out);
                 out.push_str("\" alt=\"");
-                escape_html(alt, out);
+                self.render_alt_text(*alt, out);
                 out.push('"');
                 if let Some(title) = title {
                     out.push_str(" title=\"");
-                    escape_html(title, out);
+                    escape_link_title(title, out);
                     out.push('"');
                 }
                 out.push_str(" />");

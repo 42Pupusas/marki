@@ -105,9 +105,9 @@ impl<'md, 'src> Checker<'md, 'src> {
                     title: eti,
                 },
             ) => {
-                assert_eq!(alt, ea, "Image alt mismatch at index {idx}");
                 assert_eq!(url, eu, "Image url mismatch at index {idx}");
                 assert_eq!(title, eti, "Image title mismatch at index {idx}");
+                self.check_span(*alt, ea);
             }
             (
                 Inline::Autolink { target, is_email },
@@ -143,7 +143,7 @@ enum Expect<'a> {
         title: Option<&'a str>,
     },
     Image {
-        alt: &'a str,
+        alt: Vec<Self>,
         url: &'a str,
         title: Option<&'a str>,
     },
@@ -491,7 +491,7 @@ fn test_link_ref_image() {
         Section::Paragraph { content } => Checker::new(&md).check_span(
             *content,
             &[Expect::Image {
-                alt: "alt",
+                alt: vec![Expect::Text("alt")],
                 url: "/img.png",
                 title: Some("t"),
             }],
@@ -679,7 +679,7 @@ fn test_image() {
         Section::Paragraph { content } => Checker::new(&md).check_span(
             *content,
             &[Expect::Image {
-                alt: "alt text",
+                alt: vec![Expect::Text("alt text")],
                 url: "image.png",
                 title: None,
             }],
@@ -1265,7 +1265,7 @@ fn test_image_with_title() {
         Section::Paragraph { content } => Checker::new(&md).check_span(
             *content,
             &[Expect::Image {
-                alt: "alt",
+                alt: vec![Expect::Text("alt")],
                 url: "img.png",
                 title: Some("photo"),
             }],
@@ -1563,14 +1563,12 @@ fn test_blockquote_indented_4_spaces_is_indented_code() {
 
 #[test]
 fn test_code_fence_indented_3_spaces() {
-    let md: MarkdownFile<'_> = MarkdownFile::parse("   ```\nhello\n   ```");
-    assert_eq!(
-        md.sections[0],
-        Section::CodeBlock {
-            language: None,
-            code: "hello",
-        }
-    );
+    // A fence indented 1-3 columns strips up to that many leading spaces from
+    // each content line (CommonMark §4.5). The dedent routes the content
+    // through the line pool, so assert on rendered HTML rather than the
+    // section shape.
+    let md: MarkdownFile<'_> = MarkdownFile::parse("   ```\n   hello\n   ```");
+    assert_eq!(md.to_html(), "<pre><code>hello\n</code></pre>\n");
 }
 
 #[test]
@@ -1663,14 +1661,10 @@ fn test_tilde_fence_backticks_in_info_string() {
 
 #[test]
 fn test_tilde_fence_indented() {
-    let md: MarkdownFile<'_> = MarkdownFile::parse("  ~~~\nhello\n  ~~~");
-    assert_eq!(
-        md.sections[0],
-        Section::CodeBlock {
-            language: None,
-            code: "hello",
-        }
-    );
+    // See `test_code_fence_indented_3_spaces`: a 2-column indent dedents the
+    // content (here a less-indented line keeps only its surplus spaces).
+    let md: MarkdownFile<'_> = MarkdownFile::parse("  ~~~\n hello\n  ~~~");
+    assert_eq!(md.to_html(), "<pre><code>hello\n</code></pre>\n");
 }
 
 // -----------------------------------------------------------------------

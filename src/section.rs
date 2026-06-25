@@ -48,6 +48,34 @@ impl LineRange {
     }
 }
 
+/// One entry in the code/HTML line pool: a borrowed source slice plus a count
+/// of *synthetic* leading spaces to emit before it.
+///
+/// The `pad` is almost always `0` — the common case is a zero-copy source
+/// slice. It is non-zero only when a container prefix (a blockquote `>`
+/// padding, a list content column, or the 4-space indented-code strip) ends
+/// partway through a tab: the leftover columns of that tab must be rendered as
+/// spaces that exist in no source substring (`CommonMark` §2.2 tab expansion).
+/// Carrying the count keeps the slice itself borrowed (`&'src str`), preserving
+/// the parser's zero-copy guarantee — we never have to own a padded string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolLine<'src> {
+    /// Synthetic leading spaces to emit before [`text`](Self::text).
+    pub pad: u8,
+    /// The borrowed source slice (already dedented to a byte boundary).
+    pub text: &'src str,
+}
+
+impl<'src> PoolLine<'src> {
+    /// A zero-copy line with no synthetic padding (the overwhelmingly common
+    /// case).
+    #[inline]
+    #[must_use]
+    pub const fn plain(text: &'src str) -> Self {
+        Self { pad: 0, text }
+    }
+}
+
 /// A pre-order sub-forest of [`Section`]s in the section pool.
 ///
 /// Used by blockquotes, list items, and lists to reference their child blocks
@@ -192,6 +220,12 @@ pub enum Section<'src> {
     /// without escaping or inline parsing.
     HtmlBlock {
         html: &'src str,
+    },
+    /// A raw HTML block whose content lines were dedented out of a container
+    /// (list item or blockquote) and so live in the line pool rather than as
+    /// one contiguous source slice. Emitted verbatim, line by line.
+    HtmlLines {
+        lines: LineRange,
     },
     HorizontalRule,
 }
