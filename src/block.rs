@@ -1183,6 +1183,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     /// each item's child blocks, and append the list [`Section`] (plus its
     /// pre-order subtree) to the section pool. Returns the number of input
     /// lines consumed.
+    #[allow(clippy::too_many_lines)]
     fn build_list(
         lines: &[&'src str],
         pool: &mut Vec<Inline<'src>>,
@@ -1261,10 +1262,12 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 if cind >= col {
                     let dind = cind - col;
                     let inner = &cb[cind.min(cb.len())..];
-                    if item_blanks > 0 && !sub_col.is_some_and(|th| dind >= th) {
+                    // Does this line continue the currently-open sub-container?
+                    let in_sub = sub_col.is_some_and(|th| dind >= th);
+                    if item_blanks > 0 && !in_sub {
                         loose = true;
                     }
-                    if !sub_col.is_some_and(|th| dind >= th) {
+                    if !in_sub {
                         sub_col = if (!inner.is_horizontal_rule() && inner.list_marker().is_some())
                             || inner.first() == Some(&SpecialChar::GreaterThan.byte())
                         {
@@ -1631,6 +1634,7 @@ impl<'src> ParseCtx<'src> {
     /// [`resolve_blocks`]. Nested sublists are still derived lazily in pass 2
     /// (the dedented item lines are re-scanned only when their own marker is
     /// met), so this walk only tracks the *outermost* item structure.
+    #[allow(clippy::too_many_lines)]
     fn scan_list(&mut self, start: usize) -> ListScan {
         let bytes = self.bytes;
         let line_end_of = |p: usize| {
@@ -1742,7 +1746,8 @@ impl<'src> ParseCtx<'src> {
                 // list / blockquote) was open and this line lies within it
                 // (indented past its marker), the blank was interior to that
                 // sub-container and must not loosen the outer list.
-                if item_blanks > 0 && !sub_col.is_some_and(|th| dind >= th) {
+                let in_sub = sub_col.is_some_and(|th| dind >= th);
+                if item_blanks > 0 && !in_sub {
                     loose = true;
                 }
                 item_blanks = 0;
@@ -1750,7 +1755,7 @@ impl<'src> ParseCtx<'src> {
                 // continue the current sub-container becomes a new direct child:
                 // a nested list/blockquote (re)opens a sub-container at its
                 // marker column; anything else closes it.
-                if !sub_col.is_some_and(|th| dind >= th) {
+                if !in_sub {
                     sub_col = if (!inner.is_horizontal_rule() && inner.list_marker().is_some())
                         || inner.first() == Some(&SpecialChar::GreaterThan.byte())
                     {
