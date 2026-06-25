@@ -1208,6 +1208,10 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
             i += 1;
             // Gather continuation lines for this item.
             let mut item_blanks = 0usize;
+            // Threshold of the outermost open sub-container (see `scan_list`):
+            // a blank interior to a nested list/blockquote must not loosen this
+            // list.
+            let mut sub_col: Option<usize> = None;
             while i < lines.len() {
                 let cont = lines[i];
                 let cb = cont.as_bytes();
@@ -1219,8 +1223,19 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 }
                 let cind = cb.leading_spaces();
                 if cind >= col {
-                    if item_blanks > 0 {
+                    let dind = cind - col;
+                    let inner = &cb[cind.min(cb.len())..];
+                    if item_blanks > 0 && !sub_col.is_some_and(|th| dind >= th) {
                         loose = true;
+                    }
+                    if !sub_col.is_some_and(|th| dind >= th) {
+                        sub_col = if (!inner.is_horizontal_rule() && inner.list_marker().is_some())
+                            || inner.first() == Some(&SpecialChar::GreaterThan.byte())
+                        {
+                            Some(dind + 1)
+                        } else {
+                            None
+                        };
                     }
                     item_blanks = 0;
                     item.push(cont.get(col..).unwrap_or(""));
