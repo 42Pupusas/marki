@@ -135,6 +135,12 @@ struct ParseCtx<'src> {
     /// Shared pool for blockquote lines and list items, avoiding per-section
     /// `Vec<&str>` heap allocations.
     lines: Vec<&'src str>,
+    /// Parallel to [`lines`](Self::lines): `true` where a line was collected as
+    /// a *lazy paragraph continuation* (`CommonMark` §5.1). Pass 2 consults the
+    /// slice for a container's lines so a lazy line is never re-promoted to a
+    /// setext heading or a sublist marker (examples 93 and 312). Always kept
+    /// the same length as `lines` via [`push_line`](Self::push_line).
+    lazy: Vec<bool>,
     /// Per-item metadata for top-level lists, referenced by
     /// [`RawSection::List`]; lets pass 2 skip re-scanning item boundaries.
     list_items: Vec<ItemMeta>,
@@ -780,6 +786,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     let list = Self::assemble_list(
                         metas,
                         lines,
+                        &ctx.lazy,
                         tight,
                         ordered,
                         pool,
@@ -794,11 +801,12 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     lines_start,
                     lines_len,
                 } => {
-                    let raw_lines = lines
-                        .get(lines_start as usize..(lines_start + lines_len) as usize)
-                        .unwrap_or(&[]);
+                    let span = lines_start as usize..(lines_start + lines_len) as usize;
+                    let raw_lines = lines.get(span.clone()).unwrap_or(&[]);
+                    let raw_lazy = ctx.lazy.get(span).unwrap_or(&[]);
                     let children = Self::resolve_blocks(
                         raw_lines,
+                        raw_lazy,
                         pool,
                         section_pool,
                         line_pool,
@@ -827,6 +835,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     fn assemble_list(
         metas: &[ItemMeta],
         lines: &[&'src str],
+        lazy: &[bool],
         tight: bool,
         ordered: Option<(u32, OrderedListDelimiter)>,
         pool: &mut Vec<Inline<'src>>,
@@ -839,15 +848,16 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         // its child-block subtree.
         let items_start = section_pool.len().pool_offset();
         for meta in metas {
-            let item_lines = lines
-                .get(meta.lines_start as usize..(meta.lines_start + meta.lines_len) as usize)
-                .unwrap_or(&[]);
+            let span = meta.lines_start as usize..(meta.lines_start + meta.lines_len) as usize;
+            let item_lines = lines.get(span.clone()).unwrap_or(&[]);
+            let item_lazy = lazy.get(span).unwrap_or(&[]);
             let item_at = section_pool.len();
             section_pool.push(Section::ListItem {
                 children: SectionRange::EMPTY,
             });
-            let range =
-                Self::resolve_blocks(item_lines, pool, section_pool, line_pool, scratch, defs);
+            let range = Self::resolve_blocks(
+                item_lines, item_lazy, pool, section_pool, line_pool, scratch, defs,
+            );
             section_pool[item_at] = Section::ListItem { children: range };
         }
         let items_len = section_pool.len().pool_offset() - items_start;
@@ -874,6 +884,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     #[allow(clippy::too_many_lines)]
     fn resolve_blocks(
         lines: &[&'src str],
+        lazy: &[bool],
         pool: &mut Vec<Inline<'src>>,
         section_pool: &mut Vec<Section<'src>>,
         line_pool: &mut Vec<&'src str>,
@@ -958,6 +969,8 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     // lazily continue (CommonMark §5.1). A blank `>` line or a
                     // line that begins a block closes that paragraph.
                     let mut last_para = false;
+                    // Parallel lazy flags for the collected nested lines.
+                    let mut nested_lazy: Vec<bool> = Vec::new();
                     while i < lines.len() {
                         let l = lines[i];
                         let lb = l.as_bytes();
@@ -972,6 +985,8 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                             };
                             last_para = is_lazy_paragraph_tail(content.as_bytes());
                             nested.push(content);
+                            // A `>`-marked line carries its own lazy status down.
+                            nested_lazy.push(lazy.get(i).copied().unwrap_or(false));
                             i += 1;
                             continue;
                         }
@@ -985,6 +1000,8 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                             && !lb[indent..].begins_block()
                         {
                             nested.push(l.trim());
+                            // This line lazily continues the inner paragraph.
+                            nested_lazy.push(true);
                             i += 1;
                             continue;
                         }
@@ -995,8 +1012,15 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     section_pool.push(Section::Blockquote {
                         children: SectionRange::EMPTY,
                     });
-                    let range =
-                        Self::resolve_blocks(&nested, pool, section_pool, line_pool, scratch, defs);
+                    let range = Self::resolve_blocks(
+                        &nested,
+                        &nested_lazy,
+                        pool,
+                        section_pool,
+                        line_pool,
+                        scratch,
+                        defs,
+                    );
                     scratch.give_lines(nested);
                     section_pool[at] = Section::Blockquote { children: range };
                     continue;
@@ -1060,8 +1084,11 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
 
                 // Setext heading underline promotes the open paragraph. The
                 // promoted lines keep soft breaks between them, matching how a
-                // paragraph would have rendered.
+                // paragraph would have rendered. A line that arrived as a lazy
+                // paragraph continuation (CommonMark §5.1) is paragraph text,
+                // never an underline (example 93).
                 if !para.is_empty()
+                    && !lazy.get(i).copied().unwrap_or(false)
                     && let Some(level) = body.setext_heading_level()
                 {
                     // `para` already holds trimmed lines, so no further copy.
@@ -1084,10 +1111,22 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 }
 
                 // Nested list (a thematic break takes precedence over a bullet).
-                if !body.is_horizontal_rule() && body.list_marker().is_some() {
+                // A lazy continuation line stays paragraph text rather than
+                // opening a sublist (example 312).
+                if !body.is_horizontal_rule()
+                    && body.list_marker().is_some()
+                    && !lazy.get(i).copied().unwrap_or(false)
+                {
                     Self::flush_para(&mut para, section_pool, pool, defs);
-                    let consumed =
-                        Self::build_list(&lines[i..], pool, section_pool, line_pool, scratch, defs);
+                    let consumed = Self::build_list(
+                        &lines[i..],
+                        &lazy[i..],
+                        pool,
+                        section_pool,
+                        line_pool,
+                        scratch,
+                        defs,
+                    );
                     i += consumed;
                     continue;
                 }
@@ -1186,6 +1225,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     #[allow(clippy::too_many_lines)]
     fn build_list(
         lines: &[&'src str],
+        lazy: &[bool],
         pool: &mut Vec<Inline<'src>>,
         section_pool: &mut Vec<Section<'src>>,
         line_pool: &mut Vec<&'src str>,
@@ -1239,8 +1279,11 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
             let col = head[ind + marker.width..].item_content_indent(ind, marker);
             let first_content = lines[i].get(col.min(lines[i].len())..).unwrap_or("");
             item.clear();
+            // Parallel lazy flags for this item's collected lines.
+            let mut item_lazy: Vec<bool> = Vec::new();
             if !first_content.is_empty() {
                 item.push(first_content);
+                item_lazy.push(lazy.get(i).copied().unwrap_or(false));
             }
             i += 1;
             // Gather continuation lines for this item.
@@ -1255,6 +1298,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 if cb.iter().all(u8::is_ascii_whitespace) {
                     item_blanks += 1;
                     item.push("");
+                    item_lazy.push(false);
                     i += 1;
                     continue;
                 }
@@ -1278,6 +1322,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     }
                     item_blanks = 0;
                     item.push(cont.get(col..).unwrap_or(""));
+                    item_lazy.push(lazy.get(i).copied().unwrap_or(false));
                     i += 1;
                     continue;
                 }
@@ -1287,6 +1332,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 }
                 if item_blanks == 0 && !cb[cind.min(cb.len())..].begins_block() {
                     item.push(cont.trim());
+                    item_lazy.push(false);
                     i += 1;
                     continue;
                 }
@@ -1295,6 +1341,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
             // Trailing blank lines belong to the list, not the item.
             while item.last().is_some_and(|l| l.is_empty()) {
                 item.pop();
+                item_lazy.pop();
                 pending_blanks += 1;
             }
             // ListItem placeholder, then append its subtree and backpatch.
@@ -1302,7 +1349,8 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
             section_pool.push(Section::ListItem {
                 children: SectionRange::EMPTY,
             });
-            let range = Self::resolve_blocks(&item, pool, section_pool, line_pool, scratch, defs);
+            let range =
+                Self::resolve_blocks(&item, &item_lazy, pool, section_pool, line_pool, scratch, defs);
             section_pool[item_at] = Section::ListItem { children: range };
         }
         scratch.give_lines(item);
@@ -1365,6 +1413,7 @@ impl<'src> ParseCtx<'src> {
             // Rough heuristic: ~50 bytes per section on average.
             sections: Vec::with_capacity(input.len() / 50 + 1),
             lines: Vec::with_capacity(input.len() / 80 + 1),
+            lazy: Vec::with_capacity(input.len() / 80 + 1),
             list_items: Vec::new(),
             defs: LinkDefs::new(),
         };
@@ -1700,7 +1749,7 @@ impl<'src> ParseCtx<'src> {
                 if fence.is_none() {
                     item_blanks += 1;
                 }
-                self.lines.push("");
+                self.push_line("", false);
                 pos = le + 1;
                 last_para = false;
                 continue;
@@ -1723,7 +1772,7 @@ impl<'src> ParseCtx<'src> {
                 }
                 item_blanks = 0;
                 fence = update_fence(fence, content.as_bytes());
-                self.lines.push(content);
+                self.push_line(content, false);
                 pos = le + 1;
                 last_para = true;
                 continue;
@@ -1801,10 +1850,17 @@ impl<'src> ParseCtx<'src> {
                 continue;
             }
 
-            // Lazy paragraph continuation.
-            if item_blanks == 0 && last_para && !bytes[pos + ind..le].begins_block() {
+            // Lazy paragraph continuation. A marker in the "dead zone" —
+            // indented past the 3-space sibling threshold but short of the item
+            // content column — can neither open a sub-item (too shallow) nor a
+            // sibling (too deep), so it is ordinary lazy paragraph text and must
+            // stay text in pass 2 (flagged lazy; CommonMark example 312).
+            let body = &bytes[pos + ind..le];
+            let dead_zone_marker =
+                ind > 3 && ind < col && !body.is_horizontal_rule() && body.list_marker().is_some();
+            if item_blanks == 0 && last_para && (!body.begins_block() || dead_zone_marker) {
                 // Lazy lines are dedented by trimming (they sit left of `col`).
-                self.lines.push(self.input.get(pos + ind..le).unwrap_or(""));
+                self.push_line(self.input.get(pos + ind..le).unwrap_or(""), dead_zone_marker);
                 pos = le + 1;
                 continue;
             }
@@ -1824,12 +1880,25 @@ impl<'src> ParseCtx<'src> {
         }
     }
 
+    /// Push one line onto the pool, recording whether it arrived as a lazy
+    /// paragraph continuation. Keeps `lines` and `lazy` the same length.
+    fn push_line(&mut self, line: &'src str, lazy: bool) {
+        self.lines.push(line);
+        self.lazy.push(lazy);
+    }
+
+    /// Pop the last pooled line (and its lazy flag), returning the line.
+    fn pop_line(&mut self) -> Option<&'src str> {
+        self.lazy.pop();
+        self.lines.pop()
+    }
+
     /// Push one source line `[pos..le)` onto the line pool with its first `col`
     /// columns of indentation removed (the item's content column). Lines
     /// shorter than `col` (e.g. blanks) collapse to `""`.
     fn push_dedented(&mut self, pos: usize, le: usize, col: usize) {
         let line = self.input.get(pos..le).unwrap_or("");
-        self.lines.push(line.get(col..).unwrap_or(""));
+        self.push_line(line.get(col..).unwrap_or(""), false);
     }
 
     /// Like [`push_dedented`] but skips a marker line whose content is empty,
@@ -1842,7 +1911,7 @@ impl<'src> ParseCtx<'src> {
             .and_then(|l| l.get(col..))
             .unwrap_or("");
         if !content.is_empty() {
-            self.lines.push(content);
+            self.push_line(content, false);
         }
     }
 
@@ -1854,7 +1923,7 @@ impl<'src> ParseCtx<'src> {
         while self.lines.len().lines_offset() > item_start
             && self.lines.last().is_some_and(|l| l.is_empty())
         {
-            self.lines.pop();
+            self.pop_line();
             *pending_blanks += 1;
         }
         let lines_len = self.lines.len().lines_offset() - item_start;
@@ -1973,7 +2042,7 @@ impl<'src> ParseCtx<'src> {
                 // Lazy continuation only when an inner paragraph is open and we
                 // are not inside a fenced code block.
                 if para_open && fence.is_none() {
-                    self.lines.push(self.input.get(pos..line_end).unwrap_or(""));
+                    self.push_line(self.input.get(pos..line_end).unwrap_or(""), true);
                     return Accumulator::InBlockquote {
                         lines_start,
                         para_open: true,
@@ -2054,7 +2123,7 @@ impl<'src> ParseCtx<'src> {
             // only absorbed when an inner paragraph is genuinely open.
             let (para_open, fence) = Self::blockquote_inner_state(cb, prev_para, prev_fence);
             if let Accumulator::InBlockquote { lines_start, .. } = acc {
-                self.lines.push(content);
+                self.push_line(content, false);
                 return Accumulator::InBlockquote {
                     lines_start,
                     para_open,
@@ -2063,7 +2132,7 @@ impl<'src> ParseCtx<'src> {
             }
             self.flush_acc(acc);
             let lines_start = self.lines.len().lines_offset();
-            self.lines.push(content);
+            self.push_line(content, false);
             return Accumulator::InBlockquote {
                 lines_start,
                 para_open,
@@ -2084,7 +2153,7 @@ impl<'src> ParseCtx<'src> {
             // Lazy continuation requires an open inner paragraph (not blank,
             // not inside indented/fenced code).
             if para_open && fence.is_none() && self.blockquote_continues(line_bytes, spos) {
-                self.lines.push(self.input.get(pos..line_end).unwrap_or(""));
+                self.push_line(self.input.get(pos..line_end).unwrap_or(""), true);
                 return Accumulator::InBlockquote {
                     lines_start,
                     para_open: true,
