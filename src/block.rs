@@ -245,6 +245,87 @@ fn update_fence(state: Option<(u8, usize)>, content: &[u8]) -> Option<(u8, usize
     }
 }
 
+/// Peel leading 0-3 space indentation plus any nested blockquote (`>`) and
+/// list markers from `line`, returning the byte offset of the innermost
+/// content. Mirrors [`is_lazy_paragraph_tail`]'s descent so a container line
+/// like `> [foo]: /url` is judged by its innermost content.
+fn peel_content_offset(line: &[u8]) -> usize {
+    let mut off = 0;
+    loop {
+        let rel_ind = line.get(off..).map_or(0, <[u8]>::leading_spaces).min(3);
+        let i = off + rel_ind;
+        let body = &line[i.min(line.len())..];
+        if body.first() == Some(&SpecialChar::GreaterThan.byte()) {
+            let after = if body.get(1) == Some(&SpecialChar::Space.byte()) {
+                2
+            } else {
+                1
+            };
+            off = i + after.min(body.len());
+            continue;
+        }
+        if !body.is_horizontal_rule()
+            && let Some(m) = body.list_marker()
+            && body.get(m.width) == Some(&SpecialChar::Space.byte())
+        {
+            off = i + m.width + 1;
+            continue;
+        }
+        return i;
+    }
+}
+
+/// Scan a container's already-dedented content `lines` for link reference
+/// definitions (`CommonMark` §4.7), pushing each `(normalized label, (url,
+/// title))` onto `found`. Tracks paragraph-open and fenced-code state so a
+/// def-looking line inside code, or one that would lazily continue an open
+/// paragraph, is not mistaken for a definition. Descends through nested
+/// blockquote/list markers via [`peel_content_offset`].
+fn collect_container_defs_in<'src>(
+    lines: &[&'src str],
+    found: &mut Vec<(String, (&'src str, Option<&'src str>))>,
+) {
+    let mut para_open = false;
+    let mut fence: Option<(u8, usize)> = None;
+    for &line in lines {
+        let b = line.as_bytes();
+        if b.is_blank_line(0, b.len()) {
+            para_open = false;
+            continue;
+        }
+        let off = peel_content_offset(b);
+        let body = &b[off.min(b.len())..];
+        if let Some((fc, flen)) = fence {
+            if body.is_closing_fence(fc, flen) {
+                fence = None;
+            }
+            continue;
+        }
+        let ind_body = body.leading_spaces();
+        if ind_body >= 4 && !para_open {
+            continue; // indented code block line
+        }
+        let inner = &body[ind_body.min(body.len())..];
+        if let Some(f) = inner.code_fence_opening() {
+            fence = Some(f);
+            para_open = false;
+            continue;
+        }
+        if !para_open
+            && inner.first() == Some(&b'[')
+            && let Some((def, _)) = scan_link_def(line, off + ind_body)
+        {
+            found.push((
+                normalize_label(def.label),
+                (def.url, def.title),
+            ));
+            para_open = false;
+            continue;
+        }
+        para_open = !inner.begins_block();
+    }
+}
+
 /// Lookup table: true for bytes that could start a block-level element
 /// (heading, blockquote, list marker, HR character, or digit for ordered lists).
 const COULD_START_BLOCK: [bool; 256] = {
@@ -540,7 +621,64 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         line_pool: &mut Vec<&'src str>,
     ) -> Vec<Section<'src>> {
         let lines = &ctx.lines;
-        let defs = &ctx.defs;
+        // Link reference definitions may also live inside containers
+        // (blockquotes / list items), and a reference can appear *earlier* in
+        // the document than its container-nested definition. So sweep every
+        // container's collected lines for defs up front, merging them with the
+        // top-level ones (top-level / earlier defs win via `or_insert`).
+        let combined_defs: LinkDefs<'src>;
+        let defs: &LinkDefs<'src> = if ctx
+            .sections
+            .iter()
+            .any(|s| matches!(s, RawSection::Blockquote { .. } | RawSection::List { .. }))
+        {
+            let mut found = Vec::new();
+            for raw in &ctx.sections {
+                match *raw {
+                    RawSection::Blockquote {
+                        lines_start,
+                        lines_len,
+                    } => {
+                        let raw_lines = lines
+                            .get(lines_start as usize..(lines_start + lines_len) as usize)
+                            .unwrap_or(&[]);
+                        collect_container_defs_in(raw_lines, &mut found);
+                    }
+                    RawSection::List {
+                        items_start,
+                        items_len,
+                        ..
+                    } => {
+                        let metas = ctx
+                            .list_items
+                            .get(items_start as usize..(items_start + items_len) as usize)
+                            .unwrap_or(&[]);
+                        for meta in metas {
+                            let item_lines = lines
+                                .get(
+                                    meta.lines_start as usize
+                                        ..(meta.lines_start + meta.lines_len) as usize,
+                                )
+                                .unwrap_or(&[]);
+                            collect_container_defs_in(item_lines, &mut found);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if found.is_empty() {
+                &ctx.defs
+            } else {
+                let mut map = ctx.defs.clone();
+                for (label, val) in found {
+                    map.entry(label).or_insert(val);
+                }
+                combined_defs = map;
+                &combined_defs
+            }
+        } else {
+            &ctx.defs
+        };
         let mut scratch = Scratch::default();
         let mut sections = Vec::with_capacity(ctx.sections.len());
         for raw_section in &ctx.sections {
@@ -761,6 +899,18 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
             }
 
             let body = &b[ind.min(b.len())..];
+
+            // Link reference definition inside this container: it produces no
+            // output (its label was already collected into `defs` by the
+            // pre-pass in `resolve_inlines`), so skip the line when it isn't
+            // lazily continuing an open paragraph.
+            if para.is_empty()
+                && body.first() == Some(&b'[')
+                && scan_link_def(line, ind).is_some()
+            {
+                i += 1;
+                continue;
+            }
 
             if ind <= 3 {
                 // Nested blockquote: collect the run and recurse.
