@@ -1,7 +1,7 @@
 use crate::OffsetExt;
 use crate::inline::InlineParser;
 use crate::link_def::{LinkDefs, normalize_label, scan_link_def};
-use crate::section::{LineRange, OrderedListDelimiter, Section, SectionRange};
+use crate::section::{LineRange, OrderedListDelimiter, PoolLine, Section, SectionRange};
 use crate::simd::ByteSliceExt;
 use crate::special_char::SpecialChar;
 use crate::{Inline, MarkdownFile};
@@ -660,7 +660,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         ctx: &ParseCtx<'src>,
         pool: &mut Vec<Inline<'src>>,
         section_pool: &mut Vec<Section<'src>>,
-        line_pool: &mut Vec<&'src str>,
+        line_pool: &mut Vec<PoolLine<'src>>,
     ) -> Vec<Section<'src>> {
         let lines = &ctx.lines;
         // Link reference definitions may also live inside containers
@@ -760,7 +760,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                             for line in code.split('\n') {
                                 let strip =
                                     line.bytes().take(indent).take_while(|&b| b == b' ').count();
-                                line_pool.push(line.get(strip..).unwrap_or(""));
+                                line_pool.push(PoolLine::plain(line.get(strip..).unwrap_or("")));
                             }
                         }
                         let len = line_pool.len().pool_offset() - code_start;
@@ -840,7 +840,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         ordered: Option<(u32, OrderedListDelimiter)>,
         pool: &mut Vec<Inline<'src>>,
         section_pool: &mut Vec<Section<'src>>,
-        line_pool: &mut Vec<&'src str>,
+        line_pool: &mut Vec<PoolLine<'src>>,
         scratch: &mut Scratch<'src>,
         defs: &LinkDefs<'src>,
     ) -> Section<'src> {
@@ -887,7 +887,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         lazy: &[bool],
         pool: &mut Vec<Inline<'src>>,
         section_pool: &mut Vec<Section<'src>>,
-        line_pool: &mut Vec<&'src str>,
+        line_pool: &mut Vec<PoolLine<'src>>,
         scratch: &mut Scratch<'src>,
         defs: &LinkDefs<'src>,
     ) -> SectionRange {
@@ -921,19 +921,19 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     if lb.iter().all(u8::is_ascii_whitespace) {
                         // Interior blank: keep, but only if a later indented
                         // line follows (trailing blanks are trimmed below).
-                        line_pool.push("");
+                        line_pool.push(PoolLine::plain(""));
                         i += 1;
                         continue;
                     }
                     if lb.leading_spaces() < 4 {
                         break;
                     }
-                    line_pool.push(l.get(4..).unwrap_or(""));
+                    line_pool.push(PoolLine::plain(l.get(4..).unwrap_or("")));
                     i += 1;
                 }
                 // Trim trailing blank lines out of the code block.
                 while line_pool.len().pool_offset() > code_start
-                    && line_pool.last().is_some_and(|l| l.is_empty())
+                    && line_pool.last().is_some_and(|l| l.text.is_empty() && l.pad == 0)
                 {
                     line_pool.pop();
                 }
@@ -1055,7 +1055,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                             break;
                         }
                         // Strip up to the opening fence's indentation.
-                        line_pool.push(l.get(ind.min(l.len())..).unwrap_or(""));
+                        line_pool.push(PoolLine::plain(l.get(ind.min(l.len())..).unwrap_or("")));
                         i += 1;
                     }
                     let len = line_pool.len().pool_offset() - code_start;
@@ -1152,7 +1152,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     fn collect_html_block(
         lines: &[&'src str],
         kind: crate::raw_html::HtmlBlockKind,
-        line_pool: &mut Vec<&'src str>,
+        line_pool: &mut Vec<PoolLine<'src>>,
     ) -> usize {
         use crate::raw_html::HtmlBlockKind;
         let mut n = 0;
@@ -1165,7 +1165,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
             {
                 break;
             }
-            line_pool.push(l);
+            line_pool.push(PoolLine::plain(l));
             n += 1;
             // Types 1–5 terminate on the line containing their end marker.
             let ends = match kind {
@@ -1228,7 +1228,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         lazy: &[bool],
         pool: &mut Vec<Inline<'src>>,
         section_pool: &mut Vec<Section<'src>>,
-        line_pool: &mut Vec<&'src str>,
+        line_pool: &mut Vec<PoolLine<'src>>,
         scratch: &mut Scratch<'src>,
         defs: &LinkDefs<'src>,
     ) -> usize {

@@ -335,8 +335,11 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     }
                 }
                 out.push('>');
-                for line in self.code_lines(*lines) {
-                    escape_html(line, out);
+                for pl in self.code_lines(*lines) {
+                    for _ in 0..pl.pad {
+                        out.push(' ');
+                    }
+                    escape_html(pl.text, out);
                     out.push('\n');
                 }
                 out.push_str("</code></pre>\n");
@@ -403,12 +406,15 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
             Section::HtmlLines { lines } => {
                 // Dedented container HTML block: emit each line verbatim.
                 let mut first = true;
-                for line in self.code_lines(*lines) {
+                for pl in self.code_lines(*lines) {
                     if !first {
                         out.push('\n');
                     }
                     first = false;
-                    out.push_str(line);
+                    for _ in 0..pl.pad {
+                        out.push(' ');
+                    }
+                    out.push_str(pl.text);
                 }
                 out.push('\n');
             }

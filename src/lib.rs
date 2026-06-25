@@ -77,7 +77,7 @@ impl OffsetExt for usize {
     }
 }
 use crate::simd::ByteSliceExt;
-pub use section::{InlineSpan, LineRange, OrderedListDelimiter, Section, SectionRange};
+pub use section::{InlineSpan, LineRange, OrderedListDelimiter, PoolLine, Section, SectionRange};
 pub use special_char::SpecialChar;
 
 use std::borrow::Cow;
@@ -101,8 +101,9 @@ pub struct MarkdownFile<'src, const MAX_INLINE_DEPTH: u8 = 16, const INLINE_STAC
     /// interiors and list items). Kept flat so [`Section`] stays `Copy`.
     section_pool: Vec<Section<'src>>,
     /// Pool of dedented code lines referenced by [`LineRange`] (code blocks
-    /// nested inside list items or blockquotes).
-    line_pool: Vec<&'src str>,
+    /// nested inside list items or blockquotes). Each entry carries the slice
+    /// plus any synthetic leading-space [`pad`](PoolLine::pad).
+    line_pool: Vec<PoolLine<'src>>,
 }
 
 /// On the default `MarkdownFile` (depth=16, cap=32) we expose `normalize` as
@@ -166,9 +167,11 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         }
     }
 
-    /// Get the dedented code lines referenced by a [`LineRange`].
+    /// Get the dedented code lines referenced by a [`LineRange`]. Each entry is
+    /// a [`PoolLine`] carrying the borrowed slice plus its synthetic
+    /// leading-space pad.
     #[must_use]
-    pub fn code_lines(&self, range: LineRange) -> &[&'src str] {
+    pub fn code_lines(&self, range: LineRange) -> &[PoolLine<'src>] {
         &self[range]
     }
 
@@ -251,9 +254,9 @@ impl<'a, 'src> Iterator for ChildSections<'a, 'src> {
 impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize> std::ops::Index<LineRange>
     for MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP>
 {
-    type Output = [&'src str];
+    type Output = [PoolLine<'src>];
 
-    fn index(&self, range: LineRange) -> &[&'src str] {
+    fn index(&self, range: LineRange) -> &[PoolLine<'src>] {
         let start = range.start as usize;
         let end = start + range.len as usize;
         &self.line_pool[start..end]
