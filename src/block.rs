@@ -225,6 +225,42 @@ fn is_lazy_paragraph_tail(mut line: &[u8]) -> bool {
     }
 }
 
+/// Count leading indentation of `line` in *columns* (a tab advances to the
+/// next 4-column stop, `CommonMark` §2.2). Unlike `leading_spaces` this counts
+/// a leading tab as the columns it expands to.
+fn leading_columns(line: &[u8]) -> usize {
+    let mut col = 0;
+    for &b in line {
+        match b {
+            b' ' => col += 1,
+            b'\t' => col += 4 - (col % 4),
+            _ => break,
+        }
+    }
+    col
+}
+
+/// Strip exactly `cols` columns of leading indentation from `line`, returning
+/// the remaining slice **only** when the strip lands on a byte boundary (each
+/// consumed byte is a whole space, or a tab whose expansion ends at or before
+/// `cols`). Returns `None` when `cols` falls in the middle of a tab — the
+/// caller then needs partial-tab expansion, which this borrow-only helper
+/// cannot produce, and should fall back to its existing handling.
+fn strip_columns(line: &str, cols: usize) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let mut col = 0;
+    let mut i = 0;
+    while col < cols {
+        match bytes.get(i) {
+            Some(b' ') => col += 1,
+            Some(b'\t') => col += 4 - (col % 4),
+            _ => return None,
+        }
+        i += 1;
+    }
+    if col == cols { line.get(i..) } else { None }
+}
+
 /// Update fenced-code-block state for one dedented list-item content line.
 /// `state` is `Some((fence_char, fence_len))` while inside a fence. A line that
 /// opens a fence enters the state; the matching closing fence leaves it. Used by
@@ -1667,6 +1703,27 @@ impl<'src> ParseCtx<'src> {
             }
 
             let ind = line.leading_spaces();
+
+            // A continuation line may reach the content column via a tab even
+            // when its leading *spaces* fall short (e.g. `\tbar` is 4 columns).
+            // Take the column path only when the strip lands on a clean byte
+            // boundary, yielding a borrowable slice; otherwise fall through to
+            // the space-indent handling below.
+            if ind < col
+                && !empty_then_blank
+                && leading_columns(line) >= col
+                && let Some(content) = strip_columns(self.input.get(pos..le).unwrap_or(""), col)
+            {
+                if item_blanks > 0 {
+                    loose = true;
+                }
+                item_blanks = 0;
+                fence = update_fence(fence, content.as_bytes());
+                self.lines.push(content);
+                pos = le + 1;
+                last_para = true;
+                continue;
+            }
 
             // Continuation indented to the item's content column.
             if ind >= col {
