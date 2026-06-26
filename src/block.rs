@@ -1,6 +1,6 @@
 use crate::OffsetExt;
 use crate::inline::InlineParser;
-use crate::link_def::{LinkDefs, normalize_label, scan_link_def};
+use crate::link_def::{LinkDefs, normalize_label_cow, scan_link_def};
 use crate::section::{LineRange, OrderedListDelimiter, PoolLine, Section, SectionRange};
 use crate::small_bool::SmallBoolVec;
 use crate::simd::ByteSliceExt;
@@ -465,7 +465,7 @@ fn peel_content_offset(line: &[u8]) -> usize {
 /// blockquote/list markers via [`peel_content_offset`].
 fn collect_container_defs_in<'src>(
     lines: &[&'src str],
-    found: &mut Vec<(String, (&'src str, Option<&'src str>))>,
+    found: &mut Vec<(std::borrow::Cow<'src, str>, (&'src str, Option<&'src str>))>,
 ) {
     let mut para_open = false;
     let mut fence: Option<(u8, usize)> = None;
@@ -498,7 +498,7 @@ fn collect_container_defs_in<'src>(
             && let Some((def, _)) = scan_link_def(line, off + ind_body)
         {
             found.push((
-                normalize_label(def.label),
+                normalize_label_cow(def.label),
                 (def.url, def.title),
             ));
             para_open = false;
@@ -1724,7 +1724,7 @@ impl<'src> ParseCtx<'src> {
             {
                 ctx.flush_acc(acc);
                 ctx.defs
-                    .entry(normalize_label(def.label))
+                    .entry(normalize_label_cow(def.label))
                     .or_insert((def.url, def.title));
                 pos = resume;
                 acc = Accumulator::Empty;

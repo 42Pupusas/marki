@@ -11,10 +11,16 @@
 //! that the inline parser consults to resolve reference links and images
 //! (`[text][label]`, `[label][]`, `[label]`).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// Registry mapping a normalized link label to its `(url, title)` pair.
-pub type LinkDefs<'src> = HashMap<String, (&'src str, Option<&'src str>)>;
+///
+/// The key is a `Cow` so the common case — a label already in normalized form —
+/// borrows directly from the source instead of allocating an owned `String`;
+/// only labels that actually need folding/collapsing allocate. `Cow<str>`
+/// borrows as `str`, so lookups by `&str` still hash without allocating.
+pub type LinkDefs<'src> = HashMap<Cow<'src, str>, (&'src str, Option<&'src str>)>;
 
 /// A parsed link reference definition, borrowing label/url/title from the
 /// source. The label is still raw here; it is normalized before insertion.
