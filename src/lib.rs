@@ -52,6 +52,7 @@ mod link_def;
 pub(crate) mod raw_html;
 mod section;
 pub(crate) mod simd;
+mod small_bool;
 mod special_char;
 
 #[cfg(test)]

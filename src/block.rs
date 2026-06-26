@@ -2,6 +2,7 @@ use crate::OffsetExt;
 use crate::inline::InlineParser;
 use crate::link_def::{LinkDefs, normalize_label, scan_link_def};
 use crate::section::{LineRange, OrderedListDelimiter, PoolLine, Section, SectionRange};
+use crate::small_bool::SmallBoolVec;
 use crate::simd::ByteSliceExt;
 use crate::special_char::SpecialChar;
 use crate::{Inline, MarkdownFile};
@@ -1141,7 +1142,8 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     // line that begins a block closes that paragraph.
                     let mut last_para = false;
                     // Parallel lazy flags for the collected nested lines.
-                    let mut nested_lazy: Vec<bool> = Vec::new();
+                    // Inline storage spills to the heap only for long runs.
+                    let mut nested_lazy = SmallBoolVec::new();
                     while i < lines.len() {
                         let l = lines[i];
                         let lb = l.as_bytes();
@@ -1467,7 +1469,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
             // content column, so their pad is uniformly zero — and
             // `resolve_blocks` reads a missing pad entry as 0, so an empty
             // slice is byte-for-byte equivalent (see the `&[]` pad argument).
-            let mut item_lazy: Vec<bool> = Vec::new();
+            let mut item_lazy = SmallBoolVec::new();
             if !first_content.is_empty() {
                 item.push(first_content);
                 item_lazy.push(lazy.get(i).copied().unwrap_or(false));
