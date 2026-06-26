@@ -2,7 +2,7 @@ use std::mem::MaybeUninit;
 
 use crate::OffsetExt;
 use crate::SpecialChar;
-use crate::link_def::{LinkDefs, normalize_label};
+use crate::link_def::{LinkDefs, normalize_label_cow};
 use crate::section::InlineSpan;
 use crate::simd::{ByteSet, ByteSliceExt};
 
@@ -1633,7 +1633,10 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         if self.defs.is_empty() {
             return None;
         }
-        self.defs.get(&normalize_label(label)).copied()
+        // `normalize_label_cow` borrows the label when it is already in
+        // normalized form (the common case), so the hash lookup allocates only
+        // for labels that genuinely need case folding or whitespace collapse.
+        self.defs.get(normalize_label_cow(label).as_ref()).copied()
     }
 
     #[inline]

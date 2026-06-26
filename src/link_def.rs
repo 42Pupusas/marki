@@ -55,6 +55,50 @@ pub fn normalize_label(label: &str) -> String {
     out
 }
 
+/// True when `label` is already byte-for-byte equal to its normalized form, so
+/// a lookup can hash the borrowed slice directly instead of allocating.
+///
+/// Conservatively limited to ASCII: the label must have no leading/trailing
+/// space, contain no uppercase letters, and use only single U+0020 spaces as
+/// whitespace (no tabs/newlines, no collapsed runs). Any non-ASCII byte bails
+/// to the allocating path, since case folding there is not the identity.
+#[must_use]
+fn is_already_normalized(label: &str) -> bool {
+    let b = label.as_bytes();
+    if b.first() == Some(&b' ') || b.last() == Some(&b' ') {
+        return false;
+    }
+    let mut prev_space = false;
+    for &c in b {
+        if c >= 0x80 || c.is_ascii_uppercase() {
+            return false;
+        }
+        if c == b' ' {
+            if prev_space {
+                return false; // a run of spaces would collapse to one
+            }
+            prev_space = true;
+        } else if c.is_ascii_whitespace() {
+            return false; // tab/newline/CR/FF would become a space
+        } else {
+            prev_space = false;
+        }
+    }
+    true
+}
+
+/// Normalize a link label, borrowing the input when it is already in normalized
+/// form (the common case) to avoid an allocation. See [`normalize_label`] for
+/// the normalization rules.
+#[must_use]
+pub fn normalize_label_cow(label: &str) -> std::borrow::Cow<'_, str> {
+    if is_already_normalized(label) {
+        std::borrow::Cow::Borrowed(label)
+    } else {
+        std::borrow::Cow::Owned(normalize_label(label))
+    }
+}
+
 #[inline]
 fn is_escape(bytes: &[u8], i: usize) -> bool {
     bytes.get(i) == Some(&b'\\') && bytes.get(i + 1).is_some_and(u8::is_ascii_punctuation)
