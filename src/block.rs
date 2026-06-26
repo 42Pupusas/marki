@@ -1503,8 +1503,14 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         let ctx = ParseCtx::block_pass(input);
 
         // --- Pass 2: inline parsing ---
+        // Pre-size the pools from pass-1 counts so large container-heavy
+        // documents allocate once instead of doubling from zero. Pass 1
+        // already knows the exact list-item count; each item yields one
+        // `ListItem` section plus at least one child block, so `2 * items` is
+        // a tight lower bound. Flat documents have zero list items, so this
+        // reserves nothing and the common path is unchanged.
         let mut pool = Vec::with_capacity(input.len() / 20);
-        let mut section_pool = Vec::new();
+        let mut section_pool = Vec::with_capacity(ctx.list_items.len().saturating_mul(2));
         let mut line_pool = Vec::new();
         let sections = Self::resolve_inlines(&ctx, &mut pool, &mut section_pool, &mut line_pool);
 
