@@ -87,52 +87,43 @@ static LINK_SCAN_SET: ByteSet = ByteSet::new(&[
     SpecialChar::Backslash.byte(),
 ]);
 
-/// Reusable buffers for the one-pass bracket-matching pre-scan
-/// ([`InlineParser::build_bracket_table`]). `close_of[p]` is the byte offset of
-/// the `]` that closes the `[` at offset `p`, valid only when `gen_of[p]`
-/// equals the current `generation`; `stack` holds the offsets of currently-open
-/// `[` during the build.
+/// Sentinel stored in `close_of` for a `[` that has been resolved and has *no*
+/// matching `]` (distinct from "not yet resolved", which the generation stamp
+/// tracks). Lets a failed match be memoized so it is never rescanned.
+const NO_MATCH: u32 = u32::MAX;
+
+/// Lazily-filled, memoized `[`->`]` match table for one inline context.
 ///
-/// The `generation` stamp is what keeps the happy path fast. A naive table
-/// would memset the whole `close_of` buffer to a "no match" sentinel on every
-/// inline context — `O(n)` per context, which on link-dense input (a page that
-/// is mostly `[text](url)`) dominated parse time. Instead, each build bumps
-/// `generation` and stamps only the slots it actually writes; a slot counts as
-/// "set" only when its stamp matches the current generation. "Clearing" the
-/// table is then a single integer increment, and the buffers only ever grow
-/// (amortized to nothing once pooled). All fields are plain `u32` (no borrowed
-/// data), so pooling needs no lifetime juggling.
+/// `close_of[p]` is the offset of the `]` closing the `[` at `p` (or [`NO_MATCH`]),
+/// valid only when `gen_of[p] == generation`; `stack` is scratch for the scan.
+///
+/// Two design choices keep the happy path as cheap as a plain forward scan while
+/// still making adversarial bracket nesting `O(n)`:
+///
+/// * **Lazy + memoized.** A `[`'s match is resolved on first query by a forward
+///   stack-scan from that `[`, which records *every* pair nested inside it along
+///   the way. Flat links (`[text](url)`) resolve in a short scan that never
+///   touches the surrounding text; nested `[[[…]]]` is fully resolved by the
+///   first outer query, leaving every inner lookup `O(1)`. Total work is `O(n)`
+///   per context either way, but — unlike an eager whole-context pre-pass —
+///   link-dense prose pays nothing for the long runs of text between links.
+/// * **Generation stamp.** "Clearing" the table between contexts is a single
+///   counter bump, not an `O(n)` memset; the buffers only ever grow (amortized
+///   to nothing once pooled). All fields are plain `u32` (no borrowed data), so
+///   pooling needs no lifetime juggling.
 #[derive(Default)]
 struct BracketScratch {
     close_of: Vec<u32>,
     gen_of: Vec<u32>,
     stack: Vec<u32>,
     generation: u32,
-}
-
-/// A read-only view of a [`BracketScratch`] for one inline context: the `[`->`]`
-/// match table plus the generation stamp that says which slots are live. Bundles
-/// the three pieces so call sites thread one reference instead of three.
-struct BracketTable<'a> {
-    close_of: &'a [u32],
-    gen_of: &'a [u32],
-    generation: u32,
-}
-
-impl BracketTable<'_> {
-    /// Look up the `]` matching the `[` at `open`, or `None` when it is
-    /// unmatched (no closing `]`, or the `[` lay inside a code span / autolink /
-    /// raw-HTML run that the build stepped over). A slot is live only when its
-    /// generation stamp matches this build's, so stale entries from a previous
-    /// context — or never-written slots — read as `None` without any clearing.
-    #[inline]
-    fn matching_close(&self, open: usize) -> Option<usize> {
-        if self.gen_of.get(open).copied() == Some(self.generation) {
-            Some(self.close_of[open] as usize)
-        } else {
-            None
-        }
-    }
+    /// Set by [`InlineParser::matching_close`] to report whether the just-
+    /// resolved `[` contained any *inner* `[` in its interior. A nested link
+    /// needs an inner `[`, so when this is `false` the "no links in links"
+    /// (`CommonMark` §6.3) pre-check can be skipped entirely — the resolve scan
+    /// already visited every bracket, so this reuses its work for free. A cache
+    /// hit conservatively reports `true` (the cheap full check then runs).
+    saw_inner_bracket: bool,
 }
 
 thread_local! {
@@ -1063,7 +1054,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
     fn region_has_link(
         &self,
         bytes: &[u8],
-        table: &BracketTable<'_>,
+        scratch: &mut BracketScratch,
         start: usize,
         end: usize,
     ) -> bool {
@@ -1092,12 +1083,12 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 && bytes.get(j + 1) == SpecialChar::OpenBracket
             {
                 if let Some((_, _, _, e)) =
-                    Self::try_parse_bracket_paren(self.input, bytes, table, j + 1)
+                    Self::try_parse_bracket_paren(self.input, bytes, scratch, j + 1)
                 {
                     j = e;
                     continue;
                 }
-                if let Some((_, _, _, e)) = self.try_parse_reference(bytes, table, j + 1) {
+                if let Some((_, _, _, e)) = self.try_parse_reference(bytes, scratch, j + 1) {
                     j = e;
                     continue;
                 }
@@ -1108,12 +1099,12 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             if b == SpecialChar::OpenBracket {
                 // A link that begins here means the region contains a link.
                 if let Some((_, _, _, e)) =
-                    Self::try_parse_bracket_paren(self.input, bytes, table, j)
+                    Self::try_parse_bracket_paren(self.input, bytes, scratch, j)
                     && e <= end
                 {
                     return true;
                 }
-                if let Some((_, _, _, e)) = self.try_parse_reference(bytes, table, j)
+                if let Some((_, _, _, e)) = self.try_parse_reference(bytes, scratch, j)
                     && e <= end
                 {
                     return true;
@@ -1183,25 +1174,21 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         // A link, image, or reference can only ever close on a `]`. One SIMD
         // scan up front: when the whole context has no `]`, every `[`/`!`
         // becomes literal text and we skip the (forward-scanning) bracket
-        // branches entirely, keeping them as plain bytes.
+        // branches entirely, keeping them as plain bytes — and skip checking out
+        // a scratch buffer at all, so link-free prose pays nothing.
         let links_possible = bytes
             .find_byte(0, SpecialChar::CloseBracket.byte())
             .is_some();
 
-        // Pre-compute every `[`->`]` match in one O(n) pass so each bracket
-        // branch below is an O(1) lookup instead of an O(n) rescan (which made
-        // nested brackets O(n^2)). Skip the build when no `]` exists, since
-        // then every bracket branch is gated out anyway; the empty table then
-        // answers every lookup with `None`.
-        let mut bracket_scratch = BracketScratch::checkout();
-        let table = if links_possible {
-            Self::build_bracket_table(self.input, bytes, &mut bracket_scratch)
+        // Bracket `[`->`]` matches are resolved lazily and memoized into this
+        // scratch on first query (see `matching_close`): flat links cost a
+        // short forward scan, nested brackets are resolved once then `O(1)`.
+        let mut bracket_scratch = if links_possible {
+            let mut s = BracketScratch::checkout();
+            Self::bracket_reset(&mut s, bytes.len());
+            Some(s)
         } else {
-            BracketTable {
-                close_of: &[],
-                gen_of: &[],
-                generation: 0,
-            }
+            None
         };
 
         // Flush pending plain text `[plain_start, upto)` as a text node.
@@ -1272,8 +1259,12 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             if links_possible
                 && b == SpecialChar::ExclamationMark
                 && bytes.get(i + 1) == SpecialChar::OpenBracket
-                && let Some((alt, url, title, end)) =
-                    Self::try_parse_bracket_paren(self.input, bytes, &table, i + 1)
+                && let Some((alt, url, title, end)) = Self::try_parse_bracket_paren(
+                    self.input,
+                    bytes,
+                    bracket_scratch.as_mut().unwrap(),
+                    i + 1,
+                )
             {
                 flush_text!(i);
                 let alt = self.parse_inner(alt, depth.saturating_add(1));
@@ -1286,7 +1277,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 && b == SpecialChar::ExclamationMark
                 && bytes.get(i + 1) == SpecialChar::OpenBracket
                 && let Some((text_str, url, title, end)) =
-                    self.try_parse_reference(bytes, &table, i + 1)
+                    self.try_parse_reference(bytes, bracket_scratch.as_mut().unwrap(), i + 1)
             {
                 flush_text!(i);
                 let alt = self.parse_inner(text_str, depth.saturating_add(1));
@@ -1299,8 +1290,12 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             // Link: [text](url "title")
             if links_possible
                 && b == SpecialChar::OpenBracket
-                && let Some((text_str, url, title, end)) =
-                    Self::try_parse_bracket_paren(self.input, bytes, &table, i)
+                && let Some((text_str, url, title, end)) = Self::try_parse_bracket_paren(
+                    self.input,
+                    bytes,
+                    bracket_scratch.as_mut().unwrap(),
+                    i,
+                )
             {
                 // "No links in links" (CommonMark §6.3): if the bracket text
                 // already contains a link, the outer `[` is literal and the
@@ -1310,9 +1305,23 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 // revert was exponential on nested link text).
                 // The link text occupies `[i+1, i+1+text_str.len())` (the
                 // bracket interior), not up to `end` (which is past the URL).
+                //
+                // Fast path: `try_parse_bracket_paren` just resolved this `[`
+                // with a single `matching_close`, which recorded whether the
+                // interior held any inner `[`. A nested link requires one, so
+                // when there was none the §6.3 check is provably false and the
+                // whole `region_has_link` scan is skipped (the resolve scan
+                // already covered these bytes).
                 let text_start = i + 1;
                 let text_end = text_start + text_str.len();
-                if self.region_has_link(bytes, &table, text_start, text_end) {
+                if bracket_scratch.as_ref().unwrap().saw_inner_bracket
+                    && self.region_has_link(
+                        bytes,
+                        bracket_scratch.as_mut().unwrap(),
+                        text_start,
+                        text_end,
+                    )
+                {
                     i += 1;
                     continue;
                 }
@@ -1332,7 +1341,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             if links_possible
                 && b == SpecialChar::OpenBracket
                 && let Some((text_str, url, title, end)) =
-                    self.try_parse_reference(bytes, &table, i)
+                    self.try_parse_reference(bytes, bracket_scratch.as_mut().unwrap(), i)
             {
                 // For full references the rendered text is the *first* bracket
                 // (`[text][label]`); for shortcut/collapsed it is the label
@@ -1340,7 +1349,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 // spans `text_str.len()` bytes.
                 let text_start = i + 1;
                 let text_end = text_start + text_str.len();
-                if self.region_has_link(bytes, &table, text_start, text_end) {
+                if self.region_has_link(bytes, bracket_scratch.as_mut().unwrap(), text_start, text_end) {
                     i += 1;
                     continue;
                 }
@@ -1401,7 +1410,9 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             sink.text(text);
         }
 
-        bracket_scratch.checkin();
+        if let Some(scratch) = bracket_scratch {
+            scratch.checkin();
+        }
     }
 
     /// Scan a run of identical `*`/`_` delimiters at `i`, returning
@@ -1500,50 +1511,60 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
     /// Build the bracket-match table for one inline context in a single
     /// left-to-right pass: for every `[` at offset `p` that has a matching `]`,
     /// stamp `scratch.close_of[p]` with that `]`'s offset and `scratch.gen_of[p]`
-    /// with the current generation. Returns a [`BracketTable`] view for lookups.
-    ///
-    /// This replaces a per-`[` rescan: the previous design called an
-    /// `O(n)` matching scan at *every* open bracket, so balanced nested
-    /// brackets (`[[[…]]]`) were `O(n²)` — a ~4 KB adversarial input took
-    /// seconds (an algorithmic-complexity `DoS`). A single stack-based pass makes
-    /// it `O(n)`: each special byte is visited once and each `[` is pushed and
-    /// popped at most once.
-    ///
-    /// Clearing is `O(1)`: rather than memset the whole table to a sentinel on
-    /// every context (which dominated parse time on link-dense input), the
-    /// generation counter is bumped and only written slots are stamped live.
-    /// The buffers grow to `bytes.len()` once and are reused thereafter.
-    ///
-    /// The skip rules match link structure exactly (`CommonMark` §6.3): backslash
-    /// escapes, and code spans / autolinks / raw HTML (which bind tighter than
-    /// link brackets) are stepped over so a `]` inside them cannot close a
-    /// link. Those constructs depend only on the input and their start offset,
-    /// not on bracket nesting, so resolving them once globally is equivalent to
-    /// the old per-bracket rescan.
-    fn build_bracket_table<'s>(
-        input: &'src str,
-        bytes: &[u8],
-        scratch: &'s mut BracketScratch,
-    ) -> BracketTable<'s> {
-        // Grow (never shrink) the parallel buffers to cover this context. Slots
-        // are validated by generation stamp, so no initialization is needed:
-        // a slot left over from a longer previous context simply carries a
-        // stale stamp and reads as "no match".
-        if scratch.close_of.len() < bytes.len() {
-            scratch.close_of.resize(bytes.len(), 0);
-            scratch.gen_of.resize(bytes.len(), 0);
+    /// Ready a [`BracketScratch`] for a new inline context spanning `len` bytes.
+    /// Grows the parallel buffers (never shrinks) and bumps the generation so
+    /// every prior entry is invalidated in `O(1)` — no memset. Slots need no
+    /// initialization: a stale slot carries an old stamp and reads as "unresolved".
+    fn bracket_reset(scratch: &mut BracketScratch, len: usize) {
+        if scratch.close_of.len() < len {
+            scratch.close_of.resize(len, 0);
+            scratch.gen_of.resize(len, 0);
         }
-        // A fresh generation invalidates every prior entry in `O(1)`. On the
-        // (astronomically rare) wraparound, fall back to a one-time clear so a
-        // stale slot can't masquerade as live.
         scratch.generation = scratch.generation.wrapping_add(1);
         if scratch.generation == 0 {
+            // Astronomically rare wraparound: clear stamps once so no stale slot
+            // can masquerade as belonging to the new generation.
             scratch.gen_of.iter_mut().for_each(|g| *g = u32::MAX);
             scratch.generation = 1;
         }
+    }
+
+    /// Look up the `]` matching the `[` at `open`, resolving it lazily and
+    /// memoizing the result (and every pair nested inside it) into `scratch`.
+    ///
+    /// On a cache miss this runs one forward stack-scan from `open`: it walks
+    /// brackets until `open`'s own `]` is found, stamping each inner `[`->`]`
+    /// pair it closes along the way, then returns. Because a scan stops at
+    /// `open`'s closer, flat links (`[text](url)`) scan only their own short
+    /// interior and never the surrounding prose — matching the old per-bracket
+    /// forward scan's cost on the common case. But unlike that design, the pairs
+    /// discovered while resolving a deeply nested `[` are cached, so the whole
+    /// `[[[…]]]` subtree is resolved in one scan and every later query is `O(1)`
+    /// — keeping adversarial nesting `O(n)` overall instead of `O(n²)`.
+    ///
+    /// The skip rules match link structure exactly (`CommonMark` §6.3): backslash
+    /// escapes and code spans / autolinks / raw HTML (which bind tighter than
+    /// link brackets) are stepped over so a `]` inside them cannot close a link.
+    fn matching_close(
+        input: &'src str,
+        bytes: &[u8],
+        scratch: &mut BracketScratch,
+        open: usize,
+    ) -> Option<usize> {
+        // Cached? (live stamp). `NO_MATCH` is a resolved "no closer" answer.
+        // A cache hit didn't rescan, so conservatively assume inner brackets.
+        if scratch.gen_of.get(open).copied() == Some(scratch.generation) {
+            scratch.saw_inner_bracket = true;
+            let c = scratch.close_of[open];
+            return (c != NO_MATCH).then_some(c as usize);
+        }
         let generation = scratch.generation;
-        scratch.stack.clear();
-        let mut j = 0;
+        let stack_base = scratch.stack.len();
+        #[allow(clippy::cast_possible_truncation)]
+        scratch.stack.push(open as u32);
+        let mut j = open + 1;
+        let mut result = None;
+        let mut saw_inner = false;
         while let Some(pos) = bytes.find_byte_set(j, &BRACKET_CLOSE_SET) {
             let b = bytes[pos];
             if b == SpecialChar::Backslash
@@ -1573,31 +1594,44 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 continue;
             }
             if b == SpecialChar::OpenBracket {
+                saw_inner = true;
                 #[allow(clippy::cast_possible_truncation)]
                 scratch.stack.push(pos as u32);
             } else if b == SpecialChar::CloseBracket
-                && let Some(open) = scratch.stack.pop()
+                && let Some(inner) = scratch.stack.pop()
             {
                 // Innermost open `[` matches this `]` (`CommonMark` nesting).
                 #[allow(clippy::cast_possible_truncation)]
                 {
-                    scratch.close_of[open as usize] = pos as u32;
-                    scratch.gen_of[open as usize] = generation;
+                    scratch.close_of[inner as usize] = pos as u32;
+                    scratch.gen_of[inner as usize] = generation;
+                }
+                if inner as usize == open {
+                    // `open`'s own closer: done. Any `[` still on the stack
+                    // above `stack_base` is left unresolved for a later query.
+                    result = Some(pos);
+                    break;
                 }
             }
             j = pos + 1;
         }
-        BracketTable {
-            close_of: &scratch.close_of,
-            gen_of: &scratch.gen_of,
-            generation,
+        // Every `[` still open from this scan (including `open` itself on a
+        // no-closer exit) has no matching `]`: memoize that so it is never
+        // rescanned, then restore the stack to its caller-visible depth.
+        #[allow(clippy::cast_possible_truncation)]
+        for &unclosed in &scratch.stack[stack_base..] {
+            scratch.close_of[unclosed as usize] = NO_MATCH;
+            scratch.gen_of[unclosed as usize] = generation;
         }
+        scratch.stack.truncate(stack_base);
+        scratch.saw_inner_bracket = saw_inner;
+        result
     }
 
     fn try_parse_bracket_paren(
         input: &'src str,
         bytes: &[u8],
-        table: &BracketTable<'_>,
+        scratch: &mut BracketScratch,
         start: usize,
     ) -> Option<(&'src str, &'src str, Option<&'src str>, usize)> {
         if bytes.get(start) != SpecialChar::OpenBracket {
@@ -1605,7 +1639,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         }
 
         let bracket_start = start + 1;
-        let bracket_end = table.matching_close(start)?;
+        let bracket_end = Self::matching_close(input, bytes, scratch, start)?;
 
         let paren_pos = bracket_end + 1;
         if bytes.get(paren_pos) != SpecialChar::OpenParen {
@@ -1748,7 +1782,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
     fn try_parse_reference(
         &self,
         bytes: &[u8],
-        table: &BracketTable<'_>,
+        scratch: &mut BracketScratch,
         start: usize,
     ) -> Option<(&'src str, &'src str, Option<&'src str>, usize)> {
         // Every reference form requires a matching definition; if the registry
@@ -1760,14 +1794,14 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             return None;
         }
         let first_start = start + 1;
-        let first_end = table.matching_close(start)?;
+        let first_end = Self::matching_close(self.input, bytes, scratch, start)?;
         let first_text = self.input.get(first_start..first_end)?;
 
         // Is there a second bracket pair `[...]` immediately after?
         let after_first = first_end + 1;
         if bytes.get(after_first) == SpecialChar::OpenBracket {
             let second_start = after_first + 1;
-            let second_end = table.matching_close(after_first)?;
+            let second_end = Self::matching_close(self.input, bytes, scratch, after_first)?;
             let second_text = self.input.get(second_start..second_end)?;
             if second_text.trim().is_empty() {
                 // Collapsed reference `[label][]`: label is the first text.
