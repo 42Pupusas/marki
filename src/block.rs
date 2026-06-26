@@ -1396,13 +1396,15 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
             let col = head[ind + marker.width..].item_content_indent(ind, marker);
             let first_content = lines[i].get(col.min(lines[i].len())..).unwrap_or("");
             item.clear();
-            // Parallel lazy/pad flags for this item's collected lines.
+            // Parallel lazy flags for this item's collected lines. No pad
+            // buffer: collected item lines are dedented by a pure-space
+            // content column, so their pad is uniformly zero — and
+            // `resolve_blocks` reads a missing pad entry as 0, so an empty
+            // slice is byte-for-byte equivalent (see the `&[]` pad argument).
             let mut item_lazy: Vec<bool> = Vec::new();
-            let mut item_pad: Vec<u8> = Vec::new();
             if !first_content.is_empty() {
                 item.push(first_content);
                 item_lazy.push(lazy.get(i).copied().unwrap_or(false));
-                item_pad.push(0);
             }
             i += 1;
             // Gather continuation lines for this item.
@@ -1418,7 +1420,6 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     item_blanks += 1;
                     item.push("");
                     item_lazy.push(false);
-                    item_pad.push(0);
                     i += 1;
                     continue;
                 }
@@ -1443,7 +1444,6 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     item_blanks = 0;
                     item.push(cont.get(col..).unwrap_or(""));
                     item_lazy.push(lazy.get(i).copied().unwrap_or(false));
-                    item_pad.push(0);
                     i += 1;
                     continue;
                 }
@@ -1454,7 +1454,6 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 if item_blanks == 0 && !cb[cind.min(cb.len())..].begins_block() {
                     item.push(cont.trim());
                     item_lazy.push(false);
-                    item_pad.push(0);
                     i += 1;
                     continue;
                 }
@@ -1464,7 +1463,6 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
             while item.last().is_some_and(|l| l.is_empty()) {
                 item.pop();
                 item_lazy.pop();
-                item_pad.pop();
                 pending_blanks += 1;
             }
             // ListItem placeholder, then append its subtree and backpatch.
@@ -1473,7 +1471,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 children: SectionRange::EMPTY,
             });
             let range = Self::resolve_blocks(
-                &item, &item_lazy, &item_pad, pool, section_pool, line_pool, scratch, defs,
+                &item, &item_lazy, &[], pool, section_pool, line_pool, scratch, defs,
             );
             section_pool[item_at] = Section::ListItem { children: range };
         }
