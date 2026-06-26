@@ -690,6 +690,95 @@ impl<'src, const CAP: usize> InlineBuf<'src, CAP> {
     }
 }
 
+/// Output sink for the shared inline scanner [`InlineParser::scan_inline`].
+///
+/// The two parse paths differ only in where scanned elements land and whether
+/// `*`/`_` runs are emphasis delimiters: the allocation-free [`InlineBuf`] fast
+/// path (no emphasis) and the [`EmphArena`] delimiter-stack path. Implementing
+/// this trait for both lets one scanner drive both, with `HANDLES_DELIMS`
+/// monomorphized to a constant so the delimiter branch is compiled out of the
+/// fast path entirely.
+trait InlineSink<'src> {
+    /// Whether `*`/`_` runs should be handled as emphasis delimiters. `false`
+    /// leaves them as ordinary text (the buffer fast path never sees emphasis).
+    const HANDLES_DELIMS: bool;
+    /// Ordinary plain text (may be merged with adjacent text downstream).
+    fn text(&mut self, text: &'src str);
+    /// Isolated text that must never merge with a neighbour — used for an
+    /// escaped character, so e.g. `\&ouml;` cannot recombine into an entity.
+    fn literal(&mut self, text: &'src str);
+    /// A fully-resolved inline element (code, link, image, autolink, raw HTML).
+    fn resolved(&mut self, el: Inline<'src>);
+    /// A soft or hard line break.
+    fn line_break(&mut self, is_hard: bool);
+    /// An emphasis delimiter run (`count` copies of `ch`). Only ever called
+    /// when `HANDLES_DELIMS` is `true`.
+    fn delim_run(&mut self, src: &'src str, ch: u8, count: usize, can_open: bool, can_close: bool);
+}
+
+impl<'src, const CAP: usize> InlineSink<'src> for InlineBuf<'src, CAP> {
+    const HANDLES_DELIMS: bool = false;
+    #[inline]
+    fn text(&mut self, text: &'src str) {
+        self.push(Inline::Text(text));
+    }
+    #[inline]
+    fn literal(&mut self, text: &'src str) {
+        // The buffer never merges adjacent text, so an isolated literal is just
+        // a plain text node.
+        self.push(Inline::Text(text));
+    }
+    #[inline]
+    fn resolved(&mut self, el: Inline<'src>) {
+        self.push(el);
+    }
+    #[inline]
+    fn line_break(&mut self, is_hard: bool) {
+        self.push(if is_hard {
+            Inline::HardBreak
+        } else {
+            Inline::SoftBreak
+        });
+    }
+    fn delim_run(&mut self, _: &'src str, _: u8, _: usize, _: bool, _: bool) {
+        unreachable!("buffer sink never handles emphasis delimiters")
+    }
+}
+
+impl<'src> InlineSink<'src> for EmphArena<'src> {
+    const HANDLES_DELIMS: bool = true;
+    #[inline]
+    fn text(&mut self, text: &'src str) {
+        self.push_text(text);
+    }
+    #[inline]
+    fn literal(&mut self, text: &'src str) {
+        // `Resolved` is opaque to the delimiter resolver and to text merging,
+        // keeping the escaped character isolated.
+        self.push_node(EmphKind::Resolved(Inline::Text(text)));
+    }
+    #[inline]
+    fn resolved(&mut self, el: Inline<'src>) {
+        self.push_node(EmphKind::Resolved(el));
+    }
+    #[inline]
+    fn line_break(&mut self, is_hard: bool) {
+        self.push_node(EmphKind::Resolved(if is_hard {
+            Inline::HardBreak
+        } else {
+            Inline::SoftBreak
+        }));
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn delim_run(&mut self, src: &'src str, ch: u8, count: usize, can_open: bool, can_close: bool) {
+        if can_open || can_close {
+            self.push_delim(src, ch, count as i32, can_open, can_close);
+        } else {
+            self.push_text(src);
+        }
+    }
+}
+
 /// Stateful parser for a single inline parse pass.
 ///
 /// Holds the input slice and a mutable reference to the output pool so that
@@ -781,7 +870,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             // the final flush) can borrow it again.
             let mut parser: InlineParser<'src, '_, MAX_DEPTH, CAP> =
                 InlineParser::new(line, &mut *pool, defs);
-            parser.parse_into_buf(bytes, &mut buf, 0);
+            parser.scan_inline(bytes, &mut buf, 0);
         }
         buf.flush_to_pool(pool)
     }
@@ -808,7 +897,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             }
             let mut parser: InlineParser<'src, '_, MAX_DEPTH, CAP> =
                 InlineParser::new(line, &mut *pool, defs);
-            parser.scan_line_into_arena(line.as_bytes(), arena, 0);
+            parser.scan_inline(line.as_bytes(), arena, 0);
         }
         arena.process_emphasis();
         arena.emit_list(arena.head, pool)
@@ -846,7 +935,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             return EmphArena::with(|arena| self.parse_into_arena(bytes, arena, depth));
         }
         let mut buf = InlineBuf::<CAP>::new();
-        self.parse_into_buf(bytes, &mut buf, depth);
+        self.scan_inline(bytes, &mut buf, depth);
         // A paragraph never ends with a dangling break (trailing whitespace is
         // stripped, so `foo  \n` is `foo`, not `foo<br />`).
         if self.strip_lines {
@@ -891,10 +980,21 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         .parse_at_depth(depth)
     }
 
-    /// Fast path for inline content with **no** `*`/`_` emphasis delimiters.
-    /// Collects elements straight into the stack-allocated [`InlineBuf`].
-    #[allow(clippy::too_many_lines)]
-    fn parse_into_buf(&mut self, bytes: &[u8], buf: &mut InlineBuf<'src, CAP>, depth: u8) {
+    /// Shared inline scanner driving both parse paths.
+    ///
+    /// A single SIMD-accelerated loop over `bytes` recognises every inline
+    /// construct (line breaks, backslash escapes, code spans, links, images,
+    /// autolinks, raw HTML, and — when `S::HANDLES_DELIMS` — emphasis runs) and
+    /// feeds them to the generic [`InlineSink`] `sink`. Monomorphization
+    /// compiles the emphasis branch out of the buffer fast path entirely, so
+    /// the two former copies (`parse_into_buf` / `scan_line_into_arena`) stay
+    /// zero-cost while sharing one body.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap
+    )]
+    fn scan_inline<S: InlineSink<'src>>(&mut self, bytes: &[u8], sink: &mut S, depth: u8) {
         // Paragraph reflow strips indentation at the start of the first line.
         let mut plain_start = if self.strip_lines {
             Self::skip_line_leading_ws(bytes, 0)
@@ -911,13 +1011,26 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             .find_byte(0, SpecialChar::CloseBracket.byte())
             .is_some();
 
+        // Flush pending plain text `[plain_start, upto)` as a text node.
+        macro_rules! flush_text {
+            ($upto:expr) => {
+                if let Some(text) = self.input.get(plain_start..$upto)
+                    && !text.is_empty()
+                {
+                    sink.text(text);
+                }
+            };
+        }
+
         // SIMD-accelerated scan: find next special byte.
         while let Some(pos) = bytes.find_byte_set(i, &SPECIAL_SET) {
             i = pos;
             let b = bytes[i];
 
             if b == SpecialChar::Newline {
-                self.emit_line_break(bytes, plain_start, i, buf);
+                let (trim_end, is_hard) = self.line_break_pieces(bytes, plain_start, i);
+                flush_text!(trim_end);
+                sink.line_break(is_hard);
                 plain_start = i + 1;
                 // Paragraph reflow strips indentation at each line start.
                 if self.strip_lines {
@@ -933,17 +1046,13 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 && let Some(&next) = bytes.get(i + 1)
                 && next.is_ascii_punctuation()
             {
-                if let Some(text) = self.input.get(plain_start..i)
-                    && !text.is_empty()
-                {
-                    buf.push(Inline::Text(text));
-                }
-                // Emit the escaped char as its own text node (dropping the
+                flush_text!(i);
+                // Emit the escaped char as its own isolated node (dropping the
                 // backslash). Isolating it prevents an escaped `&` from later
                 // merging with a following `name;` and being decoded as an
                 // entity at render time (e.g. `\&ouml;` must stay literal).
                 if let Some(text) = self.input.get(i + 1..i + 2) {
-                    buf.push(Inline::Text(text));
+                    sink.literal(text);
                 }
                 plain_start = i + 2;
                 i += 2;
@@ -953,12 +1062,8 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             // Inline code: `code` or ``code``
             if b == SpecialChar::Backtick {
                 if let Some((code, end)) = Self::try_parse_inline_code(self.input, bytes, i) {
-                    if let Some(text) = self.input.get(plain_start..i)
-                        && !text.is_empty()
-                    {
-                        buf.push(Inline::Text(text));
-                    }
-                    buf.push(Inline::Code(code));
+                    flush_text!(i);
+                    sink.resolved(Inline::Code(code));
                     plain_start = end;
                     i = end;
                     continue;
@@ -977,13 +1082,9 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 && let Some((alt, url, title, end)) =
                     Self::try_parse_bracket_paren(self.input, bytes, i + 1)
             {
-                if let Some(text) = self.input.get(plain_start..i)
-                    && !text.is_empty()
-                {
-                    buf.push(Inline::Text(text));
-                }
+                flush_text!(i);
                 let alt = self.parse_inner(alt, depth.saturating_add(1));
-                buf.push(Inline::Image { alt, url, title });
+                sink.resolved(Inline::Image { alt, url, title });
                 plain_start = end;
                 i = end;
                 continue;
@@ -993,13 +1094,9 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 && bytes.get(i + 1) == SpecialChar::OpenBracket
                 && let Some((text_str, url, title, end)) = self.try_parse_reference(bytes, i + 1)
             {
-                if let Some(text) = self.input.get(plain_start..i)
-                    && !text.is_empty()
-                {
-                    buf.push(Inline::Text(text));
-                }
+                flush_text!(i);
                 let alt = self.parse_inner(text_str, depth.saturating_add(1));
-                buf.push(Inline::Image { alt, url, title });
+                sink.resolved(Inline::Image { alt, url, title });
                 plain_start = end;
                 i = end;
                 continue;
@@ -1021,12 +1118,8 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                     i += 1;
                     continue;
                 }
-                if let Some(text) = self.input.get(plain_start..i)
-                    && !text.is_empty()
-                {
-                    buf.push(Inline::Text(text));
-                }
-                buf.push(Inline::Link {
+                flush_text!(i);
+                sink.resolved(Inline::Link {
                     text: text_span,
                     url,
                     title,
@@ -1048,12 +1141,8 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                     i += 1;
                     continue;
                 }
-                if let Some(text) = self.input.get(plain_start..i)
-                    && !text.is_empty()
-                {
-                    buf.push(Inline::Text(text));
-                }
-                buf.push(Inline::Link {
+                flush_text!(i);
+                sink.resolved(Inline::Link {
                     text: text_span,
                     url,
                     title,
@@ -1067,14 +1156,26 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             if b == SpecialChar::LessThan
                 && let Some((elem, end)) = Self::try_parse_angle(self.input, bytes, i)
             {
-                if let Some(text) = self.input.get(plain_start..i)
-                    && !text.is_empty()
-                {
-                    buf.push(Inline::Text(text));
-                }
-                buf.push(elem);
+                flush_text!(i);
+                sink.resolved(elem);
                 plain_start = end;
                 i = end;
+                continue;
+            }
+
+            // Emphasis delimiter run (`*`/`_`). Only the arena path handles
+            // these; the buffer fast path is only chosen when the context has
+            // no emphasis, so this branch is compiled out there.
+            if S::HANDLES_DELIMS
+                && (b == SpecialChar::Asterisk || b == SpecialChar::Underscore)
+            {
+                let (count, can_open, can_close) = Self::scan_delims(bytes, i, b);
+                debug_assert!(count > 0);
+                flush_text!(i);
+                let src = self.input.get(i..i + count).unwrap_or_default();
+                sink.delim_run(src, b, count, can_open, can_close);
+                plain_start = i + count;
+                i += count;
                 continue;
             }
 
@@ -1093,7 +1194,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         if let Some(text) = tail
             && !text.is_empty()
         {
-            buf.push(Inline::Text(text));
+            sink.text(text);
         }
     }
 
@@ -1139,7 +1240,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         // Single inline context: every `Text` node slices from `self.input`,
         // so it is the covering slice for contiguous-text merging.
         arena.src = self.input;
-        self.scan_line_into_arena(bytes, arena, depth);
+        self.scan_inline(bytes, arena, depth);
         // Drop a dangling trailing break for paragraph reflow.
         if self.strip_lines
             && arena.tail != NIL
@@ -1153,207 +1254,6 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         }
         arena.process_emphasis();
         arena.emit_list(arena.head, self.pool)
-    }
-
-    /// Scan one inline context into `arena` without resetting, resolving, or
-    /// emitting. Shared by single-context and multi-line paths.
-    #[allow(
-        clippy::too_many_lines,
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap
-    )]
-    fn scan_line_into_arena(&mut self, bytes: &[u8], arena: &mut EmphArena<'src>, depth: u8) {
-        let mut plain_start = if self.strip_lines {
-            Self::skip_line_leading_ws(bytes, 0)
-        } else {
-            0
-        };
-        let mut i = plain_start;
-
-        // A link, image, or reference can only ever close on a `]`. One SIMD
-        // scan up front: when the whole context has no `]`, every `[`/`!`
-        // becomes literal text and we skip the (forward-scanning) bracket
-        // branches entirely.
-        let links_possible = bytes
-            .find_byte(0, SpecialChar::CloseBracket.byte())
-            .is_some();
-
-        // Flush pending plain text `[plain_start, upto)` as a text node.
-        macro_rules! flush_text {
-            ($upto:expr) => {
-                if let Some(text) = self.input.get(plain_start..$upto)
-                    && !text.is_empty()
-                {
-                    arena.push_text(text);
-                }
-            };
-        }
-
-        while let Some(pos) = bytes.find_byte_set(i, &SPECIAL_SET) {
-            i = pos;
-            let b = bytes[i];
-
-            if b == SpecialChar::Newline {
-                let (trim_end, is_hard) = self.line_break_pieces(bytes, plain_start, i);
-                flush_text!(trim_end);
-                arena.push_node(EmphKind::Resolved(if is_hard {
-                    Inline::HardBreak
-                } else {
-                    Inline::SoftBreak
-                }));
-                plain_start = i + 1;
-                if self.strip_lines {
-                    plain_start = Self::skip_line_leading_ws(bytes, plain_start);
-                }
-                i = plain_start;
-                continue;
-            }
-
-            if b == SpecialChar::Backslash
-                && let Some(&next) = bytes.get(i + 1)
-                && next.is_ascii_punctuation()
-            {
-                flush_text!(i);
-                // Emit the escaped char (drop the backslash).
-                if let Some(text) = self.input.get(i + 1..i + 2) {
-                    arena.push_node(EmphKind::Resolved(Inline::Text(text)));
-                }
-                plain_start = i + 2;
-                i += 2;
-                continue;
-            }
-
-            if b == SpecialChar::Backtick {
-                if let Some((code, end)) = Self::try_parse_inline_code(self.input, bytes, i) {
-                    flush_text!(i);
-                    arena.push_node(EmphKind::Resolved(Inline::Code(code)));
-                    plain_start = end;
-                    i = end;
-                    continue;
-                }
-                // Unmatched opening run: keep the whole run as literal text
-                // and skip it so a shorter sub-run cannot re-open a code span.
-                i += SpecialChar::Backtick.count_leading_bytes(&bytes[i..]);
-                continue;
-            }
-
-            // Image (inline then reference).
-            if links_possible
-                && b == SpecialChar::ExclamationMark
-                && bytes.get(i + 1) == SpecialChar::OpenBracket
-                && let Some((alt, url, title, end)) =
-                    Self::try_parse_bracket_paren(self.input, bytes, i + 1)
-            {
-                flush_text!(i);
-                let alt = self.parse_inner(alt, depth.saturating_add(1));
-                arena.push_node(EmphKind::Resolved(Inline::Image { alt, url, title }));
-                plain_start = end;
-                i = end;
-                continue;
-            }
-            if links_possible
-                && b == SpecialChar::ExclamationMark
-                && bytes.get(i + 1) == SpecialChar::OpenBracket
-                && let Some((alt, url, title, end)) = self.try_parse_reference(bytes, i + 1)
-            {
-                flush_text!(i);
-                let alt = self.parse_inner(alt, depth.saturating_add(1));
-                arena.push_node(EmphKind::Resolved(Inline::Image { alt, url, title }));
-                plain_start = end;
-                i = end;
-                continue;
-            }
-
-            // Inline link.
-            if links_possible
-                && b == SpecialChar::OpenBracket
-                && let Some((text_str, url, title, end)) =
-                    Self::try_parse_bracket_paren(self.input, bytes, i)
-            {
-                let saved = self.pool.len();
-                let text_span = self.parse_inner(text_str, depth.saturating_add(1));
-                if self.span_has_link(text_span) {
-                    // "No links in links" (CommonMark §6.3): outer `[` is
-                    // literal, the inner link wins. Revert and rescan from i+1.
-                    self.pool.truncate(saved);
-                    i += 1;
-                    continue;
-                }
-                flush_text!(i);
-                arena.push_node(EmphKind::Resolved(Inline::Link {
-                    text: text_span,
-                    url,
-                    title,
-                }));
-                plain_start = end;
-                i = end;
-                continue;
-            }
-            // Reference link.
-            if links_possible
-                && b == SpecialChar::OpenBracket
-                && let Some((text_str, url, title, end)) = self.try_parse_reference(bytes, i)
-            {
-                let saved = self.pool.len();
-                let text_span = self.parse_inner(text_str, depth.saturating_add(1));
-                if self.span_has_link(text_span) {
-                    self.pool.truncate(saved);
-                    i += 1;
-                    continue;
-                }
-                flush_text!(i);
-                arena.push_node(EmphKind::Resolved(Inline::Link {
-                    text: text_span,
-                    url,
-                    title,
-                }));
-                plain_start = end;
-                i = end;
-                continue;
-            }
-
-            // Autolink / raw HTML.
-            if b == SpecialChar::LessThan
-                && let Some((elem, end)) = Self::try_parse_angle(self.input, bytes, i)
-            {
-                flush_text!(i);
-                arena.push_node(EmphKind::Resolved(elem));
-                plain_start = end;
-                i = end;
-                continue;
-            }
-
-            // Emphasis delimiter run.
-            if b == SpecialChar::Asterisk || b == SpecialChar::Underscore {
-                let (count, can_open, can_close) = Self::scan_delims(bytes, i, b);
-                debug_assert!(count > 0);
-                flush_text!(i);
-                let src = self.input.get(i..i + count).unwrap_or_default();
-                if can_open || can_close {
-                    arena.push_delim(src, b, count as i32, can_open, can_close);
-                } else {
-                    arena.push_text(src);
-                }
-                plain_start = i + count;
-                i += count;
-                continue;
-            }
-
-            i += 1;
-        }
-
-        let tail = if self.strip_lines {
-            self.input
-                .get(plain_start..)
-                .map(|t| t.trim_end_matches([' ', '\t']))
-        } else {
-            self.input.get(plain_start..)
-        };
-        if let Some(text) = tail
-            && !text.is_empty()
-        {
-            arena.push_text(text);
-        }
     }
 
     /// Compute the text-slice end and break kind at a newline position.
@@ -1389,52 +1289,6 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             }
         }
         (trim_end, is_hard)
-    }
-
-    /// Emit a hard or soft line break at a newline position.
-    /// Hard break if preceded by trailing `\` or 2+ spaces; soft break otherwise.
-    #[inline]
-    fn emit_line_break(
-        &self,
-        bytes: &[u8],
-        plain_start: usize,
-        newline_pos: usize,
-        buf: &mut InlineBuf<'src, CAP>,
-    ) {
-        let preceding = bytes.get(plain_start..newline_pos).unwrap_or_default();
-        let (mut trim_end, is_hard) = if preceding.last() == SpecialChar::Backslash {
-            (newline_pos - 1, true)
-        } else {
-            // Count trailing spaces with a simple backward loop.
-            let mut spaces = 0;
-            let mut j = preceding.len();
-            while j > 0 && preceding[j - 1] == SpecialChar::Space {
-                spaces += 1;
-                j -= 1;
-            }
-            if spaces >= 2 {
-                (newline_pos - spaces, true)
-            } else {
-                (newline_pos, false)
-            }
-        };
-        // Paragraph reflow strips trailing whitespace from each line, even the
-        // single trailing space that would otherwise survive a soft break.
-        if self.strip_lines {
-            while trim_end > plain_start && matches!(bytes.get(trim_end - 1), Some(b' ' | b'\t')) {
-                trim_end -= 1;
-            }
-        }
-        if let Some(text) = self.input.get(plain_start..trim_end)
-            && !text.is_empty()
-        {
-            buf.push(Inline::Text(text));
-        }
-        buf.push(if is_hard {
-            Inline::HardBreak
-        } else {
-            Inline::SoftBreak
-        });
     }
 
     /// Find the position of a matching closing delimiter, handling backslash
