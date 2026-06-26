@@ -1,6 +1,7 @@
 use crate::OffsetExt;
 use crate::inline::InlineParser;
 use crate::link_def::{LinkDef, LinkDefs, LinkLabel};
+use crate::raw_html::HtmlScan;
 use crate::section::{LineRange, OrderedListDelimiter, PoolLine, Section, SectionRange};
 use crate::small_bool::SmallBoolVec;
 use crate::simd::ByteSliceExt;
@@ -1282,8 +1283,7 @@ impl<
                 // HTML block (CommonMark §4.6). Detect a start condition on the
                 // de-indented line; type 7 cannot interrupt an open paragraph.
                 if body.first() == SpecialChar::LessThan
-                    && let Some(kind) =
-                        crate::raw_html::html_block_start(body, !para.is_empty())
+                    && let Some(kind) = body.html_block_start(!para.is_empty())
                 {
                     Self::flush_para(input, &mut para, section_pool, pool, defs);
                     let html_start = line_pool.len().pool_offset();
@@ -1385,7 +1385,7 @@ impl<
             n += 1;
             // Types 1–5 terminate on the line containing their end marker.
             let ends = match kind {
-                HtmlBlockKind::Type1 => crate::raw_html::type1_end(lb),
+                HtmlBlockKind::Type1 => lb.type1_end(),
                 HtmlBlockKind::Type6 | HtmlBlockKind::Type7 => false,
                 other => other
                     .end_marker()
@@ -1739,9 +1739,7 @@ impl<'src> ParseCtx<'src> {
             {
                 let spos = pos + indent;
                 let in_paragraph = matches!(acc, Accumulator::InParagraph { .. });
-                if let Some(kind) =
-                    crate::raw_html::html_block_start(&bytes[spos..line_end], in_paragraph)
-                {
+                if let Some(kind) = bytes[spos..line_end].html_block_start(in_paragraph) {
                     ctx.flush_acc(acc);
                     let (html, resume) = ctx.scan_html_block(pos, line_end, kind);
                     ctx.sections.push(RawSection::HtmlBlock { html });
@@ -1909,7 +1907,7 @@ impl<'src> ParseCtx<'src> {
                     .unwrap_or(bytes.len());
                 let line = &bytes[pos..line_end];
                 let ends = match kind {
-                    HtmlBlockKind::Type1 => crate::raw_html::type1_end(line),
+                    HtmlBlockKind::Type1 => line.type1_end(),
                     other => other
                         .end_marker()
                         .is_some_and(|m| line.windows(m.len()).any(|w| w == m)),

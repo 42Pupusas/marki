@@ -1,6 +1,7 @@
 use crate::OffsetExt;
 use crate::SpecialChar;
 use crate::link_def::{LinkDefs, LinkLabel};
+use crate::raw_html::HtmlScan;
 use crate::section::InlineSpan;
 use crate::simd::{ByteSet, ByteSliceExt};
 
@@ -1781,7 +1782,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             ));
         }
         // Raw inline HTML.
-        if let Some(len) = crate::raw_html::scan_inline_html(&bytes[start..]) {
+        if let Some(len) = bytes[start..].scan_inline_html() {
             let html = input.get(start..start + len)?;
             return Some((Inline::RawHtml(html), start + len));
         }
