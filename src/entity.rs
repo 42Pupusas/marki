@@ -10,6 +10,8 @@
 //! requires the trailing `;` for *all* forms, so the named lookup keys on the
 //! bytes between `&` and `;`.
 
+use crate::entities_table::NamedEntity;
+
 /// Maximum digits in a decimal reference (`CommonMark` allows up to 7).
 const MAX_DEC_DIGITS: usize = 7;
 /// Maximum digits in a hexadecimal reference (`CommonMark` allows up to 6).
@@ -67,7 +69,7 @@ impl Entity {
         if i == 1 || rest.get(i) != Some(&b';') {
             return None;
         }
-        let value = crate::entities_table::get_entity(&rest[1..i])?;
+        let value = rest[1..i].entity_value()?;
         Some((Self::Str(value), i + 1))
     }
 

@@ -102,7 +102,7 @@ impl ByteSet {
                         _mm_or_si128(_mm_cmpeq_epi8(chunk, n6), _mm_cmpeq_epi8(chunk, n7)),
                     ),
                 );
-                let mask = movemask_to_u32(_mm_movemask_epi8(eq));
+                let mask = _mm_movemask_epi8(eq).movemask_to_u32();
                 if mask != 0 {
                     return Some(offset + i + mask.trailing_zeros() as usize);
                 }
@@ -134,15 +134,23 @@ impl ByteSet {
     }
 }
 
-/// Reinterpret the low 16 bits of a `_mm_movemask_epi8` result as `u32`.
-/// Movemask returns `i32` with only bits 0..15 meaningful; widening via
-/// the byte representation is lossless.
+/// Reinterpret a `_mm_movemask_epi8` result's low 16 bits as `u32`.
 #[cfg(target_arch = "x86_64")]
-#[allow(clippy::inline_always)]
-#[inline(always)]
-const fn movemask_to_u32(mask: i32) -> u32 {
-    let [lo, hi, _, _] = mask.to_ne_bytes();
-    u16::from_ne_bytes([lo, hi]) as u32
+trait MovemaskBits {
+    fn movemask_to_u32(self) -> u32;
+}
+
+#[cfg(target_arch = "x86_64")]
+impl MovemaskBits for i32 {
+    /// Reinterpret the low 16 bits of a `_mm_movemask_epi8` result as `u32`.
+    /// Movemask returns `i32` with only bits 0..15 meaningful; widening via
+    /// the byte representation is lossless.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn movemask_to_u32(self) -> u32 {
+        let [lo, hi, _, _] = self.to_ne_bytes();
+        u32::from(u16::from_ne_bytes([lo, hi]))
+    }
 }
 
 struct ByteSearcher(u8);
@@ -176,7 +184,7 @@ impl ByteSearcher {
             let mut i = 0;
             while i + 16 <= len {
                 let chunk = _mm_loadu_si128(ptr.add(i).cast::<__m128i>());
-                let mask = movemask_to_u32(_mm_movemask_epi8(_mm_cmpeq_epi8(chunk, n)));
+                let mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, n)).movemask_to_u32();
                 if mask != 0 {
                     return Some(offset + i + mask.trailing_zeros() as usize);
                 }

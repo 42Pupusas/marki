@@ -2154,19 +2154,26 @@ static ENTITIES: [(&[u8], &str); 2125] = [
     (b"zwnj", "\u{200C}"),
 ];
 
-/// Look up an HTML5 named character reference by its name (the bytes between
-/// `&` and `;`, e.g. `b"ouml"`). Returns the replacement string, which may be
-/// one or two Unicode scalar values (e.g. `&NotEqualTilde;`).
-pub fn get_entity(bytes: &[u8]) -> Option<&'static str> {
-    ENTITIES
-        .binary_search_by_key(&bytes, |&(key, _value)| key)
-        .ok()
-        .map(|i| ENTITIES[i].1)
+/// Look up an HTML5 named character reference from its name bytes.
+pub trait NamedEntity {
+    fn entity_value(&self) -> Option<&'static str>;
+}
+
+impl NamedEntity for [u8] {
+    /// Look up an HTML5 named character reference by its name (the bytes between
+    /// `&` and `;`, e.g. `b"ouml"`). Returns the replacement string, which may
+    /// be one or two Unicode scalar values (e.g. `&NotEqualTilde;`).
+    fn entity_value(&self) -> Option<&'static str> {
+        ENTITIES
+            .binary_search_by_key(&self, |&(key, _value)| key)
+            .ok()
+            .map(|i| ENTITIES[i].1)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::get_entity;
+    use super::NamedEntity;
 
     #[test]
     fn table_is_sorted_by_key() {
@@ -2175,17 +2182,17 @@ mod tests {
 
     #[test]
     fn known_entities_resolve() {
-        assert_eq!(get_entity(b"ouml"), Some("\u{00F6}"));
-        assert_eq!(get_entity(b"copy"), Some("\u{00A9}"));
-        assert_eq!(get_entity(b"AElig"), Some("\u{00C6}"));
-        assert_eq!(get_entity(b"nbsp"), Some("\u{00A0}"));
+        assert_eq!(b"ouml".entity_value(), Some("\u{00F6}"));
+        assert_eq!(b"copy".entity_value(), Some("\u{00A9}"));
+        assert_eq!(b"AElig".entity_value(), Some("\u{00C6}"));
+        assert_eq!(b"nbsp".entity_value(), Some("\u{00A0}"));
         // Two-scalar expansion.
-        assert_eq!(get_entity(b"NotEqualTilde"), Some("\u{2242}\u{0338}"));
+        assert_eq!(b"NotEqualTilde".entity_value(), Some("\u{2242}\u{0338}"));
     }
 
     #[test]
     fn unknown_entities_are_none() {
-        assert_eq!(get_entity(b"notanentity"), None);
-        assert_eq!(get_entity(b""), None);
+        assert_eq!(b"notanentity".entity_value(), None);
+        assert_eq!(b"".entity_value(), None);
     }
 }

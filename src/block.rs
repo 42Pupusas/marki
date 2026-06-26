@@ -190,26 +190,27 @@ impl ParseScratch<'_> {
             defs: LinkDefs::default(),
         }
     }
-}
 
-/// Check a cleared [`ParseScratch`] out of the thread-local pool, allocating a
-/// fresh one only when the pool is empty. Buffers are recycled across the
-/// lifetime boundary by [`ParseScratch::relifetime`] (which clears them), so no
-/// `'src` reference is ever fabricated and no `unsafe` is involved.
-fn checkout_scratch<'src>() -> ParseScratch<'src> {
-    CTX_POOL
-        .with(|p| p.borrow_mut().pop())
-        .map_or_else(ParseScratch::default, ParseScratch::relifetime)
-}
+    /// Check a cleared [`ParseScratch`] out of the thread-local pool, allocating
+    /// a fresh one only when the pool is empty. Buffers are recycled across the
+    /// lifetime boundary by [`ParseScratch::relifetime`] (which clears them), so
+    /// no `'src` reference is ever fabricated and no `unsafe` is involved.
+    fn checkout<'src>() -> ParseScratch<'src> {
+        CTX_POOL
+            .with(|p| p.borrow_mut().pop())
+            .map_or_else(ParseScratch::default, ParseScratch::relifetime)
+    }
 
-/// Reset `scratch` (dropping all `'src` borrows) and return it to the pool as
-/// `'static` for the next parse to reuse.
-fn checkin_scratch(mut scratch: ParseScratch<'_>) {
-    scratch.reset();
-    // Recycle the allocations across the lifetime boundary; `relifetime` clears
-    // every buffer, so no `'src` reference survives into the `'static` pool.
-    let scratch: ParseScratch<'static> = scratch.relifetime();
-    CTX_POOL.with(|p| p.borrow_mut().push(scratch));
+    /// Reset `self` (dropping all `'src` borrows) and return it to the pool as
+    /// `'static` for the next parse to reuse.
+    fn checkin(mut self) {
+        self.reset();
+        // Recycle the allocations across the lifetime boundary; `relifetime`
+        // clears every buffer, so no `'src` reference survives into the
+        // `'static` pool.
+        let scratch: ParseScratch<'static> = self.relifetime();
+        CTX_POOL.with(|p| p.borrow_mut().push(scratch));
+    }
 }
 
 struct ParseCtx<'src> {
@@ -1648,7 +1649,7 @@ impl<
         // --- Pass 1: block-level parsing (no inline work) ---
         // Borrow recycled scratch buffers from the thread-local pool; pass 1
         // fills them, pass 2 reads them, then they go back cleared.
-        let ctx = ParseCtx::block_pass(input, checkout_scratch());
+        let ctx = ParseCtx::block_pass(input, ParseScratch::checkout());
 
         // --- Pass 2: inline parsing ---
         // Pre-size the pools from pass-1 counts so large container-heavy
@@ -1674,14 +1675,15 @@ impl<
             defs,
             ..
         } = ctx;
-        checkin_scratch(ParseScratch {
+        ParseScratch {
             sections: ctx_sections,
             lines,
             lazy,
             pad,
             list_items,
             defs,
-        });
+        }
+        .checkin();
 
         Self {
             sections,

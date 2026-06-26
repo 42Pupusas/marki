@@ -190,7 +190,7 @@ struct EmphArena<'src> {
 thread_local! {
     /// Free-list of emphasis arenas, reused across parse calls to amortize the
     /// arena's `Vec` allocations. Parsing is re-entrant (a link's text is a
-    /// nested inline context), so this is a stack: each [`with_arena`] call
+    /// nested inline context), so this is a stack: each [`EmphArena::with`] call
     /// checks one out and returns it cleared.
     static ARENA_POOL: std::cell::RefCell<Vec<EmphArena<'static>>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -215,25 +215,6 @@ impl EmphArena<'_> {
     }
 }
 
-/// Run `f` with a recycled [`EmphArena`], returning it to the thread-local pool
-/// afterwards. Buffers are recycled across the lifetime boundary by
-/// [`EmphArena::relifetime`] (which clears them), so no `'src` reference ever
-/// persists in the `'static` pool, and no `unsafe` is involved.
-fn with_arena<'src, R>(f: impl FnOnce(&mut EmphArena<'src>) -> R) -> R {
-    // Check out a pooled arena and re-type it to `'src`, reusing its
-    // allocations. Both callers `reset()` the arena before filling it, so we
-    // hand over the cleared buffers as-is.
-    let mut arena: EmphArena<'src> = ARENA_POOL
-        .with(|p| p.borrow_mut().pop())
-        .map_or_else(EmphArena::default, EmphArena::relifetime);
-    let out = f(&mut arena);
-    // Return it to the pool as `'static`, again recycling the allocations and
-    // dropping every `'src` borrow in the process.
-    let pooled: EmphArena<'static> = arena.relifetime();
-    ARENA_POOL.with(|p| p.borrow_mut().push(pooled));
-    out
-}
-
 // The emphasis arena is an index-based linked list: node/delimiter handles are
 // `i32` (sentinel `NIL = -1`) and index into `Vec`s whose length is bounded by
 // the document's inline-pool cap (already `u32::MAX`). The `i32`<->`usize`
@@ -245,6 +226,25 @@ fn with_arena<'src, R>(f: impl FnOnce(&mut EmphArena<'src>) -> R) -> R {
     clippy::cast_sign_loss
 )]
 impl<'src> EmphArena<'src> {
+    /// Run `f` with a recycled [`EmphArena`], returning it to the thread-local
+    /// pool afterwards. Buffers are recycled across the lifetime boundary by
+    /// [`EmphArena::relifetime`] (which clears them), so no `'src` reference
+    /// ever persists in the `'static` pool, and no `unsafe` is involved.
+    fn with<R>(f: impl FnOnce(&mut Self) -> R) -> R {
+        // Check out a pooled arena and re-type it to `'src`, reusing its
+        // allocations. Both callers `reset()` the arena before filling it, so
+        // we hand over the cleared buffers as-is.
+        let mut arena: EmphArena<'src> = ARENA_POOL
+            .with(|p| p.borrow_mut().pop())
+            .map_or_else(EmphArena::default, EmphArena::relifetime);
+        let out = f(&mut arena);
+        // Return it to the pool as `'static`, again recycling the allocations
+        // and dropping every `'src` borrow in the process.
+        let pooled: EmphArena<'static> = arena.relifetime();
+        ARENA_POOL.with(|p| p.borrow_mut().push(pooled));
+        out
+    }
+
     fn reset(&mut self) {
         self.nodes.clear();
         self.delims.clear();
@@ -761,7 +761,9 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             .iter()
             .any(|l| l.as_bytes().find_byte_set(0, &EMPH_ONLY_SET).is_some());
         if any_emph {
-            return with_arena(|arena| Self::parse_lines_into_arena(input, lines, arena, pool, defs));
+            return EmphArena::with(|arena| {
+                Self::parse_lines_into_arena(input, lines, arena, pool, defs)
+            });
         }
         let mut buf = InlineBuf::<CAP>::new();
         for (idx, line) in lines.iter().enumerate() {
@@ -841,7 +843,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         // Emphasis present? Route through the delimiter-stack algorithm.
         // Otherwise keep the allocation-free `InlineBuf` fast path.
         if bytes.find_byte_set(0, &EMPH_ONLY_SET).is_some() {
-            return with_arena(|arena| self.parse_into_arena(bytes, arena, depth));
+            return EmphArena::with(|arena| self.parse_into_arena(bytes, arena, depth));
         }
         let mut buf = InlineBuf::<CAP>::new();
         self.parse_into_buf(bytes, &mut buf, depth);
