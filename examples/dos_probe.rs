@@ -39,6 +39,19 @@ fn main() {
     probe("nested_brackets_link", &format!("{}{}", "[".repeat(20_000), "]".repeat(20_000)));
     probe("bang_bracket_image_50k", &"![".repeat(50_000));
 
+    // "No links in links" backtracking: nested link text where each level
+    // contains a real link. The parse-then-revert design was exponential here
+    // (`T(d)=2*T(d-1)`); a 126-byte input took seconds. Now linear via a
+    // non-recursive `region_has_link` pre-check over the bracket table.
+    probe(
+        "nested_link_revert_5k",
+        &format!("{}[a](b){}", "[".repeat(5_000), "](c)".repeat(5_000)),
+    );
+    probe(
+        "nested_image_revert_5k",
+        &format!("{}![a](b){}", "![".repeat(5_000), "](c)".repeat(5_000)),
+    );
+
     // Backslash escapes.
     probe("backslash_run_100k", &"\\".repeat(100_000));
 
@@ -74,6 +87,41 @@ fn main() {
 
     // Hard-break / trailing-space lines.
     probe("trailing_space_lines", &"x  \n".repeat(50_000));
+
+    // Replay any `slow-unit-*` inputs libFuzzer flagged (>1s under ASAN). We
+    // re-time them in a release build to see the true cost without sanitizer
+    // overhead, normalizing first to mirror the fuzz target.
+    eprintln!("\nslow-unit artifacts from the fuzzer:");
+    for target in ["normalize_and_parse", "parse"] {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fuzz/artifacts")
+            .join(target);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut files: Vec<_> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("slow-unit-"))
+            })
+            .collect();
+        files.sort();
+        for path in files {
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                continue;
+            };
+            let normalized = MarkdownFile::<'_, 16, 32>::normalize(text);
+            let short = path.file_name().unwrap().to_str().unwrap();
+            let short = &short[..short.len().min(26)];
+            probe(short, &normalized);
+        }
+    }
 
     eprintln!("\ndone — all returned without hang/crash.");
 }

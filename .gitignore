@@ -2,3 +2,5 @@
 flamegraph.svg
 perf.data
 perf.data.old
+# libFuzzer per-job logs written when running `cargo fuzz run ... -jobs=N`
+fuzz-*.log
