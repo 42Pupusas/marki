@@ -13,6 +13,12 @@ use divan::black_box;
 use marki_parse::MarkdownFile;
 use pulldown_cmark::{Options, Parser, html};
 
+/// Track heap traffic per benchmark (alloc count + bytes) alongside timings,
+/// so we can compare not just *speed* but *allocation discipline* against
+/// pulldown-cmark and comrak. Wraps the system allocator.
+#[global_allocator]
+static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
+
 /// Fixture names used as bench arguments. Kept as bare names so divan prints
 /// readable row labels instead of `Debug`-ing the entire file contents.
 const FIXTURES: &[&str] = &["rust_readme", "awesome", "commonmark_spec"];
