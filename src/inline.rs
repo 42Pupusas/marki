@@ -1,5 +1,6 @@
 use crate::OffsetExt;
 use crate::SpecialChar;
+use crate::VecReuse;
 use crate::link_def::{LinkDefs, LinkLabel};
 use crate::raw_html::HtmlScan;
 use crate::section::InlineSpan;
@@ -92,30 +93,38 @@ static EMPH_ONLY_SET: ByteSet =
 /// Sentinel for "no node / no link" in the index-based linked lists.
 const NIL: i32 = -1;
 
-/// If `a` and `b` are adjacent slices that both lie within `src`, return the
-/// single sub-slice of `src` spanning both (`a` immediately followed by `b`).
-/// Used to merge split text fragments — e.g. an unmatched `*` delimiter and the
-/// word after it — back into one `Text` node so the inline pool stays compact.
-///
-/// The merged slice is re-derived from `src`, which has provenance over the
-/// whole inline context, rather than from `a`'s pointer (whose borrow only
-/// covers `a`'s own bytes — reading past it into `b` is undefined behaviour
-/// under Stacked Borrows). All addresses are compared as integers, never
-/// dereferenced, so a stray slice from another allocation simply fails the
-/// containment check and is left unmerged.
-fn contiguous_merge<'src>(src: &'src str, a: &'src str, b: &'src str) -> Option<&'src str> {
-    let base = src.as_ptr() as usize;
-    let a_start = (a.as_ptr() as usize).checked_sub(base)?;
-    // `a` and `b` must be immediately adjacent...
-    if a.as_ptr() as usize + a.len() != b.as_ptr() as usize {
-        return None;
+/// Covering-slice helpers on the inline context's source `str`.
+trait SrcStr {
+    fn contiguous_merge<'a>(&'a self, a: &'a str, b: &'a str) -> Option<&'a str>;
+}
+
+impl SrcStr for str {
+    /// If `a` and `b` are adjacent slices that both lie within `self`, return
+    /// the single sub-slice of `self` spanning both (`a` immediately followed
+    /// by `b`). Used to merge split text fragments — e.g. an unmatched `*`
+    /// delimiter and the word after it — back into one `Text` node so the
+    /// inline pool stays compact.
+    ///
+    /// The merged slice is re-derived from `self`, which has provenance over
+    /// the whole inline context, rather than from `a`'s pointer (whose borrow
+    /// only covers `a`'s own bytes — reading past it into `b` is undefined
+    /// behaviour under Stacked Borrows). All addresses are compared as
+    /// integers, never dereferenced, so a stray slice from another allocation
+    /// simply fails the containment check and is left unmerged.
+    fn contiguous_merge<'a>(&'a self, a: &'a str, b: &'a str) -> Option<&'a str> {
+        let base = self.as_ptr() as usize;
+        let a_start = (a.as_ptr() as usize).checked_sub(base)?;
+        // `a` and `b` must be immediately adjacent...
+        if a.as_ptr() as usize + a.len() != b.as_ptr() as usize {
+            return None;
+        }
+        // ...and the combined run must lie entirely within `self`.
+        let total = a.len() + b.len();
+        if a_start + total > self.len() {
+            return None;
+        }
+        self.get(a_start..a_start + total)
     }
-    // ...and the combined run must lie entirely within `src`.
-    let total = a.len() + b.len();
-    if a_start + total > src.len() {
-        return None;
-    }
-    src.get(a_start..a_start + total)
 }
 
 /// A node in the inline list processed by the emphasis resolver.
@@ -195,10 +204,10 @@ impl EmphArena<'_> {
     /// `transmute` the pooled arena used to require.
     fn relifetime<'dst>(self) -> EmphArena<'dst> {
         EmphArena {
-            nodes: crate::reuse_alloc(self.nodes),
-            delims: crate::reuse_alloc(self.delims),
+            nodes: self.nodes.reuse_alloc(),
+            delims: self.delims.reuse_alloc(),
             src: "",
-            scratch: crate::reuse_alloc(self.scratch),
+            scratch: self.scratch.reuse_alloc(),
             head: NIL,
             tail: NIL,
             delim_top: NIL,
@@ -506,7 +515,7 @@ impl<'src> EmphArena<'src> {
                         // the following word), keeping the pool compact.
                         if !last_is_escaped
                             && let Some(Inline::Text(prev)) = self.scratch.last_mut()
-                            && let Some(merged) = contiguous_merge(src, prev, s)
+                            && let Some(merged) = src.contiguous_merge(prev, s)
                         {
                             *prev = merged;
                         } else {

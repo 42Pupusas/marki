@@ -1,4 +1,5 @@
 use crate::OffsetExt;
+use crate::VecReuse;
 use crate::inline::InlineParser;
 use crate::link_def::{LinkDef, LinkDefs, LinkLabel};
 use crate::raw_html::HtmlScan;
@@ -181,8 +182,8 @@ impl ParseScratch<'_> {
     /// `transmute` the pooled scratch set used to require.
     fn relifetime<'dst>(self) -> ParseScratch<'dst> {
         ParseScratch {
-            sections: crate::reuse_alloc(self.sections),
-            lines: crate::reuse_alloc(self.lines),
+            sections: self.sections.reuse_alloc(),
+            lines: self.lines.reuse_alloc(),
             lazy: self.lazy,
             pad: self.pad,
             list_items: self.list_items,
