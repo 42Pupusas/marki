@@ -891,6 +891,14 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         };
         let mut i = plain_start;
 
+        // A link, image, or reference can only ever close on a `]`. One SIMD
+        // scan up front: when the whole context has no `]`, every `[`/`!`
+        // becomes literal text and we skip the (forward-scanning) bracket
+        // branches entirely, keeping them as plain bytes.
+        let links_possible = bytes
+            .find_byte(0, SpecialChar::CloseBracket.byte())
+            .is_some();
+
         // SIMD-accelerated scan: find next special byte.
         while let Some(pos) = bytes.find_byte_set(i, &SPECIAL_SET) {
             i = pos;
@@ -951,7 +959,8 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             }
 
             // Image: ![alt](url "title") or reference ![alt][label]
-            if b == SpecialChar::ExclamationMark
+            if links_possible
+                && b == SpecialChar::ExclamationMark
                 && bytes.get(i + 1) == SpecialChar::OpenBracket
                 && let Some((alt, url, title, end)) =
                     Self::try_parse_bracket_paren(self.input, bytes, i + 1)
@@ -967,7 +976,8 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 i = end;
                 continue;
             }
-            if b == SpecialChar::ExclamationMark
+            if links_possible
+                && b == SpecialChar::ExclamationMark
                 && bytes.get(i + 1) == SpecialChar::OpenBracket
                 && let Some((text_str, url, title, end)) = self.try_parse_reference(bytes, i + 1)
             {
@@ -984,7 +994,8 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             }
 
             // Link: [text](url "title")
-            if b == SpecialChar::OpenBracket
+            if links_possible
+                && b == SpecialChar::OpenBracket
                 && let Some((text_str, url, title, end)) =
                     Self::try_parse_bracket_paren(self.input, bytes, i)
             {
@@ -1014,7 +1025,8 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             }
 
             // Reference link: [text][label], [label][], or [label]
-            if b == SpecialChar::OpenBracket
+            if links_possible
+                && b == SpecialChar::OpenBracket
                 && let Some((text_str, url, title, end)) = self.try_parse_reference(bytes, i)
             {
                 let saved = self.pool.len();
@@ -1146,6 +1158,14 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         };
         let mut i = plain_start;
 
+        // A link, image, or reference can only ever close on a `]`. One SIMD
+        // scan up front: when the whole context has no `]`, every `[`/`!`
+        // becomes literal text and we skip the (forward-scanning) bracket
+        // branches entirely.
+        let links_possible = bytes
+            .find_byte(0, SpecialChar::CloseBracket.byte())
+            .is_some();
+
         // Flush pending plain text `[plain_start, upto)` as a text node.
         macro_rules! flush_text {
             ($upto:expr) => {
@@ -1206,7 +1226,8 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             }
 
             // Image (inline then reference).
-            if b == SpecialChar::ExclamationMark
+            if links_possible
+                && b == SpecialChar::ExclamationMark
                 && bytes.get(i + 1) == SpecialChar::OpenBracket
                 && let Some((alt, url, title, end)) =
                     Self::try_parse_bracket_paren(self.input, bytes, i + 1)
@@ -1218,7 +1239,8 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 i = end;
                 continue;
             }
-            if b == SpecialChar::ExclamationMark
+            if links_possible
+                && b == SpecialChar::ExclamationMark
                 && bytes.get(i + 1) == SpecialChar::OpenBracket
                 && let Some((alt, url, title, end)) = self.try_parse_reference(bytes, i + 1)
             {
@@ -1231,7 +1253,8 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             }
 
             // Inline link.
-            if b == SpecialChar::OpenBracket
+            if links_possible
+                && b == SpecialChar::OpenBracket
                 && let Some((text_str, url, title, end)) =
                     Self::try_parse_bracket_paren(self.input, bytes, i)
             {
@@ -1255,7 +1278,8 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 continue;
             }
             // Reference link.
-            if b == SpecialChar::OpenBracket
+            if links_possible
+                && b == SpecialChar::OpenBracket
                 && let Some((text_str, url, title, end)) = self.try_parse_reference(bytes, i)
             {
                 let saved = self.pool.len();
