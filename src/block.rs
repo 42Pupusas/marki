@@ -1,6 +1,6 @@
 use crate::OffsetExt;
 use crate::inline::InlineParser;
-use crate::link_def::{LinkDefs, normalize_label_cow, scan_link_def};
+use crate::link_def::{LinkDef, LinkDefs, LinkLabel};
 use crate::section::{LineRange, OrderedListDelimiter, PoolLine, Section, SectionRange};
 use crate::small_bool::SmallBoolVec;
 use crate::simd::ByteSliceExt;
@@ -510,10 +510,10 @@ fn collect_container_defs_in<'src>(
         }
         if !para_open
             && inner.first() == Some(&b'[')
-            && let Some((def, _)) = scan_link_def(line, off + ind_body)
+            && let Some((def, _)) = LinkDef::scan(line, off + ind_body)
         {
             found.push((
-                normalize_label_cow(def.label),
+                def.label.normalize_label_cow(),
                 (def.url, def.title),
             ));
             para_open = false;
@@ -1153,7 +1153,7 @@ impl<
             // lazily continuing an open paragraph.
             if para.is_empty()
                 && body.first() == Some(&b'[')
-                && scan_link_def(line, ind).is_some()
+                && LinkDef::scan(line, ind).is_some()
             {
                 i += 1;
                 continue;
@@ -1761,11 +1761,11 @@ impl<'src> ParseCtx<'src> {
                             .get(..4)
                             .is_some_and(|w| w.contains(&b'['))))
                 && let Some(indent) = bytes[pos..line_end].strip_indent()
-                && let Some((def, resume)) = scan_link_def(ctx.input, pos + indent)
+                && let Some((def, resume)) = LinkDef::scan(ctx.input, pos + indent)
             {
                 ctx.flush_acc(acc);
                 ctx.defs
-                    .entry(normalize_label_cow(def.label))
+                    .entry(def.label.normalize_label_cow())
                     .or_insert((def.url, def.title));
                 pos = resume;
                 acc = Accumulator::Empty;

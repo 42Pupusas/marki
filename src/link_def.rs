@@ -30,263 +30,276 @@ pub struct LinkDef<'src> {
     pub title: Option<&'src str>,
 }
 
-/// Normalize a link label for matching (`CommonMark` §4.7): trim surrounding
-/// whitespace, collapse internal whitespace runs to a single space, and apply
-/// Unicode case folding (approximated by `to_lowercase`).
-#[must_use]
-pub fn normalize_label(label: &str) -> String {
-    let mut out = String::with_capacity(label.len());
-    let mut prev_ws = false;
-    for ch in label.trim().chars() {
-        if ch.is_whitespace() {
-            if !prev_ws {
-                out.push(' ');
-                prev_ws = true;
-            }
-        } else {
-            prev_ws = false;
-            for lc in ch.to_lowercase() {
-                // CommonMark matches labels by full Unicode case folding, where
-                // the sharp s folds to "ss". `to_lowercase` only maps the
-                // capital form `ẞ` to `ß`, so finish the fold here; this also
-                // lets a `SS` label (lowercased to "ss") match `ß`/`ẞ`.
-                if lc == '\u{00df}' {
-                    out.push_str("ss");
-                } else {
-                    out.push(lc);
+/// Link-label normalization (`CommonMark` §4.7), hung off `str` so call sites
+/// read as `label.normalize_label_cow()` rather than a bare function. Keeps the
+/// module free of standalone functions.
+pub trait LinkLabel {
+    #[must_use]
+    fn normalize_label(&self) -> String;
+    #[must_use]
+    fn normalize_label_cow(&self) -> std::borrow::Cow<'_, str>;
+    #[must_use]
+    fn is_already_normalized(&self) -> bool;
+}
+
+impl LinkLabel for str {
+    /// Normalize a link label for matching (`CommonMark` §4.7): trim surrounding
+    /// whitespace, collapse internal whitespace runs to a single space, and
+    /// apply Unicode case folding (approximated by `to_lowercase`).
+    fn normalize_label(&self) -> String {
+        let mut out = String::with_capacity(self.len());
+        let mut prev_ws = false;
+        for ch in self.trim().chars() {
+            if ch.is_whitespace() {
+                if !prev_ws {
+                    out.push(' ');
+                    prev_ws = true;
+                }
+            } else {
+                prev_ws = false;
+                for lc in ch.to_lowercase() {
+                    // CommonMark matches labels by full Unicode case folding,
+                    // where the sharp s folds to "ss". `to_lowercase` only maps
+                    // the capital form `ẞ` to `ß`, so finish the fold here; this
+                    // also lets a `SS` label (lowercased to "ss") match `ß`/`ẞ`.
+                    if lc == '\u{00df}' {
+                        out.push_str("ss");
+                    } else {
+                        out.push(lc);
+                    }
                 }
             }
         }
+        out
     }
-    out
-}
 
-/// True when `label` is already byte-for-byte equal to its normalized form, so
-/// a lookup can hash the borrowed slice directly instead of allocating.
-///
-/// Conservatively limited to ASCII: the label must have no leading/trailing
-/// space, contain no uppercase letters, and use only single U+0020 spaces as
-/// whitespace (no tabs/newlines, no collapsed runs). Any non-ASCII byte bails
-/// to the allocating path, since case folding there is not the identity.
-#[must_use]
-fn is_already_normalized(label: &str) -> bool {
-    let b = label.as_bytes();
-    if b.first() == Some(&b' ') || b.last() == Some(&b' ') {
-        return false;
+    /// Normalize a link label, borrowing the input when it is already in
+    /// normalized form (the common case) to avoid an allocation. See
+    /// [`LinkLabel::normalize_label`] for the normalization rules.
+    fn normalize_label_cow(&self) -> std::borrow::Cow<'_, str> {
+        if self.is_already_normalized() {
+            std::borrow::Cow::Borrowed(self)
+        } else {
+            std::borrow::Cow::Owned(self.normalize_label())
+        }
     }
-    let mut prev_space = false;
-    for &c in b {
-        if c >= 0x80 || c.is_ascii_uppercase() {
+
+    /// True when already byte-for-byte equal to its normalized form, so a lookup
+    /// can hash the borrowed slice directly instead of allocating.
+    ///
+    /// Conservatively limited to ASCII: the label must have no leading/trailing
+    /// space, contain no uppercase letters, and use only single U+0020 spaces
+    /// as whitespace (no tabs/newlines, no collapsed runs). Any non-ASCII byte
+    /// bails to the allocating path, since case folding there is not identity.
+    fn is_already_normalized(&self) -> bool {
+        let b = self.as_bytes();
+        if b.first() == Some(&b' ') || b.last() == Some(&b' ') {
             return false;
         }
-        if c == b' ' {
-            if prev_space {
-                return false; // a run of spaces would collapse to one
+        let mut prev_space = false;
+        for &c in b {
+            if c >= 0x80 || c.is_ascii_uppercase() {
+                return false;
             }
-            prev_space = true;
-        } else if c.is_ascii_whitespace() {
-            return false; // tab/newline/CR/FF would become a space
-        } else {
-            prev_space = false;
+            if c == b' ' {
+                if prev_space {
+                    return false; // a run of spaces would collapse to one
+                }
+                prev_space = true;
+            } else if c.is_ascii_whitespace() {
+                return false; // tab/newline/CR/FF would become a space
+            } else {
+                prev_space = false;
+            }
         }
-    }
-    true
-}
-
-/// Normalize a link label, borrowing the input when it is already in normalized
-/// form (the common case) to avoid an allocation. See [`normalize_label`] for
-/// the normalization rules.
-#[must_use]
-pub fn normalize_label_cow(label: &str) -> std::borrow::Cow<'_, str> {
-    if is_already_normalized(label) {
-        std::borrow::Cow::Borrowed(label)
-    } else {
-        std::borrow::Cow::Owned(normalize_label(label))
+        true
     }
 }
 
-#[inline]
-fn is_escape(bytes: &[u8], i: usize) -> bool {
-    bytes.get(i) == Some(&b'\\') && bytes.get(i + 1).is_some_and(u8::is_ascii_punctuation)
-}
-
-/// Skip spaces/tabs, then optionally a single line ending followed by more
-/// spaces/tabs. Returns `None` if a blank line is encountered (two line
-/// endings), which terminates a definition.
-fn skip_ws_one_nl(bytes: &[u8], mut i: usize) -> Option<usize> {
-    while matches!(bytes.get(i), Some(b' ' | b'\t')) {
-        i += 1;
+impl<'src> LinkDef<'src> {
+    #[inline]
+    fn is_escape(bytes: &[u8], i: usize) -> bool {
+        bytes.get(i) == Some(&b'\\') && bytes.get(i + 1).is_some_and(u8::is_ascii_punctuation)
     }
-    if bytes.get(i) == Some(&b'\n') {
-        i += 1;
+
+    /// Skip spaces/tabs, then optionally a single line ending followed by more
+    /// spaces/tabs. Returns `None` if a blank line is encountered (two line
+    /// endings), which terminates a definition.
+    fn skip_ws_one_nl(bytes: &[u8], mut i: usize) -> Option<usize> {
         while matches!(bytes.get(i), Some(b' ' | b'\t')) {
             i += 1;
         }
         if bytes.get(i) == Some(&b'\n') {
-            return None;
+            i += 1;
+            while matches!(bytes.get(i), Some(b' ' | b'\t')) {
+                i += 1;
+            }
+            if bytes.get(i) == Some(&b'\n') {
+                return None;
+            }
+        }
+        Some(i)
+    }
+
+    /// If the remainder of the current line (from `i`) is only whitespace,
+    /// return the offset at which the next line begins (or the input length at
+    /// EOF). Otherwise return `None` — the line has trailing non-whitespace.
+    fn line_end_resume(bytes: &[u8], mut i: usize) -> Option<usize> {
+        while matches!(bytes.get(i), Some(b' ' | b'\t')) {
+            i += 1;
+        }
+        match bytes.get(i) {
+            None => Some(bytes.len()),
+            Some(&b'\n') => Some(i + 1),
+            _ => None,
         }
     }
-    Some(i)
-}
 
-/// If the remainder of the current line (from `i`) is only whitespace, return
-/// the offset at which the next line begins (or the input length at EOF).
-/// Otherwise return `None` — the line has trailing non-whitespace content.
-fn line_end_resume(bytes: &[u8], mut i: usize) -> Option<usize> {
-    while matches!(bytes.get(i), Some(b' ' | b'\t')) {
-        i += 1;
-    }
-    match bytes.get(i) {
-        None => Some(bytes.len()),
-        Some(&b'\n') => Some(i + 1),
-        _ => None,
-    }
-}
-
-/// Scan a link destination at `i`. Returns `(url_start, url_end, after)`.
-/// Supports the `<...>` bracketed form and the bare form (terminated by
-/// whitespace or a control character, with balanced parentheses).
-fn scan_destination(bytes: &[u8], i: usize) -> Option<(usize, usize, usize)> {
-    if bytes.get(i) == Some(&b'<') {
+    /// Scan a link destination at `i`. Returns `(url_start, url_end, after)`.
+    /// Supports the `<...>` bracketed form and the bare form (terminated by
+    /// whitespace or a control character, with balanced parentheses).
+    fn scan_destination(bytes: &[u8], i: usize) -> Option<(usize, usize, usize)> {
+        if bytes.get(i) == Some(&b'<') {
         let mut j = i + 1;
         loop {
             match bytes.get(j) {
                 None | Some(b'\n' | b'<') => return None,
-                _ if is_escape(bytes, j) => j += 2,
+                _ if Self::is_escape(bytes, j) => j += 2,
                 Some(b'>') => return Some((i + 1, j, j + 1)),
                 _ => j += 1,
             }
         }
-    } else {
-        let start = i;
-        let mut j = i;
-        let mut depth: i32 = 0;
-        loop {
-            match bytes.get(j) {
-                None => break,
-                Some(&b) if b.is_ascii_whitespace() => break,
-                _ if is_escape(bytes, j) => {
-                    j += 2;
-                    continue;
-                }
-                Some(b'(') => depth += 1,
-                Some(b')') => {
-                    if depth == 0 {
-                        break;
+        } else {
+            let start = i;
+            let mut j = i;
+            let mut depth: i32 = 0;
+            loop {
+                match bytes.get(j) {
+                    None => break,
+                    Some(&b) if b.is_ascii_whitespace() => break,
+                    _ if Self::is_escape(bytes, j) => {
+                        j += 2;
+                        continue;
                     }
-                    depth -= 1;
-                }
-                Some(&b) if b < 0x20 => break,
-                _ => {}
-            }
-            j += 1;
-        }
-        if j == start || depth != 0 {
-            return None;
-        }
-        Some((start, j, j))
-    }
-}
-
-/// Scan a title at `i` delimited by `"`, `'`, or `(...)`.
-/// Returns `(title_start, title_end, after)`.
-fn scan_title(bytes: &[u8], i: usize) -> Option<(usize, usize, usize)> {
-    let close = match bytes.get(i) {
-        Some(b'"') => b'"',
-        Some(b'\'') => b'\'',
-        Some(b'(') => b')',
-        _ => return None,
-    };
-    let mut j = i + 1;
-    loop {
-        match bytes.get(j) {
-            None => return None,
-            _ if is_escape(bytes, j) => j += 2,
-            Some(&b) if b == close => return Some((i + 1, j, j + 1)),
-            Some(b'\n') => {
-                if bytes.get(j + 1) == Some(&b'\n') {
-                    return None; // blank line inside a title is not allowed
+                    Some(b'(') => depth += 1,
+                    Some(b')') => {
+                        if depth == 0 {
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    Some(&b) if b < 0x20 => break,
+                    _ => {}
                 }
                 j += 1;
             }
-            _ => j += 1,
-        }
-    }
-}
-
-/// After a destination at `i`, try to parse a title that is separated from the
-/// destination by whitespace (possibly crossing one line ending).
-fn title_after(bytes: &[u8], i: usize) -> Option<(usize, usize, usize)> {
-    let after_ws = skip_ws_one_nl(bytes, i)?;
-    if after_ws == i {
-        return None; // a title must be separated from the destination
-    }
-    scan_title(bytes, after_ws)
-}
-
-/// Try to parse a link reference definition beginning at `start` (the `[`),
-/// with leading block indentation already stripped by the caller. Returns the
-/// definition and the byte offset at which parsing should resume.
-#[must_use]
-pub fn scan_link_def(input: &str, start: usize) -> Option<(LinkDef<'_>, usize)> {
-    let bytes = input.as_bytes();
-    if bytes.get(start) != Some(&b'[') {
-        return None;
-    }
-    let label_start = start + 1;
-    let mut i = label_start;
-    let label_end = loop {
-        match bytes.get(i) {
-            None => return None,
-            _ if is_escape(bytes, i) => i += 2,
-            Some(b'[') => return None,
-            Some(b']') => break i,
-            Some(b'\n') => {
-                if bytes.get(i + 1) == Some(&b'\n') {
-                    return None;
-                }
-                i += 1;
+            if j == start || depth != 0 {
+                return None;
             }
-            _ => i += 1,
+            Some((start, j, j))
         }
-    };
-    let label = input.get(label_start..label_end)?;
-    if label.len() > 999 || label.trim().is_empty() {
-        return None;
     }
-    i = label_end + 1;
-    if bytes.get(i) != Some(&b':') {
-        return None;
+
+    /// Scan a title at `i` delimited by `"`, `'`, or `(...)`.
+    /// Returns `(title_start, title_end, after)`.
+    fn scan_title(bytes: &[u8], i: usize) -> Option<(usize, usize, usize)> {
+        let close = match bytes.get(i) {
+            Some(b'"') => b'"',
+            Some(b'\'') => b'\'',
+            Some(b'(') => b')',
+            _ => return None,
+        };
+        let mut j = i + 1;
+        loop {
+            match bytes.get(j) {
+                None => return None,
+                _ if Self::is_escape(bytes, j) => j += 2,
+                Some(&b) if b == close => return Some((i + 1, j, j + 1)),
+                Some(b'\n') => {
+                    if bytes.get(j + 1) == Some(&b'\n') {
+                        return None; // blank line inside a title is not allowed
+                    }
+                    j += 1;
+                }
+                _ => j += 1,
+            }
+        }
     }
-    i += 1;
-    i = skip_ws_one_nl(bytes, i)?;
 
-    let (url_start, url_end, after_dest) = scan_destination(bytes, i)?;
-    let url = input.get(url_start..url_end)?;
+    /// After a destination at `i`, try to parse a title that is separated from
+    /// the destination by whitespace (possibly crossing one line ending).
+    fn title_after(bytes: &[u8], i: usize) -> Option<(usize, usize, usize)> {
+        let after_ws = Self::skip_ws_one_nl(bytes, i)?;
+        if after_ws == i {
+            return None; // a title must be separated from the destination
+        }
+        Self::scan_title(bytes, after_ws)
+    }
 
-    // A definition with no title requires the destination line to end cleanly.
-    let no_title_resume = line_end_resume(bytes, after_dest);
+    /// Try to parse a link reference definition beginning at `start` (the `[`),
+    /// with leading block indentation already stripped by the caller. Returns
+    /// the definition and the byte offset at which parsing should resume.
+    #[must_use]
+    pub fn scan(input: &'src str, start: usize) -> Option<(Self, usize)> {
+        let bytes = input.as_bytes();
+        if bytes.get(start) != Some(&b'[') {
+            return None;
+        }
+        let label_start = start + 1;
+        let mut i = label_start;
+        let label_end = loop {
+            match bytes.get(i) {
+                None => return None,
+                _ if Self::is_escape(bytes, i) => i += 2,
+                Some(b'[') => return None,
+                Some(b']') => break i,
+                Some(b'\n') => {
+                    if bytes.get(i + 1) == Some(&b'\n') {
+                        return None;
+                    }
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        };
+        let label = input.get(label_start..label_end)?;
+        if label.len() > 999 || label.trim().is_empty() {
+            return None;
+        }
+        i = label_end + 1;
+        if bytes.get(i) != Some(&b':') {
+            return None;
+        }
+        i += 1;
+        i = Self::skip_ws_one_nl(bytes, i)?;
 
-    if let Some((t_start, t_end, t_after)) = title_after(bytes, after_dest)
-        && let Some(resume) = line_end_resume(bytes, t_after)
-    {
-        return Some((
-            LinkDef {
+        let (url_start, url_end, after_dest) = Self::scan_destination(bytes, i)?;
+        let url = input.get(url_start..url_end)?;
+
+        // A definition with no title needs the destination line to end cleanly.
+        let no_title_resume = Self::line_end_resume(bytes, after_dest);
+
+        if let Some((t_start, t_end, t_after)) = Self::title_after(bytes, after_dest)
+            && let Some(resume) = Self::line_end_resume(bytes, t_after)
+        {
+            return Some((
+                Self {
+                    label,
+                    url,
+                    title: input.get(t_start..t_end),
+                },
+                resume,
+            ));
+        }
+
+        let resume = no_title_resume?;
+        Some((
+            Self {
                 label,
                 url,
-                title: input.get(t_start..t_end),
+                title: None,
             },
             resume,
-        ));
+        ))
     }
-
-    let resume = no_title_resume?;
-    Some((
-        LinkDef {
-            label,
-            url,
-            title: None,
-        },
-        resume,
-    ))
 }

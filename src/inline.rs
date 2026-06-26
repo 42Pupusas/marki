@@ -1,6 +1,6 @@
 use crate::OffsetExt;
 use crate::SpecialChar;
-use crate::link_def::{LinkDefs, normalize_label_cow};
+use crate::link_def::{LinkDefs, LinkLabel};
 use crate::section::InlineSpan;
 use crate::simd::{ByteSet, ByteSliceExt};
 
@@ -1703,7 +1703,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         // `normalize_label_cow` borrows the label when it is already in
         // normalized form (the common case), so the hash lookup allocates only
         // for labels that genuinely need case folding or whitespace collapse.
-        self.defs.get(normalize_label_cow(label).as_ref()).copied()
+        self.defs.get(label.normalize_label_cow().as_ref()).copied()
     }
 
     #[inline]
