@@ -128,6 +128,72 @@ impl<'src> Scratch<'src> {
 
 /// Mutable parsing context for pass 1. Only collects raw sections — no inline
 /// pool or span pool needed.
+/// Recyclable scratch buffers for one [`ParseCtx`]. These are all pass-1
+/// intermediates — built while scanning blocks, consumed by pass-2 inline
+/// resolution, then thrown away. Because they never escape into the returned
+/// [`MarkdownFile`], they can be pooled across parses (see [`CTX_POOL`]):
+/// `MarkdownFile::parse` checks a set out, hands it to [`block_pass`], and
+/// checks it back in cleared. On a corpus of many small documents this turns
+/// six heap allocate-and-free cycles *per document* into zero after the first.
+#[derive(Default)]
+struct ParseScratch<'src> {
+    sections: Vec<RawSection<'src>>,
+    lines: Vec<&'src str>,
+    lazy: Vec<bool>,
+    pad: Vec<u8>,
+    list_items: Vec<ItemMeta>,
+    defs: LinkDefs<'src>,
+}
+
+impl ParseScratch<'_> {
+    /// Empty every buffer, dropping all borrowed `&'src` references so the set
+    /// holds no lifetime-bound data and can be safely re-typed to `'static`
+    /// when returned to the pool.
+    fn reset(&mut self) {
+        self.sections.clear();
+        self.lines.clear();
+        self.lazy.clear();
+        self.pad.clear();
+        self.list_items.clear();
+        self.defs.clear();
+    }
+}
+
+thread_local! {
+    /// Free-list of [`ParseScratch`] buffer sets, reused across `parse` calls
+    /// to amortize their `Vec`/`HashMap` allocations. A `Vec` (not a single
+    /// slot) so re-entrant parsing — should it ever occur — borrows distinct
+    /// sets rather than clobbering one. Mirrors `inline::ARENA_POOL`.
+    static CTX_POOL: std::cell::RefCell<Vec<ParseScratch<'static>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Check a cleared [`ParseScratch`] out of the thread-local pool, allocating a
+/// fresh one only when the pool is empty.
+///
+/// SAFETY: the pool stores `ParseScratch<'static>`; we hand back a
+/// `ParseScratch<'src>`. The layout is identical for every lifetime (the
+/// lifetime only constrains the borrowed `&str`s the buffers hold), and the
+/// set is returned via [`checkin_scratch`] only after [`ParseScratch::reset`]
+/// has dropped every `'src` reference, so the pool never observes a dangling
+/// borrow.
+fn checkout_scratch<'src>() -> ParseScratch<'src> {
+    let scratch: ParseScratch<'static> =
+        CTX_POOL.with(|p| p.borrow_mut().pop()).unwrap_or_default();
+    unsafe { std::mem::transmute::<ParseScratch<'static>, ParseScratch<'src>>(scratch) }
+}
+
+/// Reset `scratch` (dropping all `'src` borrows) and return it to the pool as
+/// `'static` for the next parse to reuse.
+fn checkin_scratch(mut scratch: ParseScratch<'_>) {
+    scratch.reset();
+    // SAFETY: `reset` emptied every buffer, so no `'src` reference remains;
+    // re-typing the now-borrow-free set to `'static` is sound.
+    let scratch: ParseScratch<'static> =
+        unsafe { std::mem::transmute::<ParseScratch<'_>, ParseScratch<'static>>(scratch) };
+    CTX_POOL.with(|p| p.borrow_mut().push(scratch));
+}
+
 struct ParseCtx<'src> {
     input: &'src str,
     bytes: &'src [u8],
@@ -1500,7 +1566,9 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     #[must_use]
     pub fn parse(input: &'src str) -> Self {
         // --- Pass 1: block-level parsing (no inline work) ---
-        let ctx = ParseCtx::block_pass(input);
+        // Borrow recycled scratch buffers from the thread-local pool; pass 1
+        // fills them, pass 2 reads them, then they go back cleared.
+        let ctx = ParseCtx::block_pass(input, checkout_scratch());
 
         // --- Pass 2: inline parsing ---
         // Pre-size the pools from pass-1 counts so large container-heavy
@@ -1513,6 +1581,27 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
         let mut section_pool = Vec::with_capacity(ctx.list_items.len().saturating_mul(2));
         let mut line_pool = Vec::new();
         let sections = Self::resolve_inlines(&ctx, &mut pool, &mut section_pool, &mut line_pool);
+
+        // Return the scratch buffers to the thread-local pool (reset clears the
+        // `'src` borrows) so the next parse on this thread reuses their
+        // capacity instead of re-allocating.
+        let ParseCtx {
+            sections: ctx_sections,
+            lines,
+            lazy,
+            pad,
+            list_items,
+            defs,
+            ..
+        } = ctx;
+        checkin_scratch(ParseScratch {
+            sections: ctx_sections,
+            lines,
+            lazy,
+            pad,
+            list_items,
+            defs,
+        });
 
         Self {
             sections,
@@ -1533,22 +1622,28 @@ impl<'src> ParseCtx<'src> {
     /// [`MarkdownFile`] type never touches the `Accumulator`/`RawSection`
     /// intermediates.
     #[allow(clippy::too_many_lines)]
-    fn block_pass(input: &'src str) -> Self {
+    fn block_pass(input: &'src str, scratch: ParseScratch<'src>) -> Self {
         let bytes = input.as_bytes();
+        // Adopt the recycled (already-cleared) buffers from the thread-local
+        // pool. After the first parse on a thread these arrive with capacity
+        // intact, so pass 1 fills them without touching the allocator.
+        let ParseScratch {
+            sections,
+            lines,
+            lazy,
+            pad,
+            list_items,
+            defs,
+        } = scratch;
         let mut ctx = ParseCtx {
             input,
             bytes,
-            // Rough heuristic: ~50 bytes per section on average.
-            sections: Vec::with_capacity(input.len() / 50 + 1),
-            // `lines`/`lazy`/`pad` are only populated on the container path
-            // (blockquotes & list items). The majority of real-world documents
-            // are flat, so allocate these lazily — an empty `Vec` never touches
-            // the allocator, and the container path grows them amortized-O(1).
-            lines: Vec::new(),
-            lazy: Vec::new(),
-            pad: Vec::new(),
-            list_items: Vec::new(),
-            defs: LinkDefs::new(),
+            sections,
+            lines,
+            lazy,
+            pad,
+            list_items,
+            defs,
         };
         let mut acc = Accumulator::Empty;
         let mut pos = 0;
