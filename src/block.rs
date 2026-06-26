@@ -924,6 +924,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                         .get(items_start as usize..(items_start + items_len) as usize)
                         .unwrap_or(&[]);
                     let list = Self::assemble_list(
+                        ctx.input,
                         metas,
                         lines,
                         &ctx.lazy,
@@ -947,6 +948,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     let raw_lazy = ctx.lazy.get(span.clone()).unwrap_or(&[]);
                     let raw_pad = ctx.pad.get(span).unwrap_or(&[]);
                     let children = Self::resolve_blocks(
+                        ctx.input,
                         raw_lines,
                         raw_lazy,
                         raw_pad,
@@ -976,6 +978,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     /// together — no item-boundary or content-column work is repeated.
     #[allow(clippy::too_many_arguments)]
     fn assemble_list(
+        input: &'src str,
         metas: &[ItemMeta],
         lines: &[&'src str],
         lazy: &[bool],
@@ -1001,7 +1004,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 children: SectionRange::EMPTY,
             });
             let range = Self::resolve_blocks(
-                item_lines, item_lazy, item_pad, pool, section_pool, line_pool, scratch, defs,
+                input, item_lines, item_lazy, item_pad, pool, section_pool, line_pool, scratch, defs,
             );
             section_pool[item_at] = Section::ListItem { children: range };
         }
@@ -1028,6 +1031,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     /// nested blockquotes, and nested lists.
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn resolve_blocks(
+        input: &'src str,
         lines: &[&'src str],
         lazy: &[bool],
         pad: &[u8],
@@ -1067,7 +1071,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
             let b = line.as_bytes();
 
             if b.iter().all(u8::is_ascii_whitespace) {
-                Self::flush_para(&mut para, section_pool, pool, defs);
+                Self::flush_para(input, &mut para, section_pool, pool, defs);
                 i += 1;
                 continue;
             }
@@ -1134,7 +1138,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
             if ind_cols <= 3 {
                 // Nested blockquote: collect the run and recurse.
                 if body.first() == SpecialChar::GreaterThan {
-                    Self::flush_para(&mut para, section_pool, pool, defs);
+                    Self::flush_para(input, &mut para, section_pool, pool, defs);
                     let mut nested = scratch.take_lines();
                     // `last_para` tracks whether the previous collected line is
                     // paragraph content that a following marker-less line may
@@ -1189,6 +1193,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     // pad (that lives only on the top-level container's pooled
                     // lines); an empty pad slice reads as all-zero.
                     let range = Self::resolve_blocks(
+                        input,
                         &nested,
                         &nested_lazy,
                         &[],
@@ -1207,7 +1212,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 if body.first() == SpecialChar::Hash
                     && let Some((level, text)) = body.try_parse_heading(line, ind)
                 {
-                    Self::flush_para(&mut para, section_pool, pool, defs);
+                    Self::flush_para(input, &mut para, section_pool, pool, defs);
                     let content =
                         InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_configured(
                             text, pool, defs,
@@ -1219,7 +1224,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
 
                 // Fenced code block.
                 if let Some((fence_char, fence_len)) = body.code_fence_opening() {
-                    Self::flush_para(&mut para, section_pool, pool, defs);
+                    Self::flush_para(input, &mut para, section_pool, pool, defs);
                     let language = Self::fence_language(line, ind, fence_len);
                     let code_start = line_pool.len().pool_offset();
                     i += 1;
@@ -1249,7 +1254,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     && let Some(kind) =
                         crate::raw_html::html_block_start(body, !para.is_empty())
                 {
-                    Self::flush_para(&mut para, section_pool, pool, defs);
+                    Self::flush_para(input, &mut para, section_pool, pool, defs);
                     let html_start = line_pool.len().pool_offset();
                     i += Self::collect_html_block(&lines[i..], kind, line_pool);
                     let len = line_pool.len().pool_offset() - html_start;
@@ -1271,7 +1276,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     // `para` already holds trimmed lines, so no further copy.
                     let content =
                         InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_lines_configured(
-                            &para, pool, defs,
+                            input, &para, pool, defs,
                         );
                     section_pool.push(Section::Heading { level, content });
                     para.clear();
@@ -1281,7 +1286,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
 
                 // Thematic break.
                 if body.is_horizontal_rule() {
-                    Self::flush_para(&mut para, section_pool, pool, defs);
+                    Self::flush_para(input, &mut para, section_pool, pool, defs);
                     section_pool.push(Section::HorizontalRule);
                     i += 1;
                     continue;
@@ -1294,8 +1299,9 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     && body.list_marker().is_some()
                     && !lazy.get(i).copied().unwrap_or(false)
                 {
-                    Self::flush_para(&mut para, section_pool, pool, defs);
+                    Self::flush_para(input, &mut para, section_pool, pool, defs);
                     let consumed = Self::build_list(
+                        input,
                         &lines[i..],
                         &lazy[i..],
                         pad.get(i..).unwrap_or(&[]),
@@ -1316,7 +1322,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
             i += 1;
         }
 
-        Self::flush_para(&mut para, section_pool, pool, defs);
+        Self::flush_para(input, &mut para, section_pool, pool, defs);
 
         scratch.give_lines(para);
         let len = section_pool.len().pool_offset() - start;
@@ -1363,6 +1369,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     /// Flush pending paragraph lines into one [`Section::Paragraph`] appended
     /// to the section pool, joining multiple lines with soft breaks.
     fn flush_para(
+        input: &'src str,
         para: &mut Vec<&'src str>,
         section_pool: &mut Vec<Section<'src>>,
         pool: &mut Vec<Inline<'src>>,
@@ -1372,7 +1379,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
             return;
         }
         let content = InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_lines_configured(
-            para, pool, defs,
+            input, para, pool, defs,
         );
         section_pool.push(Section::Paragraph { content });
         para.clear();
@@ -1402,6 +1409,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     /// lines consumed.
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn build_list(
+        input: &'src str,
         lines: &[&'src str],
         lazy: &[bool],
         pad: &[u8],
@@ -1539,7 +1547,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 children: SectionRange::EMPTY,
             });
             let range = Self::resolve_blocks(
-                &item, &item_lazy, &[], pool, section_pool, line_pool, scratch, defs,
+                input, &item, &item_lazy, &[], pool, section_pool, line_pool, scratch, defs,
             );
             section_pool[item_at] = Section::ListItem { children: range };
         }

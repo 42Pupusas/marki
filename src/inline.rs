@@ -93,21 +93,30 @@ static EMPH_ONLY_SET: ByteSet =
 /// Sentinel for "no node / no link" in the index-based linked lists.
 const NIL: i32 = -1;
 
-/// If `a` and `b` are adjacent slices of the same backing string, return the
-/// single slice spanning both (`a` immediately followed by `b`). Used to merge
-/// split text fragments — e.g. an unmatched `*` delimiter and the word after
-/// it — back into one `Text` node so the inline pool stays compact.
-fn contiguous_merge<'src>(a: &'src str, b: &'src str) -> Option<&'src str> {
-    let a_end = a.as_ptr() as usize + a.len();
-    if a_end == b.as_ptr() as usize {
-        // SAFETY: a and b are contiguous slices of the same allocation, so the
-        // combined range is a valid UTF-8 slice of that original `&str`.
-        Some(unsafe {
-            std::str::from_utf8_unchecked(std::slice::from_raw_parts(a.as_ptr(), a.len() + b.len()))
-        })
-    } else {
-        None
+/// If `a` and `b` are adjacent slices that both lie within `src`, return the
+/// single sub-slice of `src` spanning both (`a` immediately followed by `b`).
+/// Used to merge split text fragments — e.g. an unmatched `*` delimiter and the
+/// word after it — back into one `Text` node so the inline pool stays compact.
+///
+/// The merged slice is re-derived from `src`, which has provenance over the
+/// whole inline context, rather than from `a`'s pointer (whose borrow only
+/// covers `a`'s own bytes — reading past it into `b` is undefined behaviour
+/// under Stacked Borrows). All addresses are compared as integers, never
+/// dereferenced, so a stray slice from another allocation simply fails the
+/// containment check and is left unmerged.
+fn contiguous_merge<'src>(src: &'src str, a: &'src str, b: &'src str) -> Option<&'src str> {
+    let base = src.as_ptr() as usize;
+    let a_start = (a.as_ptr() as usize).checked_sub(base)?;
+    // `a` and `b` must be immediately adjacent...
+    if a.as_ptr() as usize + a.len() != b.as_ptr() as usize {
+        return None;
     }
+    // ...and the combined run must lie entirely within `src`.
+    let total = a.len() + b.len();
+    if a_start + total > src.len() {
+        return None;
+    }
+    src.get(a_start..a_start + total)
 }
 
 /// A node in the inline list processed by the emphasis resolver.
@@ -156,6 +165,11 @@ struct EmphDelim {
 struct EmphArena<'src> {
     nodes: Vec<EmphNode<'src>>,
     delims: Vec<EmphDelim>,
+    /// Backing inline-context string that every `Text` node slices from. Used
+    /// to re-derive merged text runs with whole-context provenance (see
+    /// [`contiguous_merge`]). Empty between parses so the `'static` pool never
+    /// retains a borrow.
+    src: &'src str,
     /// Reusable post-order emit stack (see [`EmphArena::emit_list`]).
     scratch: Vec<Inline<'src>>,
     /// Head/tail of the top-level node list.
@@ -208,6 +222,7 @@ impl<'src> EmphArena<'src> {
     fn reset(&mut self) {
         self.nodes.clear();
         self.delims.clear();
+        self.src = "";
         self.head = NIL;
         self.tail = NIL;
         self.delim_top = NIL;
@@ -453,6 +468,7 @@ impl<'src> EmphArena<'src> {
     /// the frame finishes it bulk-copies its markers from `scratch` to `pool`,
     /// keeping every level's run contiguous — the pool's post-order invariant.
     fn emit_list(&mut self, head: i32, pool: &mut Vec<Inline<'src>>) -> InlineSpan {
+        let src = self.src;
         let mark = self.scratch.len();
         let mut t = head;
         // Tracks whether the last pushed scratch entry is a backslash-escaped
@@ -473,7 +489,7 @@ impl<'src> EmphArena<'src> {
                         // the following word), keeping the pool compact.
                         if !last_is_escaped
                             && let Some(Inline::Text(prev)) = self.scratch.last_mut()
-                            && let Some(merged) = contiguous_merge(prev, s)
+                            && let Some(merged) = contiguous_merge(src, prev, s)
                         {
                             *prev = merged;
                         } else {
@@ -706,6 +722,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
     /// land in the pool *below* the top-level run — the span returned covers
     /// only the top-level elements, never their nested children.
     pub(crate) fn parse_lines_configured(
+        input: &'src str,
         lines: &[&'src str],
         pool: &'pool mut Vec<Inline<'src>>,
         defs: &'pool LinkDefs<'src>,
@@ -718,7 +735,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             .iter()
             .any(|l| l.as_bytes().find_byte_set(0, &EMPH_ONLY_SET).is_some());
         if any_emph {
-            return with_arena(|arena| Self::parse_lines_into_arena(lines, arena, pool, defs));
+            return with_arena(|arena| Self::parse_lines_into_arena(input, lines, arena, pool, defs));
         }
         let mut buf = InlineBuf::<CAP>::new();
         for (idx, line) in lines.iter().enumerate() {
@@ -744,12 +761,19 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
     /// Parse multiple soft-break-joined lines into one [`EmphArena`], so a
     /// single emphasis run can span line boundaries, then emit to the pool.
     fn parse_lines_into_arena(
+        input: &'src str,
         lines: &[&'src str],
         arena: &mut EmphArena<'src>,
         pool: &'pool mut Vec<Inline<'src>>,
         defs: &'pool LinkDefs<'src>,
     ) -> InlineSpan {
         arena.reset();
+        // Every collected line is a sub-slice of the document `input`, so it is
+        // the covering slice with provenance over all of them — the slice a
+        // within-line text merge re-derives its combined run from. (A merge
+        // never crosses a line boundary: consecutive lines are separated by a
+        // `SoftBreak`, which is `Resolved` and never a mergeable `Text`.)
+        arena.src = input;
         for (idx, line) in lines.iter().enumerate() {
             if idx > 0 {
                 arena.push_node(EmphKind::Resolved(Inline::SoftBreak));
@@ -1072,6 +1096,9 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         depth: u8,
     ) -> InlineSpan {
         arena.reset();
+        // Single inline context: every `Text` node slices from `self.input`,
+        // so it is the covering slice for contiguous-text merging.
+        arena.src = self.input;
         self.scan_line_into_arena(bytes, arena, depth);
         // Drop a dangling trailing break for paragraph reflow.
         if self.strip_lines

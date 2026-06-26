@@ -10,10 +10,12 @@ fn walk(md: &MarkdownFile<'_>, sections: &[Section<'_>]) {
     for section in sections {
         match section {
             Section::UnorderedList { items, .. } | Section::OrderedList { items, .. } => {
-                walk(md, md.child_sections(*items));
+                let kids: Vec<Section<'_>> = md.child_sections(*items).cloned().collect();
+                walk(md, &kids);
             }
             Section::ListItem { children } | Section::Blockquote { children } => {
-                walk(md, md.child_sections(*children));
+                let kids: Vec<Section<'_>> = md.child_sections(*children).cloned().collect();
+                walk(md, &kids);
             }
             Section::Heading { content, .. } | Section::Paragraph { content } => {
                 let _ = md.inlines(*content);
