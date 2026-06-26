@@ -1536,9 +1536,13 @@ impl<'src> ParseCtx<'src> {
             bytes,
             // Rough heuristic: ~50 bytes per section on average.
             sections: Vec::with_capacity(input.len() / 50 + 1),
-            lines: Vec::with_capacity(input.len() / 80 + 1),
-            lazy: Vec::with_capacity(input.len() / 80 + 1),
-            pad: Vec::with_capacity(input.len() / 80 + 1),
+            // `lines`/`lazy`/`pad` are only populated on the container path
+            // (blockquotes & list items). The majority of real-world documents
+            // are flat, so allocate these lazily — an empty `Vec` never touches
+            // the allocator, and the container path grows them amortized-O(1).
+            lines: Vec::new(),
+            lazy: Vec::new(),
+            pad: Vec::new(),
             list_items: Vec::new(),
             defs: LinkDefs::new(),
         };
