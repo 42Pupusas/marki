@@ -38,6 +38,87 @@ impl Entity {
             Self::Str(s) => EntityChars::Many(s.chars()),
         }
     }
+
+    /// Try to decode any character reference whose `&` is at `rest[0]`.
+    ///
+    /// Returns the decoded [`Entity`] and the number of bytes consumed
+    /// (including the leading `&` and trailing `;`), or `None` when `rest` is
+    /// not a well-formed reference (the caller then treats the `&` as literal).
+    pub fn decode(rest: &[u8]) -> Option<(Self, usize)> {
+        if rest.first() != Some(&b'&') {
+            return None;
+        }
+        if rest.get(1) == Some(&b'#') {
+            Self::decode_numeric(rest).map(|(c, n)| (Self::Char(c), n))
+        } else {
+            Self::decode_named(rest)
+        }
+    }
+
+    /// Decode a named reference (`&name;`) by looking `name` up in the WHATWG
+    /// table. The body is one or more ASCII alphanumerics terminated by `;`.
+    fn decode_named(rest: &[u8]) -> Option<(Self, usize)> {
+        // rest[0] is '&'; scan the alphanumeric body.
+        let mut i = 1;
+        while i < rest.len() && i <= MAX_NAMED_LEN && rest[i].is_ascii_alphanumeric() {
+            i += 1;
+        }
+        // Need at least one body byte and a terminating ';'.
+        if i == 1 || rest.get(i) != Some(&b';') {
+            return None;
+        }
+        let value = crate::entities_table::get_entity(&rest[1..i])?;
+        Some((Self::Str(value), i + 1))
+    }
+
+    /// Try to decode a numeric character reference whose `&` is at `rest[0]`.
+    ///
+    /// Returns the decoded [`char`] and the number of bytes consumed (including
+    /// the leading `&` and trailing `;`) on success, or `None` when `rest` is
+    /// not a well-formed numeric reference (the caller then treats the `&` as
+    /// literal).
+    ///
+    /// A syntactically valid reference to an invalid code point (zero, a
+    /// surrogate, or beyond `U+10FFFF`) decodes to the replacement character
+    /// `U+FFFD`, matching the reference implementation.
+    pub fn decode_numeric(rest: &[u8]) -> Option<(char, usize)> {
+        if rest.first() != Some(&b'&') || rest.get(1) != Some(&b'#') {
+            return None;
+        }
+        let (radix, digits_start, max_digits) = match rest.get(2) {
+            Some(b'x' | b'X') => (16u32, 3, MAX_HEX_DIGITS),
+            _ => (10, 2, MAX_DEC_DIGITS),
+        };
+
+        let mut i = digits_start;
+        let mut value: u32 = 0;
+        let mut count = 0;
+        while let Some(&b) = rest.get(i) {
+            let digit = match b {
+                b'0'..=b'9' => u32::from(b - b'0'),
+                b'a'..=b'f' if radix == 16 => u32::from(b - b'a') + 10,
+                b'A'..=b'F' if radix == 16 => u32::from(b - b'A') + 10,
+                _ => break,
+            };
+            value = value.saturating_mul(radix).saturating_add(digit);
+            count += 1;
+            i += 1;
+            if count > max_digits {
+                return None;
+            }
+        }
+
+        if count == 0 || rest.get(i) != Some(&b';') {
+            return None;
+        }
+        i += 1; // consume ';'
+
+        let ch = match value {
+            0 => '\u{FFFD}',
+            v => char::from_u32(v).unwrap_or('\u{FFFD}'),
+        };
+        Some((ch, i))
+    }
 }
 
 /// Iterator over an [`Entity`]'s scalar values (one for numeric, one or two for
@@ -57,96 +138,16 @@ impl Iterator for EntityChars {
     }
 }
 
-/// Try to decode any character reference whose `&` is at `rest[0]`.
-///
-/// Returns the decoded [`Entity`] and the number of bytes consumed (including
-/// the leading `&` and trailing `;`), or `None` when `rest` is not a
-/// well-formed reference (the caller then treats the `&` as literal).
-pub fn decode_entity(rest: &[u8]) -> Option<(Entity, usize)> {
-    if rest.first() != Some(&b'&') {
-        return None;
-    }
-    if rest.get(1) == Some(&b'#') {
-        decode_numeric(rest).map(|(c, n)| (Entity::Char(c), n))
-    } else {
-        decode_named(rest)
-    }
-}
-
-/// Decode a named reference (`&name;`) by looking `name` up in the WHATWG
-/// table. The body is one or more ASCII alphanumerics terminated by `;`.
-fn decode_named(rest: &[u8]) -> Option<(Entity, usize)> {
-    // rest[0] is '&'; scan the alphanumeric body.
-    let mut i = 1;
-    while i < rest.len() && i <= MAX_NAMED_LEN && rest[i].is_ascii_alphanumeric() {
-        i += 1;
-    }
-    // Need at least one body byte and a terminating ';'.
-    if i == 1 || rest.get(i) != Some(&b';') {
-        return None;
-    }
-    let value = crate::entities_table::get_entity(&rest[1..i])?;
-    Some((Entity::Str(value), i + 1))
-}
-
-/// Try to decode a numeric character reference whose `&` is at `rest[0]`.
-///
-/// Returns the decoded [`char`] and the number of bytes consumed (including the
-/// leading `&` and trailing `;`) on success, or `None` when `rest` is not a
-/// well-formed numeric reference (the caller then treats the `&` as literal).
-///
-/// A syntactically valid reference to an invalid code point (zero, a surrogate,
-/// or beyond `U+10FFFF`) decodes to the replacement character `U+FFFD`, matching
-/// the reference implementation (e.g. `&#0;` → `�`).
-pub fn decode_numeric(rest: &[u8]) -> Option<(char, usize)> {
-    if rest.first() != Some(&b'&') || rest.get(1) != Some(&b'#') {
-        return None;
-    }
-    let (radix, digits_start, max_digits) = match rest.get(2) {
-        Some(b'x' | b'X') => (16u32, 3, MAX_HEX_DIGITS),
-        _ => (10, 2, MAX_DEC_DIGITS),
-    };
-
-    let mut i = digits_start;
-    let mut value: u32 = 0;
-    let mut count = 0;
-    while let Some(&b) = rest.get(i) {
-        let digit = match b {
-            b'0'..=b'9' => u32::from(b - b'0'),
-            b'a'..=b'f' if radix == 16 => u32::from(b - b'a') + 10,
-            b'A'..=b'F' if radix == 16 => u32::from(b - b'A') + 10,
-            _ => break,
-        };
-        value = value.saturating_mul(radix).saturating_add(digit);
-        count += 1;
-        i += 1;
-        if count > max_digits {
-            return None;
-        }
-    }
-
-    if count == 0 || rest.get(i) != Some(&b';') {
-        return None;
-    }
-    i += 1; // consume ';'
-
-    let ch = match value {
-        0 => '\u{FFFD}',
-        v => char::from_u32(v).unwrap_or('\u{FFFD}'),
-    };
-    Some((ch, i))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Entity, decode_entity, decode_numeric};
+    use super::Entity;
 
     fn dec(s: &str) -> Option<(char, usize)> {
-        decode_numeric(s.as_bytes())
+        Entity::decode_numeric(s.as_bytes())
     }
 
     fn ent(s: &str) -> Option<(Entity, usize)> {
-        decode_entity(s.as_bytes())
+        Entity::decode(s.as_bytes())
     }
 
     #[test]
