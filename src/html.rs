@@ -15,22 +15,31 @@ use crate::{Inline, InlineSpan, MarkdownFile, Section};
 /// single leading and trailing space. Finally HTML-escape. Entities and
 /// backslashes are *not* interpreted inside a code span.
 fn escape_code_span(s: &str, out: &mut String) {
-    // Step 1: collapse line endings to spaces into a scratch buffer.
-    let mut buf = String::with_capacity(s.len());
-    for ch in s.chars() {
-        buf.push(if ch == '\n' { ' ' } else { ch });
-    }
+    // Step 1: collapse line endings to spaces. The overwhelmingly common case
+    // is a span with no newline at all, so avoid the scratch allocation
+    // entirely then and borrow the source directly. Only when a newline is
+    // present do we materialize a collapsed copy.
+    let collapsed: std::borrow::Cow<'_, str> = if s.as_bytes().contains(&b'\n') {
+        let mut buf = String::with_capacity(s.len());
+        for ch in s.chars() {
+            buf.push(if ch == '\n' { ' ' } else { ch });
+        }
+        std::borrow::Cow::Owned(buf)
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    };
 
     // Step 2: strip one leading + trailing space, but only when the content is
     // not made up entirely of spaces (`` `  ` `` keeps both spaces).
-    let trimmed = if buf.len() >= 2
-        && buf.starts_with(' ')
-        && buf.ends_with(' ')
-        && buf.bytes().any(|b| b != b' ')
+    let bytes = collapsed.as_bytes();
+    let trimmed = if bytes.len() >= 2
+        && bytes.first() == Some(&b' ')
+        && bytes.last() == Some(&b' ')
+        && bytes.iter().any(|&b| b != b' ')
     {
-        &buf[1..buf.len() - 1]
+        &collapsed[1..collapsed.len() - 1]
     } else {
-        &buf[..]
+        &collapsed[..]
     };
 
     escape_html(trimmed, out);
@@ -281,7 +290,13 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     /// compared directly against the spec test vectors.
     #[must_use]
     pub fn to_html(&self) -> String {
-        let mut out = String::new();
+        // Pre-size the output to avoid doubling from zero on large documents.
+        // Rendered HTML is typically a small multiple of the source length
+        // (tags, escapes); reserving ~1.5x the inline-pool-implied size covers
+        // the common case in one allocation while staying modest for small
+        // inputs. The estimate keys off the section count plus inline volume.
+        let estimate = 64 + self.pool.len() * 8 + self.sections.len() * 16;
+        let mut out = String::with_capacity(estimate);
         for section in &self.sections {
             self.render_section(section, &mut out);
         }
