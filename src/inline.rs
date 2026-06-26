@@ -186,23 +186,41 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+impl EmphArena<'_> {
+    /// Re-type an emptied arena to a different lifetime, recycling each buffer's
+    /// heap allocation via [`crate::reuse_alloc`]. Every `Vec` is cleared first
+    /// (dropping all borrowed elements), so no borrow of the old lifetime
+    /// survives into the result. This is the safe replacement for the lifetime
+    /// `transmute` the pooled arena used to require.
+    fn relifetime<'dst>(self) -> EmphArena<'dst> {
+        EmphArena {
+            nodes: crate::reuse_alloc(self.nodes),
+            delims: crate::reuse_alloc(self.delims),
+            src: "",
+            scratch: crate::reuse_alloc(self.scratch),
+            head: NIL,
+            tail: NIL,
+            delim_top: NIL,
+        }
+    }
+}
+
 /// Run `f` with a recycled [`EmphArena`], returning it to the thread-local pool
-/// afterwards. The arena is cleared before use and before return, so no `'src`
-/// references ever persist in the `'static` pool.
+/// afterwards. Buffers are recycled across the lifetime boundary by
+/// [`EmphArena::relifetime`] (which clears them), so no `'src` reference ever
+/// persists in the `'static` pool, and no `unsafe` is involved.
 fn with_arena<'src, R>(f: impl FnOnce(&mut EmphArena<'src>) -> R) -> R {
-    let mut arena: EmphArena<'static> = ARENA_POOL
+    // Check out a pooled arena and re-type it to `'src`, reusing its
+    // allocations. Both callers `reset()` the arena before filling it, so we
+    // hand over the cleared buffers as-is.
+    let mut arena: EmphArena<'src> = ARENA_POOL
         .with(|p| p.borrow_mut().pop())
-        .unwrap_or_default();
-    arena.reset();
-    // SAFETY: `EmphArena<'a>` has the same layout for every `'a` (the lifetime
-    // only constrains the `&str`s it stores). We hand `f` a correctly-scoped
-    // `'src` borrow; on return the arena is reset (all `Vec`s emptied, dropping
-    // every `&'src str`) before it is moved back as `'static`, so the pool
-    // never observes a dangling reference.
-    let borrow: &mut EmphArena<'src> = unsafe { std::mem::transmute(&mut arena) };
-    let out = f(borrow);
-    arena.reset();
-    ARENA_POOL.with(|p| p.borrow_mut().push(arena));
+        .map_or_else(EmphArena::default, EmphArena::relifetime);
+    let out = f(&mut arena);
+    // Return it to the pool as `'static`, again recycling the allocations and
+    // dropping every `'src` borrow in the process.
+    let pooled: EmphArena<'static> = arena.relifetime();
+    ARENA_POOL.with(|p| p.borrow_mut().push(pooled));
     out
 }
 

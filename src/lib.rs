@@ -62,6 +62,28 @@ mod tests;
 
 pub use inline::Inline;
 
+/// Reuse an emptied `Vec`'s heap allocation under a type that differs only in a
+/// lifetime parameter (e.g. `Vec<Inline<'static>>` to `Vec<Inline<'src>>`).
+///
+/// This is the safe replacement for the lifetime-laundering `transmute`s that
+/// used to recycle borrow-bearing scratch buffers through `'static`
+/// thread-local pools. We clear the vector first (dropping every borrowed
+/// element), then run it through `into_iter().map(..).collect()`: the standard
+/// library's in-place-collect specialization reuses the *same* backing
+/// allocation when the source and destination element types share layout,
+/// which a lifetime-only difference always does. The mapping closure is never
+/// called because the vector is empty, so no element is ever produced or read.
+///
+/// Soundness does not depend on the specialization firing: if it ever did not,
+/// `collect` would simply allocate a fresh (empty) vector, a possible *perf*
+/// regression, never undefined behaviour. The allocation-tracking comparison
+/// benchmark guards against that.
+#[inline]
+pub(crate) fn reuse_alloc<A, B>(mut v: Vec<A>) -> Vec<B> {
+    v.clear();
+    v.into_iter().map(|_| unreachable!("vec was cleared")).collect()
+}
+
 /// Convert collection lengths into the `u32` offsets used by spans.
 pub(crate) trait OffsetExt {
     fn pool_offset(self) -> u32;

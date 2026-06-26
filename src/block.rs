@@ -169,29 +169,44 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+impl ParseScratch<'_> {
+    /// Re-type an emptied scratch set to a different lifetime, recycling each
+    /// `Vec`'s heap allocation via [`crate::reuse_alloc`] (which clears it,
+    /// dropping every borrowed element). The `defs` map cannot reuse its
+    /// allocation across the lifetime change (`HashMap` has no in-place
+    /// re-collect), so it is replaced with a fresh empty map; this allocates
+    /// nothing in the common case (a document with no link definitions never
+    /// populates the table). This is the safe replacement for the lifetime
+    /// `transmute` the pooled scratch set used to require.
+    fn relifetime<'dst>(self) -> ParseScratch<'dst> {
+        ParseScratch {
+            sections: crate::reuse_alloc(self.sections),
+            lines: crate::reuse_alloc(self.lines),
+            lazy: self.lazy,
+            pad: self.pad,
+            list_items: self.list_items,
+            defs: LinkDefs::default(),
+        }
+    }
+}
+
 /// Check a cleared [`ParseScratch`] out of the thread-local pool, allocating a
-/// fresh one only when the pool is empty.
-///
-/// SAFETY: the pool stores `ParseScratch<'static>`; we hand back a
-/// `ParseScratch<'src>`. The layout is identical for every lifetime (the
-/// lifetime only constrains the borrowed `&str`s the buffers hold), and the
-/// set is returned via [`checkin_scratch`] only after [`ParseScratch::reset`]
-/// has dropped every `'src` reference, so the pool never observes a dangling
-/// borrow.
+/// fresh one only when the pool is empty. Buffers are recycled across the
+/// lifetime boundary by [`ParseScratch::relifetime`] (which clears them), so no
+/// `'src` reference is ever fabricated and no `unsafe` is involved.
 fn checkout_scratch<'src>() -> ParseScratch<'src> {
-    let scratch: ParseScratch<'static> =
-        CTX_POOL.with(|p| p.borrow_mut().pop()).unwrap_or_default();
-    unsafe { std::mem::transmute::<ParseScratch<'static>, ParseScratch<'src>>(scratch) }
+    CTX_POOL
+        .with(|p| p.borrow_mut().pop())
+        .map_or_else(ParseScratch::default, ParseScratch::relifetime)
 }
 
 /// Reset `scratch` (dropping all `'src` borrows) and return it to the pool as
 /// `'static` for the next parse to reuse.
 fn checkin_scratch(mut scratch: ParseScratch<'_>) {
     scratch.reset();
-    // SAFETY: `reset` emptied every buffer, so no `'src` reference remains;
-    // re-typing the now-borrow-free set to `'static` is sound.
-    let scratch: ParseScratch<'static> =
-        unsafe { std::mem::transmute::<ParseScratch<'_>, ParseScratch<'static>>(scratch) };
+    // Recycle the allocations across the lifetime boundary; `relifetime` clears
+    // every buffer, so no `'src` reference survives into the `'static` pool.
+    let scratch: ParseScratch<'static> = scratch.relifetime();
     CTX_POOL.with(|p| p.borrow_mut().push(scratch));
 }
 
