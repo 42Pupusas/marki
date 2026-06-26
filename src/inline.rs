@@ -1,5 +1,3 @@
-use std::mem::MaybeUninit;
-
 use crate::OffsetExt;
 use crate::SpecialChar;
 use crate::link_def::{LinkDefs, normalize_label_cow};
@@ -577,11 +575,16 @@ impl CharClass {
 }
 
 /// Stack-allocated buffer for collecting inline elements without heap allocation.
-/// Uses `MaybeUninit` to avoid zeroing the stack array on every parse call.
 /// The capacity `CAP` is configurable via `MarkdownFile`'s `INLINE_STACK_CAP`
 /// const generic — falls back to heap if exceeded.
+///
+/// `Inline` is `Copy` with a cheap unit variant ([`Inline::SoftBreak`]), so the
+/// inline storage is a plain initialized array seeded with that filler rather
+/// than `MaybeUninit`. This keeps the whole type safe — no `assume_init` /
+/// `from_raw_parts` — at the cost of writing `CAP` filler values once in
+/// [`new`](Self::new); only `0..len` are ever read back.
 struct InlineBuf<'src, const CAP: usize> {
-    stack: [MaybeUninit<Inline<'src>>; CAP],
+    stack: [Inline<'src>; CAP],
     len: usize,
     overflow: Vec<Inline<'src>>,
 }
@@ -590,8 +593,8 @@ impl<'src, const CAP: usize> InlineBuf<'src, CAP> {
     #[inline]
     const fn new() -> Self {
         Self {
-            // SAFETY: An array of MaybeUninit does not require initialization.
-            stack: [const { MaybeUninit::uninit() }; CAP],
+            // Filler the array with a cheap unit variant; only `0..len` is read.
+            stack: [Inline::SoftBreak; CAP],
             len: 0,
             overflow: Vec::new(),
         }
@@ -601,7 +604,7 @@ impl<'src, const CAP: usize> InlineBuf<'src, CAP> {
     #[inline(always)]
     fn push(&mut self, item: Inline<'src>) {
         if self.len < CAP {
-            self.stack[self.len] = MaybeUninit::new(item);
+            self.stack[self.len] = item;
             self.len += 1;
         } else {
             self.push_slow(item);
@@ -611,14 +614,9 @@ impl<'src, const CAP: usize> InlineBuf<'src, CAP> {
     #[cold]
     fn push_slow(&mut self, item: Inline<'src>) {
         if self.overflow.is_empty() {
-            // Spill stack to heap
+            // Spill stack to heap.
             self.overflow = Vec::with_capacity(CAP * 2);
-            // SAFETY: elements 0..self.len were initialized via push.
-            // Use a raw pointer to avoid borrow conflict with self.overflow.
-            let len = self.len;
-            let ptr = self.stack.as_ptr().cast::<Inline>();
-            let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-            self.overflow.extend_from_slice(slice);
+            self.overflow.extend_from_slice(&self.stack[..self.len]);
         }
         self.overflow.push(item);
     }
@@ -634,20 +632,20 @@ impl<'src, const CAP: usize> InlineBuf<'src, CAP> {
             ) {
                 self.overflow.pop();
             }
-        } else if self.len > 0 {
-            // SAFETY: element len-1 was initialized via push.
-            let last = unsafe { self.stack[self.len - 1].assume_init_ref() };
-            if matches!(last, Inline::SoftBreak | Inline::HardBreak) {
-                self.len -= 1;
-            }
+        } else if self.len > 0
+            && matches!(
+                self.stack[self.len - 1],
+                Inline::SoftBreak | Inline::HardBreak
+            )
+        {
+            self.len -= 1;
         }
     }
 
     /// Get initialized stack elements as a slice.
     #[inline]
-    const fn initialized_stack(&self) -> &[Inline<'src>] {
-        // SAFETY: all elements 0..self.len have been initialized via push.
-        unsafe { std::slice::from_raw_parts(self.stack.as_ptr().cast::<Inline>(), self.len) }
+    fn initialized_stack(&self) -> &[Inline<'src>] {
+        &self.stack[..self.len]
     }
 
     #[inline]
