@@ -93,8 +93,22 @@ use std::borrow::Cow;
 /// The const generics `MAX_INLINE_DEPTH` and `INLINE_STACK_CAP` control
 /// recursion depth and stack-allocation size for emphasis parsing. The
 /// defaults (`16` and `32`) are suitable for virtually all real-world input.
+///
+/// `MAX_BLOCK_DEPTH` bounds block-container nesting (blockquotes and list
+/// items). Block parsing recurses once per nesting level, so without a cap a
+/// pathological document such as 50 000 `>` characters would overflow the
+/// stack and abort the process (the CVE-2023-24824 class of denial-of-service).
+/// At the limit, deeper containers are flattened into their text rather than
+/// recursed into, so parsing always terminates in bounded stack. The default
+/// (`128`) is far beyond any real document while staying comfortably within a
+/// small thread stack.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MarkdownFile<'src, const MAX_INLINE_DEPTH: u8 = 16, const INLINE_STACK_CAP: usize = 32> {
+pub struct MarkdownFile<
+    'src,
+    const MAX_INLINE_DEPTH: u8 = 16,
+    const INLINE_STACK_CAP: usize = 32,
+    const MAX_BLOCK_DEPTH: u16 = 128,
+> {
     /// The block-level sections of the document, in order.
     pub sections: Vec<Section<'src>>,
     pool: Vec<Inline<'src>>,
@@ -145,8 +159,12 @@ impl MarkdownFile<'_, 16, 32> {
     }
 }
 
-impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
-    MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP>
+impl<
+    'src,
+    const MAX_INLINE_DEPTH: u8,
+    const INLINE_STACK_CAP: usize,
+    const MAX_BLOCK_DEPTH: u16,
+> MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP, MAX_BLOCK_DEPTH>
 {
     /// Get the inline elements referenced by a span.
     #[must_use]
@@ -210,8 +228,13 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     }
 }
 
-impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize> std::ops::Index<InlineSpan>
-    for MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP>
+impl<
+    'src,
+    const MAX_INLINE_DEPTH: u8,
+    const INLINE_STACK_CAP: usize,
+    const MAX_BLOCK_DEPTH: u16,
+> std::ops::Index<InlineSpan>
+    for MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP, MAX_BLOCK_DEPTH>
 {
     type Output = [Inline<'src>];
 
@@ -222,8 +245,13 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize> std::ops::
     }
 }
 
-impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize> std::ops::Index<SectionRange>
-    for MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP>
+impl<
+    'src,
+    const MAX_INLINE_DEPTH: u8,
+    const INLINE_STACK_CAP: usize,
+    const MAX_BLOCK_DEPTH: u16,
+> std::ops::Index<SectionRange>
+    for MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP, MAX_BLOCK_DEPTH>
 {
     type Output = [Section<'src>];
 
@@ -252,8 +280,13 @@ impl<'a, 'src> Iterator for ChildSections<'a, 'src> {
     }
 }
 
-impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize> std::ops::Index<LineRange>
-    for MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP>
+impl<
+    'src,
+    const MAX_INLINE_DEPTH: u8,
+    const INLINE_STACK_CAP: usize,
+    const MAX_BLOCK_DEPTH: u16,
+> std::ops::Index<LineRange>
+    for MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP, MAX_BLOCK_DEPTH>
 {
     type Output = [PoolLine<'src>];
 

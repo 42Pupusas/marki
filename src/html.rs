@@ -280,8 +280,8 @@ fn strip_code_indent(line: &str) -> &str {
     &line[i..]
 }
 
-impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
-    MarkdownFile<'_, MAX_INLINE_DEPTH, INLINE_STACK_CAP>
+impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_BLOCK_DEPTH: u16>
+    MarkdownFile<'_, MAX_INLINE_DEPTH, INLINE_STACK_CAP, MAX_BLOCK_DEPTH>
 {
     /// Render the document to an HTML string.
     ///

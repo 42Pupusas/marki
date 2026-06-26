@@ -788,8 +788,12 @@ impl BlockBytes for [u8] {
     }
 }
 
-impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
-    MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP>
+impl<
+    'src,
+    const MAX_INLINE_DEPTH: u8,
+    const INLINE_STACK_CAP: usize,
+    const MAX_BLOCK_DEPTH: u16,
+> MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP, MAX_BLOCK_DEPTH>
 {
     /// Convert the raw sections from pass 1 into final sections with inline
     /// parsing. Separating passes lets us pre-size the output pools from the
@@ -925,6 +929,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                         .unwrap_or(&[]);
                     let list = Self::assemble_list(
                         ctx.input,
+                        1,
                         metas,
                         lines,
                         &ctx.lazy,
@@ -949,6 +954,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     let raw_pad = ctx.pad.get(span).unwrap_or(&[]);
                     let children = Self::resolve_blocks(
                         ctx.input,
+                        1,
                         raw_lines,
                         raw_lazy,
                         raw_pad,
@@ -979,6 +985,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     #[allow(clippy::too_many_arguments)]
     fn assemble_list(
         input: &'src str,
+        depth: u16,
         metas: &[ItemMeta],
         lines: &[&'src str],
         lazy: &[bool],
@@ -1004,7 +1011,8 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 children: SectionRange::EMPTY,
             });
             let range = Self::resolve_blocks(
-                input, item_lines, item_lazy, item_pad, pool, section_pool, line_pool, scratch, defs,
+                input, depth, item_lines, item_lazy, item_pad, pool, section_pool, line_pool,
+                scratch, defs,
             );
             section_pool[item_at] = Section::ListItem { children: range };
         }
@@ -1032,6 +1040,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn resolve_blocks(
         input: &'src str,
+        depth: u16,
         lines: &[&'src str],
         lazy: &[bool],
         pad: &[u8],
@@ -1135,7 +1144,13 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 continue;
             }
 
-            if ind_cols <= 3 {
+            // Container nesting is bounded by `MAX_BLOCK_DEPTH`: block parsing
+            // recurses once per level, so an unbounded run of `>` or nested
+            // list markers would overflow the stack and abort the process
+            // (CVE-2023-24824 class). Past the limit we stop opening new
+            // containers and let the marker lines fall through to paragraph
+            // text, which keeps stack usage bounded and parsing total.
+            if ind_cols <= 3 && depth < MAX_BLOCK_DEPTH {
                 // Nested blockquote: collect the run and recurse.
                 if body.first() == SpecialChar::GreaterThan {
                     Self::flush_para(input, &mut para, section_pool, pool, defs);
@@ -1194,6 +1209,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     // lines); an empty pad slice reads as all-zero.
                     let range = Self::resolve_blocks(
                         input,
+                        depth + 1,
                         &nested,
                         &nested_lazy,
                         &[],
@@ -1302,6 +1318,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                     Self::flush_para(input, &mut para, section_pool, pool, defs);
                     let consumed = Self::build_list(
                         input,
+                        depth + 1,
                         &lines[i..],
                         &lazy[i..],
                         pad.get(i..).unwrap_or(&[]),
@@ -1410,6 +1427,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn build_list(
         input: &'src str,
+        depth: u16,
         lines: &[&'src str],
         lazy: &[bool],
         pad: &[u8],
@@ -1547,7 +1565,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize>
                 children: SectionRange::EMPTY,
             });
             let range = Self::resolve_blocks(
-                input, &item, &item_lazy, &[], pool, section_pool, line_pool, scratch, defs,
+                input, depth, &item, &item_lazy, &[], pool, section_pool, line_pool, scratch, defs,
             );
             section_pool[item_at] = Section::ListItem { children: range };
         }
