@@ -8,6 +8,7 @@
 use std::fmt::Write as _;
 
 use crate::entity::Entity;
+use crate::section::SectionRange;
 use crate::{Inline, InlineSpan, MarkdownFile, Section};
 
 /// HTML-rendering sink: every escaping helper hangs off the output [`String`]
@@ -349,19 +350,7 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_BLOCK_
                 out.push_str("</p>\n");
             }
             Section::CodeBlock { language, code } => {
-                out.push_str("<pre><code");
-                if let Some(lang) = language {
-                    // CommonMark uses the first word of the info string as the
-                    // language class, with backslash escapes and entities
-                    // resolved (e.g. `foo\+bar` -> `foo+bar`, `f&ouml;` -> `fö`).
-                    let first = lang.split_whitespace().next().unwrap_or("");
-                    if !first.is_empty() {
-                        out.push_str(" class=\"language-");
-                        out.escape_info_string(first);
-                        out.push('"');
-                    }
-                }
-                out.push('>');
+                Self::open_code_tag(*language, out);
                 out.escape_html(code);
                 // CommonMark code blocks always end their final line with a
                 // single newline. The parser strips the newline before a
@@ -373,16 +362,7 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_BLOCK_
                 out.push_str("</code></pre>\n");
             }
             Section::CodeLines { language, lines } => {
-                out.push_str("<pre><code");
-                if let Some(lang) = language {
-                    let first = lang.split_whitespace().next().unwrap_or("");
-                    if !first.is_empty() {
-                        out.push_str(" class=\"language-");
-                        out.escape_info_string(first);
-                        out.push('"');
-                    }
-                }
-                out.push('>');
+                Self::open_code_tag(*language, out);
                 for pl in self.code_lines(*lines) {
                     for _ in 0..pl.pad {
                         out.push(' ');
@@ -429,16 +409,8 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_BLOCK_
                 }
                 out.push_str("</ol>\n");
             }
-            Section::ListItem { children } => {
-                // A bare ListItem (not reached via a list) renders loose.
-                self.render_list_item(
-                    &Section::ListItem {
-                        children: *children,
-                    },
-                    false,
-                    out,
-                );
-            }
+            // A bare ListItem (not reached via a list) renders loose.
+            Section::ListItem { .. } => self.render_list_item(section, false, out),
             Section::Blockquote { children } => {
                 out.push_str("<blockquote>\n");
                 for child in self.child_sections(*children) {
@@ -467,7 +439,77 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_BLOCK_
                 out.push('\n');
             }
             Section::HorizontalRule => out.push_str("<hr />\n"),
+            Section::Table { rows, .. } => self.render_table(*rows, out),
+            // Rows and cells are emitted by their parent `Table`; reaching one
+            // standalone is not meaningful, so render nothing.
+            Section::TableRow { .. } | Section::TableCell { .. } => {}
         }
+    }
+
+    /// Open a `<pre><code …>` tag, attaching a `language-…` class derived from
+    /// the first word of the fenced code block's info string. `CommonMark` uses
+    /// that first word as the language, with backslash escapes and entities
+    /// resolved (e.g. `foo\+bar` -> `foo+bar`, `f&ouml;` -> `fö`).
+    fn open_code_tag(language: Option<&str>, out: &mut String) {
+        out.push_str("<pre><code");
+        if let Some(lang) = language {
+            let first = lang.split_whitespace().next().unwrap_or("");
+            if !first.is_empty() {
+                out.push_str(" class=\"language-");
+                out.escape_info_string(first);
+                out.push('"');
+            }
+        }
+        out.push('>');
+    }
+
+    /// Render a [`Section::Table`]'s rows into `<table>`/`<thead>`/`<tbody>`.
+    /// The first row is the header (`<thead>`); the rest, if any, the body.
+    fn render_table(&self, rows: SectionRange, out: &mut String) {
+        let mut rows_iter = self.child_sections(rows);
+        out.push_str("<table>\n");
+        if let Some(head) = rows_iter.next() {
+            out.push_str("<thead>\n");
+            self.render_table_row(head, out);
+            out.push_str("</thead>\n");
+        }
+        let mut body_open = false;
+        for row in rows_iter {
+            if !body_open {
+                out.push_str("<tbody>\n");
+                body_open = true;
+            }
+            self.render_table_row(row, out);
+        }
+        if body_open {
+            out.push_str("</tbody>\n");
+        }
+        out.push_str("</table>\n");
+    }
+
+    /// Render one `<tr>` of a table. `header` rows use `<th>`, body rows `<td>`;
+    /// a non-`None` column alignment adds the GFM `align="…"` attribute.
+    fn render_table_row(&self, row: &Section<'_>, out: &mut String) {
+        let Section::TableRow { header, cells } = row else {
+            return;
+        };
+        let tag = if *header { "th" } else { "td" };
+        out.push_str("<tr>\n");
+        for cell in self.child_sections(*cells) {
+            let Section::TableCell { align, content } = cell else {
+                continue;
+            };
+            let attr = match align {
+                crate::ColumnAlignment::None => "",
+                crate::ColumnAlignment::Left => " align=\"left\"",
+                crate::ColumnAlignment::Center => " align=\"center\"",
+                crate::ColumnAlignment::Right => " align=\"right\"",
+            };
+            let _ = write!(out, "<{tag}{attr}>");
+            self.render_inlines(*content, out);
+            let _ = writeln!(out, "</{tag}>");
+        }
+        out.push_str("</tr>\n");
     }
 
     /// Render one `<li>` element following `CommonMark`'s reference model: a

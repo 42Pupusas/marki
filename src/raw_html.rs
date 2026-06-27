@@ -138,7 +138,8 @@ impl HtmlScan for [u8] {
                 let start = i;
                 let mut j = i;
                 while b.get(j).is_some_and(|&c| {
-                    !c.is_ascii_whitespace() && !matches!(c, b'"' | b'\'' | b'=' | b'<' | b'>' | b'`')
+                    !c.is_ascii_whitespace()
+                        && !matches!(c, b'"' | b'\'' | b'=' | b'<' | b'>' | b'`')
                 }) {
                     j += 1;
                 }
@@ -315,7 +316,11 @@ impl HtmlScan for [u8] {
 
     /// Case-insensitive ASCII byte-slice comparison.
     fn eq_ignore_case(&self, other: &[u8]) -> bool {
-        self.len() == other.len() && self.iter().zip(other).all(|(x, y)| x.eq_ignore_ascii_case(y))
+        self.len() == other.len()
+            && self
+                .iter()
+                .zip(other)
+                .all(|(x, y)| x.eq_ignore_ascii_case(y))
     }
 
     /// Case-insensitive substring search.

@@ -160,15 +160,15 @@ impl<'src> LinkDef<'src> {
     /// whitespace or a control character, with balanced parentheses).
     fn scan_destination(bytes: &[u8], i: usize) -> Option<(usize, usize, usize)> {
         if bytes.get(i) == Some(&b'<') {
-        let mut j = i + 1;
-        loop {
-            match bytes.get(j) {
-                None | Some(b'\n' | b'<') => return None,
-                _ if Self::is_escape(bytes, j) => j += 2,
-                Some(b'>') => return Some((i + 1, j, j + 1)),
-                _ => j += 1,
+            let mut j = i + 1;
+            loop {
+                match bytes.get(j) {
+                    None | Some(b'\n' | b'<') => return None,
+                    _ if Self::is_escape(bytes, j) => j += 2,
+                    Some(b'>') => return Some((i + 1, j, j + 1)),
+                    _ => j += 1,
+                }
             }
-        }
         } else {
             let start = i;
             let mut j = i;

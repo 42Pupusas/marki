@@ -20,6 +20,7 @@ A zero-copy Markdown parser for Rust. Parses markdown strings into structured se
 - Unordered lists (`-`, `*`, or `+` markers) and ordered lists (with preserved start number)
 - Nested lists and multi-block list items, loose/tight detection
 - Blockquotes (including nested and lazy continuation)
+- GFM tables (pipe-delimited, per-column alignment, header/body rows)
 - Link reference definitions
 - Horizontal rules (`---`, `***`, `___`)
 - Tabs expanded to 4-column stops per spec, including partial expansion inside containers

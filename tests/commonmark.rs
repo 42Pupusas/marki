@@ -274,7 +274,8 @@ fn commonmark_conformance() {
     // Full CommonMark conformance reached (652/652). This test now gates:
     // every spec vector must render byte-for-byte, so any regression fails CI.
     assert_eq!(
-        passed, total,
+        passed,
+        total,
         "CommonMark conformance regressed: {passed}/{total} ({pct:.1}%); {} failing",
         failures.len()
     );

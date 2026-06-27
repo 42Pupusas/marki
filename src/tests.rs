@@ -1753,3 +1753,165 @@ fn test_closing_fence_indented_4_spaces_not_closing() {
         }
     );
 }
+
+// -----------------------------------------------------------------------
+// GFM tables (CommonMark/GFM §4.10)
+// -----------------------------------------------------------------------
+
+use crate::ColumnAlignment;
+
+/// The structural shape of a parsed table, flattened for easy assertions:
+/// `(columns, per-row (header?, cells-as-plain-text))`.
+fn table_shape<'src>(
+    md: &MarkdownFile<'src>,
+    section: &Section<'src>,
+) -> (u16, Vec<(bool, Vec<String>)>) {
+    let Section::Table { columns, rows } = section else {
+        panic!("expected table, got {section:?}");
+    };
+    let mut out = Vec::new();
+    for row in md.child_sections(*rows) {
+        let Section::TableRow { header, cells } = row else {
+            panic!("expected table row, got {row:?}");
+        };
+        let mut cell_texts = Vec::new();
+        for cell in md.child_sections(*cells) {
+            let Section::TableCell { content, .. } = cell else {
+                panic!("expected table cell, got {cell:?}");
+            };
+            // Flatten inline content to plain text for the shape comparison.
+            let mut s = String::new();
+            for inline in md.inlines(*content) {
+                if let Inline::Text(t) = inline {
+                    s.push_str(t);
+                }
+            }
+            cell_texts.push(s);
+        }
+        out.push((*header, cell_texts));
+    }
+    (*columns, out)
+}
+
+#[test]
+fn test_table_basic() {
+    let md: MarkdownFile<'_> =
+        MarkdownFile::parse("| abc | def |\n| --- | --- |\n| ghi | jkl |\n| mno | pqr |");
+    let (cols, rows) = table_shape(&md, &md.sections[0]);
+    assert_eq!(cols, 2);
+    assert_eq!(
+        rows,
+        vec![
+            (true, vec!["abc".to_owned(), "def".to_owned()]),
+            (false, vec!["ghi".to_owned(), "jkl".to_owned()]),
+            (false, vec!["mno".to_owned(), "pqr".to_owned()]),
+        ]
+    );
+}
+
+#[test]
+fn test_table_no_outer_pipes() {
+    // GFM "simpler" table: leading/trailing pipes are optional.
+    let md: MarkdownFile<'_> = MarkdownFile::parse("abc | def\n--- | ---\nxyz | ghi");
+    let (cols, rows) = table_shape(&md, &md.sections[0]);
+    assert_eq!(cols, 2);
+    assert_eq!(rows[0], (true, vec!["abc".to_owned(), "def".to_owned()]));
+    assert_eq!(rows[1], (false, vec!["xyz".to_owned(), "ghi".to_owned()]));
+}
+
+#[test]
+fn test_table_alignment() {
+    let md: MarkdownFile<'_> =
+        MarkdownFile::parse("a | b | c | d | e\n:-- | --- | :-: | --- | --:\nf | g | h | i | j");
+    let Section::Table { rows, .. } = &md.sections[0] else {
+        panic!("expected table");
+    };
+    let header = md.child_sections(*rows).next().unwrap();
+    let Section::TableRow { cells, .. } = header else {
+        panic!("expected row");
+    };
+    let aligns: Vec<ColumnAlignment> = md
+        .child_sections(*cells)
+        .map(|c| match c {
+            Section::TableCell { align, .. } => *align,
+            _ => panic!("expected cell"),
+        })
+        .collect();
+    assert_eq!(
+        aligns,
+        vec![
+            ColumnAlignment::Left,
+            ColumnAlignment::None,
+            ColumnAlignment::Center,
+            ColumnAlignment::None,
+            ColumnAlignment::Right,
+        ]
+    );
+}
+
+#[test]
+fn test_table_short_rows_padded_long_truncated() {
+    let md: MarkdownFile<'_> =
+        MarkdownFile::parse("| a | b | c |\n| --- | --- | --- |\n| x |\n| 1 | 2 | 3 | 4 | 5 |");
+    let (cols, rows) = table_shape(&md, &md.sections[0]);
+    assert_eq!(cols, 3);
+    // Short row padded to 3 cells.
+    assert_eq!(
+        rows[1],
+        (false, vec!["x".to_owned(), String::new(), String::new()])
+    );
+    // Long row truncated to 3 cells.
+    assert_eq!(
+        rows[2],
+        (false, vec!["1".to_owned(), "2".to_owned(), "3".to_owned()])
+    );
+}
+
+#[test]
+fn test_table_mismatched_delimiter_is_paragraph() {
+    // Header has 3 columns, delimiter has 2 -> not a table.
+    let md: MarkdownFile<'_> =
+        MarkdownFile::parse("| a | b | c |\n| --- | --- |\n| this | isn't | okay |");
+    assert!(
+        matches!(md.sections[0], Section::Paragraph { .. }),
+        "expected paragraph, got {:?}",
+        md.sections[0]
+    );
+}
+
+#[test]
+fn test_table_interrupts_paragraph() {
+    // GFM: a table can be recognised directly after paragraph text.
+    let md: MarkdownFile<'_> = MarkdownFile::parse("123\n456\n| a | b |\n| ---| --- |\nd | e");
+    assert!(matches!(md.sections[0], Section::Paragraph { .. }));
+    assert!(
+        matches!(md.sections[1], Section::Table { .. }),
+        "expected table as second section, got {:?}",
+        md.sections[1]
+    );
+}
+
+#[test]
+fn test_table_not_enough_rows_is_paragraph() {
+    // A single piped line with no delimiter row is just a paragraph.
+    let md: MarkdownFile<'_> = MarkdownFile::parse("| Not enough table | to be considered table |");
+    assert!(matches!(md.sections[0], Section::Paragraph { .. }));
+}
+
+#[test]
+fn test_table_header_only() {
+    // Header + delimiter with no body rows is a valid (header-only) table.
+    let md: MarkdownFile<'_> = MarkdownFile::parse("| xyz |\n| --- |");
+    let (cols, rows) = table_shape(&md, &md.sections[0]);
+    assert_eq!(cols, 1);
+    assert_eq!(rows, vec![(true, vec!["xyz".to_owned()])]);
+}
+
+#[test]
+fn test_table_html_render() {
+    let md: MarkdownFile<'_> = MarkdownFile::parse("| abc | def |\n| --- | --- |\n| ghi | jkl |");
+    let html = md.to_html();
+    let expected = "<table>\n<thead>\n<tr>\n<th>abc</th>\n<th>def</th>\n</tr>\n</thead>\n\
+<tbody>\n<tr>\n<td>ghi</td>\n<td>jkl</td>\n</tr>\n</tbody>\n</table>\n";
+    assert_eq!(html, expected);
+}

@@ -145,6 +145,39 @@ impl PartialEq<OrderedListDelimiter> for u8 {
     }
 }
 
+/// Column alignment for a GFM table (`CommonMark`/GFM §4.10), derived from the
+/// colons in the delimiter row: `:---` left, `:--:` center, `---:` right, and
+/// `---` (no colon) [`None`](Self::None).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColumnAlignment {
+    /// No explicit alignment (`---`): the renderer picks its default.
+    #[default]
+    None,
+    /// Left-aligned (`:---`).
+    Left,
+    /// Center-aligned (`:--:`).
+    Center,
+    /// Right-aligned (`---:`).
+    Right,
+}
+
+impl ColumnAlignment {
+    /// Derive the alignment from a single delimiter-row cell's trimmed bytes
+    /// (e.g. `:--:`). A leading `:` means left, a trailing `:` means right,
+    /// both means center. Returns [`None`](Self::None) when neither is present.
+    #[must_use]
+    pub fn from_delimiter(cell: &[u8]) -> Self {
+        let left = cell.first() == Some(&b':');
+        let right = cell.last() == Some(&b':');
+        match (left, right) {
+            (true, true) => Self::Center,
+            (true, false) => Self::Left,
+            (false, true) => Self::Right,
+            (false, false) => Self::None,
+        }
+    }
+}
+
 impl Section<'_> {
     /// Number of pool entries this section occupies, including itself and its
     /// entire pre-order subtree. Leaves span 1; containers span `1 + len` of
@@ -159,6 +192,8 @@ impl Section<'_> {
             Section::ListItem { children } | Section::Blockquote { children } => {
                 1 + children.len as usize
             }
+            Section::Table { rows, .. } => 1 + rows.len as usize,
+            Section::TableRow { cells, .. } => 1 + cells.len as usize,
             _ => 1,
         }
     }
@@ -228,4 +263,27 @@ pub enum Section<'src> {
         lines: LineRange,
     },
     HorizontalRule,
+    /// A GFM table (`CommonMark`/GFM §4.10). `columns` is the column count
+    /// fixed by the header/delimiter rows; `rows` is a [`SectionRange`] of
+    /// [`Section::TableRow`] children in the section pool (the header row first,
+    /// then any body rows). Iterate them with
+    /// [`child_sections`](crate::MarkdownFile::child_sections).
+    Table {
+        columns: u16,
+        rows: SectionRange,
+    },
+    /// One row of a [`Section::Table`]. `header` marks the first (heading) row.
+    /// `cells` is a [`SectionRange`] of [`Section::TableCell`] children, always
+    /// exactly the table's `columns` long (short source rows are padded with
+    /// empty cells, long ones truncated, per GFM).
+    TableRow {
+        header: bool,
+        cells: SectionRange,
+    },
+    /// One cell of a [`Section::TableRow`]. `align` is the column's alignment
+    /// (from the delimiter row); `content` is the cell text parsed as inlines.
+    TableCell {
+        align: ColumnAlignment,
+        content: InlineSpan,
+    },
 }

@@ -36,7 +36,10 @@ fn main() {
 
     // Bracket nesting: link/image reference scanning.
     probe("open_brackets_50k", &"[".repeat(50_000));
-    probe("nested_brackets_link", &format!("{}{}", "[".repeat(20_000), "]".repeat(20_000)));
+    probe(
+        "nested_brackets_link",
+        &format!("{}{}", "[".repeat(20_000), "]".repeat(20_000)),
+    );
     probe("bang_bracket_image_50k", &"![".repeat(50_000));
 
     // "No links in links" backtracking: nested link text where each level
@@ -66,10 +69,7 @@ fn main() {
 
     // Deep block nesting (RECURSION — stack-overflow risk in resolve_blocks).
     probe("blockquote_depth_50k", &">".repeat(50_000));
-    probe(
-        "blockquote_spaced_depth_10k",
-        &"> ".repeat(10_000),
-    );
+    probe("blockquote_spaced_depth_10k", &"> ".repeat(10_000));
     probe(
         "nested_list_depth_2k",
         &(0..2_000)
@@ -80,10 +80,7 @@ fn main() {
 
     // Many blank lines after a marker (GHSL-2023-119 footnote analogue:
     // dangling open blocks rescanned per blank line).
-    probe(
-        "list_then_blanks",
-        &format!("- x\n{}", "\n".repeat(50_000)),
-    );
+    probe("list_then_blanks", &format!("- x\n{}", "\n".repeat(50_000)));
 
     // Hard-break / trailing-space lines.
     probe("trailing_space_lines", &"x  \n".repeat(50_000));

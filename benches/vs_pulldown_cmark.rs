@@ -2,11 +2,11 @@
 //! Rust Markdown parsers on every run.
 //!
 //! * `pulldown-cmark` — the fast pull parser used by rustdoc / mdBook.
-//! * `comrak` — the CommonMark 0.31.2 reference-compliant parser used by
+//! * `comrak` — the `CommonMark` 0.31.2 reference-compliant parser used by
 //!   crates.io, docs.rs, and GitLab.
 //!
 //! Each parser is timed both on the bundled prose fixtures and on the official
-//! CommonMark spec test vectors (652 cases), so regressions in our throughput
+//! `CommonMark` spec test vectors (652 cases), so regressions in our throughput
 //! relative to the reference implementations show up immediately.
 
 use divan::black_box;
@@ -33,7 +33,7 @@ fn fixture(name: &str) -> &'static str {
     }
 }
 
-/// The official CommonMark spec test suite as raw JSON (652 cases).
+/// The official `CommonMark` spec test suite as raw JSON (652 cases).
 const SPEC_JSON: &str = include_str!("../tests/fixtures/spec.json");
 
 /// Extract every `"markdown"` input string from the embedded spec JSON.
@@ -131,7 +131,7 @@ mod fixtures {
     }
 }
 
-/// Comparison across the full CommonMark spec test-vector corpus (652 cases),
+/// Comparison across the full `CommonMark` spec test-vector corpus (652 cases),
 /// concatenated into one document. Inputs are gathered via `with_inputs` so
 /// JSON extraction is excluded from the measured region.
 #[divan::bench_group]

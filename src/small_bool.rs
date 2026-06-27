@@ -17,7 +17,7 @@ const INLINE: usize = 8;
 
 /// A growable `bool` sequence that stores its first [`INLINE`] elements inline
 /// on the stack and spills to a `Vec<bool>` only when it grows past that.
-pub(crate) enum SmallBoolVec {
+pub enum SmallBoolVec {
     /// Inline storage: `buf[..len]` are live.
     Inline { buf: [bool; INLINE], len: usize },
     /// Spilled to the heap once the inline capacity was exceeded.
@@ -96,8 +96,11 @@ mod tests {
         }
         assert!(matches!(v, SmallBoolVec::Inline { .. }));
         assert_eq!(v.len(), INLINE);
-        assert_eq!(v.last().copied(), Some((INLINE - 1) % 2 == 0));
-        assert_eq!(&*v, &[true, false, true, false, true, false, true, false][..]);
+        assert_eq!(v.last().copied(), Some((INLINE - 1).is_multiple_of(2)));
+        assert_eq!(
+            &*v,
+            &[true, false, true, false, true, false, true, false][..]
+        );
     }
 
     #[test]

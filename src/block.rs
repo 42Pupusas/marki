@@ -3,9 +3,11 @@ use crate::VecReuse;
 use crate::inline::InlineParser;
 use crate::link_def::{LinkDef, LinkDefs, LinkLabel};
 use crate::raw_html::HtmlScan;
-use crate::section::{LineRange, OrderedListDelimiter, PoolLine, Section, SectionRange};
-use crate::small_bool::SmallBoolVec;
+use crate::section::{
+    ColumnAlignment, InlineSpan, LineRange, OrderedListDelimiter, PoolLine, Section, SectionRange,
+};
 use crate::simd::ByteSliceExt;
+use crate::small_bool::SmallBoolVec;
 use crate::special_char::SpecialChar;
 use crate::{Inline, MarkdownFile};
 
@@ -57,6 +59,15 @@ enum RawSection<'src> {
         html: &'src str,
     },
     HorizontalRule,
+    /// A GFM table (`CommonMark`/GFM §4.10) captured as its verbatim source
+    /// span (header row + delimiter row + body rows, no trailing newline) plus
+    /// the column count fixed by the header/delimiter rows. Pass 2
+    /// ([`assemble_table`]) splits the rows, derives per-column alignment, and
+    /// inline-parses each cell.
+    Table {
+        source: &'src str,
+        columns: u16,
+    },
 }
 
 /// Pass-1 metadata for one top-level list item: the half-open range of
@@ -75,6 +86,15 @@ struct ListScan {
     items_len: u32,
     tight: bool,
     ordered: Option<(u32, OrderedListDelimiter)>,
+    resume: usize,
+}
+
+/// Result of [`ParseCtx::scan_table`]: the verbatim table source span (header
+/// row + delimiter row + body rows, no trailing newline), its column count, and
+/// the byte offset to resume parsing at.
+struct TableScan<'src> {
+    source: &'src str,
+    columns: u16,
     resume: usize,
 }
 
@@ -304,6 +324,97 @@ const COULD_START_BLOCK: [bool; 256] = {
     table
 };
 
+/// Upper bound on table columns we track alignment for. Columns beyond this
+/// keep [`ColumnAlignment::None`]; far past any real table width and bounds the
+/// stack array in [`assemble_table`].
+const MAX_TABLE_COLUMNS: usize = 128;
+
+/// Splits one GFM table row into its cell slices, honouring backslash-escaped
+/// pipes (`\|`) and stripping a single optional leading/trailing delimiter
+/// pipe (`CommonMark`/GFM §4.10). Yields borrowed source slices (cells are
+/// *not* trimmed here — the caller trims).
+///
+/// Escaping is detected by counting the run of backslashes preceding a `|`: an
+/// odd run escapes the pipe (it stays in the cell), an even run does not (it is
+/// a separator). The slices stay zero-copy, so an escaped `\|` is rendered
+/// verbatim by the inline parser (which resolves the backslash escape itself).
+struct TableCells<'src> {
+    rest: Option<&'src str>,
+}
+
+impl<'src> TableCells<'src> {
+    fn new(row: &'src str) -> Self {
+        // Strip a single optional leading pipe (after optional whitespace) and a
+        // single optional trailing pipe (before optional whitespace).
+        let trimmed = row.trim();
+        let without_lead = trimmed.strip_prefix('|').unwrap_or(trimmed);
+        let body = without_lead.strip_suffix('|').unwrap_or(without_lead);
+        Self { rest: Some(body) }
+    }
+
+    /// Byte index of the next *unescaped* `|` in `s`, or `None`.
+    fn next_pipe(s: &str) -> Option<usize> {
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'|' {
+                // Count preceding backslashes; odd => escaped.
+                let mut bs = 0;
+                let mut j = i;
+                while j > 0 && bytes[j - 1] == b'\\' {
+                    bs += 1;
+                    j -= 1;
+                }
+                if bs % 2 == 0 {
+                    return Some(i);
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+}
+
+impl<'src> Iterator for TableCells<'src> {
+    type Item = &'src str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let s = self.rest?;
+        if let Some(i) = Self::next_pipe(s) {
+            let (cell, after) = (&s[..i], &s[i + 1..]);
+            self.rest = Some(after);
+            Some(cell)
+        } else {
+            self.rest = None;
+            Some(s)
+        }
+    }
+}
+
+/// Count the cells in a GFM table row (the [`TableCells`] split length). Used in
+/// pass 1 to verify the header and delimiter rows agree on a column count.
+fn table_row_cell_count(row: &str) -> usize {
+    TableCells::new(row).count()
+}
+
+/// Validate a GFM table delimiter row (`CommonMark`/GFM §4.10): every cell, once
+/// trimmed, must be a non-empty run of `-` with an optional leading and/or
+/// trailing `:` (e.g. `---`, `:--`, `:-:`, `--:`). Returns the column count
+/// when valid, else `None`.
+fn table_delimiter_columns(row: &str) -> Option<usize> {
+    let mut n = 0;
+    for cell in TableCells::new(row) {
+        let c = cell.trim().as_bytes();
+        let no_lead = c.strip_prefix(b":").unwrap_or(c);
+        let inner = no_lead.strip_suffix(b":").unwrap_or(no_lead);
+        if inner.is_empty() || !inner.iter().all(|&b| b == b'-') {
+            return None;
+        }
+        n += 1;
+    }
+    (n > 0).then_some(n)
+}
+
 trait BlockBytes {
     fn is_blank_line(&self, start: usize, end: usize) -> bool;
     fn strip_indent(&self) -> Option<usize>;
@@ -352,12 +463,13 @@ trait BlockStr {
     fn strip_cols_from_padded(pad: u8, slice: &str, n: usize) -> (u8, &str);
 }
 
+/// One collected link reference definition: `(normalized label, (url, title))`,
+/// as gathered by [`ContainerLines::collect_container_defs_in`].
+type CollectedDef<'src> = (std::borrow::Cow<'src, str>, (&'src str, Option<&'src str>));
+
 /// Container-content scan over a block's already-dedented lines.
 trait ContainerLines<'src> {
-    fn collect_container_defs_in(
-        &self,
-        found: &mut Vec<(std::borrow::Cow<'src, str>, (&'src str, Option<&'src str>))>,
-    );
+    fn collect_container_defs_in(&self, found: &mut Vec<CollectedDef<'src>>);
 }
 
 impl BlockBytes for [u8] {
@@ -452,9 +564,7 @@ impl BlockBytes for [u8] {
         let level = SpecialChar::Hash.count_leading_bytes(self);
         // The opening hash sequence must be followed by a space, a tab, or the
         // end of the line (CommonMark §4.2).
-        if !(1..=6).contains(&level)
-            || !matches!(self.get(level), None | Some(&b' ' | &b'\t'))
-        {
+        if !(1..=6).contains(&level) || !matches!(self.get(level), None | Some(&b' ' | &b'\t')) {
             return None;
         }
         // Trim leading whitespace after '#'s.
@@ -799,10 +909,7 @@ impl<'src> ContainerLines<'src> for [&'src str] {
     /// def-looking line inside code, or one that would lazily continue an open
     /// paragraph, is not mistaken for a definition. Descends through nested
     /// blockquote/list markers via [`BlockBytes::peel_content_offset`].
-    fn collect_container_defs_in(
-        &self,
-        found: &mut Vec<(std::borrow::Cow<'src, str>, (&'src str, Option<&'src str>))>,
-    ) {
+    fn collect_container_defs_in(&self, found: &mut Vec<CollectedDef<'src>>) {
         let mut para_open = false;
         let mut fence: Option<(u8, usize)> = None;
         for &line in self {
@@ -842,12 +949,8 @@ impl<'src> ContainerLines<'src> for [&'src str] {
     }
 }
 
-impl<
-    'src,
-    const MAX_INLINE_DEPTH: u8,
-    const INLINE_STACK_CAP: usize,
-    const MAX_BLOCK_DEPTH: u16,
-> MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP, MAX_BLOCK_DEPTH>
+impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_BLOCK_DEPTH: u16>
+    MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP, MAX_BLOCK_DEPTH>
 {
     /// Convert the raw sections from pass 1 into final sections with inline
     /// parsing. Separating passes lets us pre-size the output pools from the
@@ -1026,9 +1129,103 @@ impl<
                 RawSection::HorizontalRule => {
                     sections.push(Section::HorizontalRule);
                 }
+                RawSection::Table { source, columns } => {
+                    let table = Self::assemble_table(source, columns, pool, section_pool, defs);
+                    sections.push(table);
+                }
             }
         }
         sections
+    }
+
+    /// Assemble a [`Section::Table`] from its verbatim `source` span (header
+    /// row, delimiter row, then body rows) and the `columns` count fixed in
+    /// pass 1. Builds the pre-order sub-forest in the section pool: the `Table`
+    /// node, then each `TableRow` immediately followed by its `TableCell`
+    /// children. The header row is emitted first (`header: true`); the
+    /// delimiter row is consumed for alignment only and never emitted.
+    fn assemble_table(
+        source: &'src str,
+        columns: u16,
+        pool: &mut Vec<Inline<'src>>,
+        section_pool: &mut Vec<Section<'src>>,
+        defs: &LinkDefs<'src>,
+    ) -> Section<'src> {
+        let ncols = columns as usize;
+        let mut lines = source.split('\n');
+        let header = lines.next().unwrap_or("");
+        let delimiter = lines.next().unwrap_or("");
+
+        // Per-column alignment from the delimiter row.
+        let mut aligns = [ColumnAlignment::None; MAX_TABLE_COLUMNS];
+        for (i, cell) in TableCells::new(delimiter).enumerate() {
+            if i >= ncols {
+                break;
+            }
+            aligns[i] = ColumnAlignment::from_delimiter(cell.trim().as_bytes());
+        }
+        let align_of = |i: usize| aligns.get(i).copied().unwrap_or(ColumnAlignment::None);
+
+        // Pre-order: the Table node, then each row + its cells.
+        let rows_start = section_pool.len().pool_offset();
+
+        // A small closure appends one row (header or body) and its cells.
+        let push_row = |section_pool: &mut Vec<Section<'src>>,
+                        pool: &mut Vec<Inline<'src>>,
+                        line: &'src str,
+                        is_header: bool| {
+            let row_at = section_pool.len();
+            section_pool.push(Section::TableRow {
+                header: is_header,
+                cells: SectionRange::EMPTY,
+            });
+            let cells_start = section_pool.len().pool_offset();
+            let mut n = 0usize;
+            for cell in TableCells::new(line) {
+                if n >= ncols {
+                    break;
+                }
+                let content = InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_configured(
+                    cell.trim(),
+                    pool,
+                    defs,
+                );
+                section_pool.push(Section::TableCell {
+                    align: align_of(n),
+                    content,
+                });
+                n += 1;
+            }
+            // Pad short rows with empty cells (GFM truncates long, pads short).
+            while n < ncols {
+                section_pool.push(Section::TableCell {
+                    align: align_of(n),
+                    content: InlineSpan::EMPTY,
+                });
+                n += 1;
+            }
+            let cells_len = section_pool.len().pool_offset() - cells_start;
+            section_pool[row_at] = Section::TableRow {
+                header: is_header,
+                cells: SectionRange::new(cells_start, cells_len),
+            };
+        };
+
+        push_row(section_pool, pool, header, true);
+        for line in lines {
+            // A trailing empty split fragment (source never has a trailing
+            // newline, but guard anyway) contributes no row.
+            if line.is_empty() {
+                continue;
+            }
+            push_row(section_pool, pool, line, false);
+        }
+
+        let rows_len = section_pool.len().pool_offset() - rows_start;
+        Section::Table {
+            columns,
+            rows: SectionRange::new(rows_start, rows_len),
+        }
     }
 
     /// Assemble a top-level list [`Section`] from the per-item metadata that
@@ -1065,8 +1262,16 @@ impl<
                 children: SectionRange::EMPTY,
             });
             let range = Self::resolve_blocks(
-                input, depth, item_lines, item_lazy, item_pad, pool, section_pool, line_pool,
-                scratch, defs,
+                input,
+                depth,
+                item_lines,
+                item_lazy,
+                item_pad,
+                pool,
+                section_pool,
+                line_pool,
+                scratch,
+                defs,
             );
             section_pool[item_at] = Section::ListItem { children: range };
         }
@@ -1167,12 +1372,17 @@ impl<
                     // Strip the four indent columns, preserving any straddled-
                     // tab pad so the rendered code keeps its leading spaces.
                     let (cpad, ctext) = str::strip_cols_from_padded(pad_at(i), l, 4);
-                    line_pool.push(PoolLine { pad: cpad, text: ctext });
+                    line_pool.push(PoolLine {
+                        pad: cpad,
+                        text: ctext,
+                    });
                     i += 1;
                 }
                 // Trim trailing blank lines out of the code block.
                 while line_pool.len().pool_offset() > code_start
-                    && line_pool.last().is_some_and(|l| l.text.is_empty() && l.pad == 0)
+                    && line_pool
+                        .last()
+                        .is_some_and(|l| l.text.is_empty() && l.pad == 0)
                 {
                     line_pool.pop();
                 }
@@ -1190,9 +1400,7 @@ impl<
             // output (its label was already collected into `defs` by the
             // pre-pass in `resolve_inlines`), so skip the line when it isn't
             // lazily continuing an open paragraph.
-            if para.is_empty()
-                && body.first() == Some(&b'[')
-                && LinkDef::scan(line, ind).is_some()
+            if para.is_empty() && body.first() == Some(&b'[') && LinkDef::scan(line, ind).is_some()
             {
                 i += 1;
                 continue;
@@ -1618,7 +1826,16 @@ impl<
                 children: SectionRange::EMPTY,
             });
             let range = Self::resolve_blocks(
-                input, depth, &item, &item_lazy, &[], pool, section_pool, line_pool, scratch, defs,
+                input,
+                depth,
+                &item,
+                &item_lazy,
+                &[],
+                pool,
+                section_pool,
+                line_pool,
+                scratch,
+                defs,
             );
             section_pool[item_at] = Section::ListItem { children: range };
         }
@@ -1842,12 +2059,95 @@ impl<'src> ParseCtx<'src> {
                 }
             }
 
+            // GFM tables (CommonMark/GFM §4.10): a header row containing an
+            // unescaped pipe immediately followed by a delimiter row with a
+            // matching column count. A table can interrupt a paragraph, so this
+            // runs regardless of `acc` — the open paragraph (if any) is flushed
+            // first. Detection needs one line of lookahead (the delimiter row).
+            if let Some(scan) = ctx.scan_table(pos, line_end) {
+                ctx.flush_acc(acc);
+                ctx.sections.push(RawSection::Table {
+                    source: scan.source,
+                    columns: scan.columns,
+                });
+                pos = scan.resume;
+                acc = Accumulator::Empty;
+                continue;
+            }
+
             acc = ctx.fold_line(acc, pos, line_end);
             pos = line_end + 1;
         }
 
         ctx.flush_acc(acc);
         ctx
+    }
+
+    /// Detect a GFM table (`CommonMark`/GFM §4.10) starting at the line
+    /// `[pos..line_end)`. A table is a header row containing at least one
+    /// unescaped pipe, immediately followed by a delimiter row whose column
+    /// count equals the header's, then zero or more body rows. Returns the
+    /// verbatim source span (no trailing newline), the column count, and the
+    /// byte offset to resume at — or `None` when the two-line shape is absent.
+    ///
+    /// Top-level only: tables nested inside a blockquote or list item are not
+    /// recognised by [`resolve_blocks`] and stay paragraphs.
+    fn scan_table(&self, pos: usize, line_end: usize) -> Option<TableScan<'src>> {
+        let bytes = self.bytes;
+        // The header must be indented 0-3 spaces and carry an unescaped pipe.
+        let indent = bytes[pos..line_end].strip_indent()?;
+        let header = self.input.get(pos + indent..line_end)?;
+        TableCells::next_pipe(header)?;
+        let header_cols = table_row_cell_count(header);
+
+        // The very next line must be a valid delimiter row of equal width.
+        let delim_start = line_end + 1;
+        if delim_start > bytes.len() {
+            return None;
+        }
+        let delim_end = bytes
+            .find_byte(delim_start, SpecialChar::Newline.byte())
+            .unwrap_or(bytes.len());
+        let delim_indent = bytes[delim_start..delim_end].strip_indent()?;
+        let delim = self.input.get(delim_start + delim_indent..delim_end)?;
+        let delim_cols = table_delimiter_columns(delim)?;
+        if delim_cols != header_cols {
+            return None;
+        }
+        let columns = u16::try_from(header_cols).ok()?;
+
+        // Body rows: consecutive non-blank lines that do not begin another
+        // block-level construct. The table source spans from the header row
+        // start to the end of the last body row.
+        let source_start = pos + indent;
+        let mut row_pos = delim_end + 1;
+        let mut source_end = delim_end;
+        while row_pos < bytes.len() {
+            let row_end = bytes
+                .find_byte(row_pos, SpecialChar::Newline.byte())
+                .unwrap_or(bytes.len());
+            if bytes.is_blank_line(row_pos, row_end) {
+                break;
+            }
+            let Some(rind) = bytes[row_pos..row_end].strip_indent() else {
+                break; // 4+ indent: indented code, ends the table.
+            };
+            let body = &bytes[row_pos + rind..row_end];
+            // A line that starts a new block (heading, hr, blockquote, fence,
+            // list marker) closes the table per GFM.
+            if body.begins_block() {
+                break;
+            }
+            source_end = row_end;
+            row_pos = row_end + 1;
+        }
+
+        let source = self.input.get(source_start..source_end)?;
+        Some(TableScan {
+            source,
+            columns,
+            resume: source_end.min(bytes.len()).saturating_add(1),
+        })
     }
     /// Extract the language tag from a code fence opening line.
     /// `bytes` is the line with leading indentation already stripped.
@@ -2185,7 +2485,10 @@ impl<'src> ParseCtx<'src> {
                 ind > 3 && ind < col && !body.is_horizontal_rule() && body.list_marker().is_some();
             if item_blanks == 0 && last_para && (!body.begins_block() || dead_zone_marker) {
                 // Lazy lines are dedented by trimming (they sit left of `col`).
-                self.push_line(self.input.get(pos + ind..le).unwrap_or(""), dead_zone_marker);
+                self.push_line(
+                    self.input.get(pos + ind..le).unwrap_or(""),
+                    dead_zone_marker,
+                );
                 pos = le + 1;
                 continue;
             }
@@ -2456,7 +2759,10 @@ impl<'src> ParseCtx<'src> {
                     // leaves `(tab_width - 1)` columns of pad.
                     let tab_col = indent + 1;
                     let pad = u8::try_from((4 - (tab_col % 4)).saturating_sub(1)).unwrap_or(0);
-                    (pad, self.input.get(content_start + 1..line_end).unwrap_or(""))
+                    (
+                        pad,
+                        self.input.get(content_start + 1..line_end).unwrap_or(""),
+                    )
                 }
                 _ => (0, self.input.get(content_start..line_end).unwrap_or("")),
             };

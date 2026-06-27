@@ -112,7 +112,9 @@ impl OffsetExt for usize {
     }
 }
 use crate::simd::ByteSliceExt;
-pub use section::{InlineSpan, LineRange, OrderedListDelimiter, PoolLine, Section, SectionRange};
+pub use section::{
+    ColumnAlignment, InlineSpan, LineRange, OrderedListDelimiter, PoolLine, Section, SectionRange,
+};
 pub use special_char::SpecialChar;
 
 use std::borrow::Cow;
@@ -193,12 +195,8 @@ impl MarkdownFile<'_, 16, 32> {
     }
 }
 
-impl<
-    'src,
-    const MAX_INLINE_DEPTH: u8,
-    const INLINE_STACK_CAP: usize,
-    const MAX_BLOCK_DEPTH: u16,
-> MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP, MAX_BLOCK_DEPTH>
+impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_BLOCK_DEPTH: u16>
+    MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP, MAX_BLOCK_DEPTH>
 {
     /// Get the inline elements referenced by a span.
     #[must_use]
@@ -245,11 +243,19 @@ impl<
                 Section::UnorderedList { items, .. } | Section::OrderedList { items, .. } => {
                     self.walk_sections(self.child_sections(*items));
                 }
-                Section::Heading { content, .. } | Section::Paragraph { content } => {
+                Section::Heading { content, .. }
+                | Section::Paragraph { content }
+                | Section::TableCell { content, .. } => {
                     let _ = self.inlines(*content);
                 }
                 Section::Blockquote { children } | Section::ListItem { children } => {
                     self.walk_sections(self.child_sections(*children));
+                }
+                Section::Table { rows, .. } => {
+                    self.walk_sections(self.child_sections(*rows));
+                }
+                Section::TableRow { cells, .. } => {
+                    self.walk_sections(self.child_sections(*cells));
                 }
                 Section::CodeBlock { .. }
                 | Section::CodeLines { .. }
@@ -262,12 +268,8 @@ impl<
     }
 }
 
-impl<
-    'src,
-    const MAX_INLINE_DEPTH: u8,
-    const INLINE_STACK_CAP: usize,
-    const MAX_BLOCK_DEPTH: u16,
-> std::ops::Index<InlineSpan>
+impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_BLOCK_DEPTH: u16>
+    std::ops::Index<InlineSpan>
     for MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP, MAX_BLOCK_DEPTH>
 {
     type Output = [Inline<'src>];
@@ -279,12 +281,8 @@ impl<
     }
 }
 
-impl<
-    'src,
-    const MAX_INLINE_DEPTH: u8,
-    const INLINE_STACK_CAP: usize,
-    const MAX_BLOCK_DEPTH: u16,
-> std::ops::Index<SectionRange>
+impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_BLOCK_DEPTH: u16>
+    std::ops::Index<SectionRange>
     for MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP, MAX_BLOCK_DEPTH>
 {
     type Output = [Section<'src>];
@@ -314,12 +312,8 @@ impl<'a, 'src> Iterator for ChildSections<'a, 'src> {
     }
 }
 
-impl<
-    'src,
-    const MAX_INLINE_DEPTH: u8,
-    const INLINE_STACK_CAP: usize,
-    const MAX_BLOCK_DEPTH: u16,
-> std::ops::Index<LineRange>
+impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_BLOCK_DEPTH: u16>
+    std::ops::Index<LineRange>
     for MarkdownFile<'src, MAX_INLINE_DEPTH, INLINE_STACK_CAP, MAX_BLOCK_DEPTH>
 {
     type Output = [PoolLine<'src>];

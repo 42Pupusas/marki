@@ -74,8 +74,6 @@ static BRACKET_CLOSE_SET: ByteSet = ByteSet::new(&[
 static EMPH_ONLY_SET: ByteSet =
     ByteSet::new(&[SpecialChar::Asterisk.byte(), SpecialChar::Underscore.byte()]);
 
-
-
 /// The only bytes that can begin a link/image inside link text, for the
 /// "no links in links" pre-check ([`InlineParser::region_has_link`]): `[`
 /// (link / reference), `!` (image), and `\` (escape, which neutralizes the
@@ -1079,9 +1077,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             }
             // Image `![…](…)` / `![…][…]`: skip the whole construct so links in
             // its alt are not counted.
-            if b == SpecialChar::ExclamationMark
-                && bytes.get(j + 1) == SpecialChar::OpenBracket
-            {
+            if b == SpecialChar::ExclamationMark && bytes.get(j + 1) == SpecialChar::OpenBracket {
                 if let Some((_, _, _, e)) =
                     Self::try_parse_bracket_paren(self.input, bytes, scratch, j + 1)
                 {
@@ -1349,7 +1345,12 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
                 // spans `text_str.len()` bytes.
                 let text_start = i + 1;
                 let text_end = text_start + text_str.len();
-                if self.region_has_link(bytes, bracket_scratch.as_mut().unwrap(), text_start, text_end) {
+                if self.region_has_link(
+                    bytes,
+                    bracket_scratch.as_mut().unwrap(),
+                    text_start,
+                    text_end,
+                ) {
                     i += 1;
                     continue;
                 }
@@ -1379,9 +1380,7 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
             // Emphasis delimiter run (`*`/`_`). Only the arena path handles
             // these; the buffer fast path is only chosen when the context has
             // no emphasis, so this branch is compiled out there.
-            if S::HANDLES_DELIMS
-                && (b == SpecialChar::Asterisk || b == SpecialChar::Underscore)
-            {
+            if S::HANDLES_DELIMS && (b == SpecialChar::Asterisk || b == SpecialChar::Underscore) {
                 let (count, can_open, can_close) = Self::scan_delims(bytes, i, b);
                 debug_assert!(count > 0);
                 flush_text!(i);
