@@ -5,11 +5,33 @@
 //! matching the structure the `CommonMark` reference renderer uses. It is the
 //! comparison target for the conformance test suite in `tests/commonmark.rs`.
 
+mod footnotes;
+
 use std::fmt::Write as _;
 
 use crate::entity::Entity;
-use crate::section::SectionRange;
+use crate::ext;
+use crate::section::{Checkbox, SectionRange};
 use crate::{Inline, InlineSpan, MarkdownFile, Section};
+
+/// Where inline content is being rendered. In a GFM table cell, `\|` stands
+/// for `|` even inside code spans and raw HTML, because cmark-gfm unescapes
+/// pipes in the cell source before parsing it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InlineContext {
+    Block,
+    TableCell,
+}
+
+impl InlineContext {
+    fn literal(self, s: &str) -> std::borrow::Cow<'_, str> {
+        if self == Self::TableCell && s.contains("\\|") {
+            std::borrow::Cow::Owned(s.replace("\\|", "|"))
+        } else {
+            std::borrow::Cow::Borrowed(s)
+        }
+    }
+}
 
 /// HTML-rendering sink: every escaping helper hangs off the output [`String`]
 /// as a method, so the renderer reads as `out.escape_html(code)` rather than
@@ -26,6 +48,7 @@ trait HtmlSink {
     fn escape_href_autolink(&mut self, s: &str);
     fn escape_info_string(&mut self, s: &str);
     fn escape_link_title(&mut self, s: &str);
+    fn escape_footnote_id(&mut self, s: &str);
     fn push_cr(&mut self);
 }
 
@@ -255,6 +278,56 @@ impl HtmlSink for String {
         }
     }
 
+    /// Escape a footnote label for use in an `id` or `#fragment`, the way
+    /// cmark-gfm does: alphanumerics and `-_.+!*(),#@?=;:/$~` pass through,
+    /// `&` becomes `&amp;`, `'` becomes `&#x27;`, an existing `%XX` escape is
+    /// kept, and every other byte is percent-encoded.
+    fn escape_footnote_id(&mut self, s: &str) {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            match b {
+                b'a'..=b'z'
+                | b'A'..=b'Z'
+                | b'0'..=b'9'
+                | b'-'
+                | b'_'
+                | b'.'
+                | b'+'
+                | b'!'
+                | b'*'
+                | b'('
+                | b')'
+                | b','
+                | b'#'
+                | b'@'
+                | b'?'
+                | b'='
+                | b';'
+                | b':'
+                | b'/'
+                | b'$'
+                | b'~' => self.push(b as char),
+                b'&' => self.push_str("&amp;"),
+                b'\'' => self.push_str("&#x27;"),
+                b'%' if bytes.get(i + 1).is_some_and(u8::is_ascii_hexdigit)
+                    && bytes.get(i + 2).is_some_and(u8::is_ascii_hexdigit) =>
+                {
+                    self.push_str(&s[i..i + 3]);
+                    i += 2;
+                }
+                _ => {
+                    self.push('%');
+                    self.push(HEX[(b >> 4) as usize] as char);
+                    self.push(HEX[(b & 0xf) as usize] as char);
+                }
+            }
+            i += 1;
+        }
+    }
+
     /// Emit a newline only if non-empty and not already ending with one.
     /// Mirrors the `CommonMark` reference renderer's `cr()`, which keeps block
     /// elements on their own lines without doubling up newlines.
@@ -278,9 +351,7 @@ static HREF_SAFE: [bool; 256] = {
         b += 1;
     }
     // Carve out the unsafe ASCII punctuation that `encodeURI` percent-encodes.
-    let unsafe_bytes = [
-        b'"', b'<', b'>', b'[', b'\\', b']', b'^', b'`', b'{', b'|', b'}',
-    ];
+    let unsafe_bytes = *b"\"<>[\\]^`{|}";
     let mut i = 0;
     while i < unsafe_bytes.len() {
         t[unsafe_bytes[i] as usize] = false;
@@ -334,6 +405,7 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_BLOCK_
         for section in &self.sections {
             self.render_section(section, &mut out);
         }
+        self.render_footnotes(&mut out);
         out
     }
 
@@ -418,32 +490,67 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_BLOCK_
                 }
                 out.push_str("</blockquote>\n");
             }
+            Section::Alert {
+                kind,
+                title,
+                children,
+            } => self.render_alert(*kind, *title, *children, out),
             Section::HtmlBlock { html } => {
                 // Emitted verbatim, with the trailing newline CommonMark adds.
-                out.push_str(html);
+                ext::TagFilter::block(out, html);
                 out.push('\n');
             }
-            Section::HtmlLines { lines } => {
-                // Dedented container HTML block: emit each line verbatim.
-                let mut first = true;
-                for pl in self.code_lines(*lines) {
-                    if !first {
-                        out.push('\n');
-                    }
-                    first = false;
-                    for _ in 0..pl.pad {
-                        out.push(' ');
-                    }
-                    out.push_str(pl.text);
-                }
-                out.push('\n');
-            }
+            Section::HtmlLines { lines } => self.render_html_lines(*lines, out),
             Section::HorizontalRule => out.push_str("<hr />\n"),
             Section::Table { rows, .. } => self.render_table(*rows, out),
-            // Rows and cells are emitted by their parent `Table`; reaching one
-            // standalone is not meaningful, so render nothing.
-            Section::TableRow { .. } | Section::TableCell { .. } => {}
+            // Rows and cells are emitted by their parent `Table`, and footnote
+            // definitions by `render_footnotes` after the body.
+            Section::TableRow { .. }
+            | Section::TableCell { .. }
+            | Section::FootnoteDefinition { .. } => {}
         }
+    }
+
+    /// Render an HTML block whose lines were dedented out of a container,
+    /// emitting each line verbatim with its synthetic leading spaces.
+    fn render_html_lines(&self, lines: crate::LineRange, out: &mut String) {
+        let mut first = true;
+        for pl in self.code_lines(lines) {
+            if !first {
+                out.push('\n');
+            }
+            first = false;
+            for _ in 0..pl.pad {
+                out.push(' ');
+            }
+            ext::TagFilter::block(out, pl.text);
+        }
+        out.push('\n');
+    }
+
+    /// Render a GFM alert as GitHub does: a `markdown-alert` `<div>` with a
+    /// title paragraph followed by the alert's blocks.
+    fn render_alert(
+        &self,
+        kind: crate::AlertKind,
+        title: Option<&str>,
+        children: SectionRange,
+        out: &mut String,
+    ) {
+        let _ = write!(
+            out,
+            "<div class=\"markdown-alert markdown-alert-{}\">\n<p class=\"markdown-alert-title\">",
+            kind.keyword()
+        );
+        match title {
+            Some(title) => out.escape_link_title(title),
+            None => out.push_str(kind.default_title()),
+        }
+        out.push_str("</p>\n");
+        for child in self.child_sections(children) {
+            self.render_section(child, out);
+        }
+        out.push_str("</div>\n");
     }
 
     /// Open a `<pre><code …>` tag, attaching a `language-…` class derived from
@@ -506,7 +613,7 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_BLOCK_
                 crate::ColumnAlignment::Right => " align=\"right\"",
             };
             let _ = write!(out, "<{tag}{attr}>");
-            self.render_inlines(*content, out);
+            self.render_inlines_in(*content, InlineContext::TableCell, out);
             let _ = writeln!(out, "</{tag}>");
         }
         out.push_str("</tr>\n");
@@ -517,12 +624,21 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_BLOCK_
     /// while every other block is preceded by a soft line break (emitted only
     /// when the output isn't already at the start of a line).
     fn render_list_item(&self, item: &Section<'_>, tight: bool, out: &mut String) {
-        let Section::ListItem { children } = item else {
+        let Section::ListItem { task, children } = item else {
             self.render_section(item, out);
             return;
         };
         let kids = self.child_sections(*children);
         out.push_str("<li>");
+        match task {
+            Some(Checkbox::Checked) => {
+                out.push_str("<input type=\"checkbox\" checked=\"\" disabled=\"\" /> ");
+            }
+            Some(Checkbox::Unchecked) => {
+                out.push_str("<input type=\"checkbox\" disabled=\"\" /> ");
+            }
+            None => {}
+        }
         for kid in kids {
             if tight && let Section::Paragraph { content } = kid {
                 // Tight paragraph: bare inlines, no wrapper, no leading break.
@@ -536,8 +652,12 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_BLOCK_
     }
 
     fn render_inlines(&self, span: InlineSpan, out: &mut String) {
+        self.render_inlines_in(span, InlineContext::Block, out);
+    }
+
+    fn render_inlines_in(&self, span: InlineSpan, ctx: InlineContext, out: &mut String) {
         for inline in self.inlines(span) {
-            self.render_inline(inline, out);
+            self.render_inline(inline, ctx, out);
         }
     }
 
@@ -552,44 +672,56 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_BLOCK_
                 Inline::Code(c) => out.escape_html(c),
                 Inline::Autolink { target, .. } => out.escape_html(target),
                 Inline::RawHtml(h) => out.escape_html(h),
-                Inline::Bold(s) | Inline::Italic(s) | Inline::Link { text: s, .. } => {
+                Inline::Bold(s)
+                | Inline::Italic(s)
+                | Inline::Strikethrough(s)
+                | Inline::Link { text: s, .. } => {
                     self.render_alt_text(*s, out);
                 }
                 Inline::Image { alt, .. } => self.render_alt_text(*alt, out),
+                Inline::FootnoteRef { .. } => {}
                 Inline::SoftBreak | Inline::HardBreak => out.push('\n'),
             }
         }
     }
 
-    fn render_inline(&self, inline: &Inline<'_>, out: &mut String) {
+    fn render_inline(&self, inline: &Inline<'_>, ctx: InlineContext, out: &mut String) {
         match inline {
             Inline::Text(t) => out.escape_text(t),
             Inline::Bold(span) => {
                 out.push_str("<strong>");
-                self.render_inlines(*span, out);
+                self.render_inlines_in(*span, ctx, out);
                 out.push_str("</strong>");
             }
             Inline::Italic(span) => {
                 out.push_str("<em>");
-                self.render_inlines(*span, out);
+                self.render_inlines_in(*span, ctx, out);
                 out.push_str("</em>");
+            }
+            Inline::Strikethrough(span) => {
+                out.push_str("<del>");
+                self.render_inlines_in(*span, ctx, out);
+                out.push_str("</del>");
             }
             Inline::Code(c) => {
                 out.push_str("<code>");
-                out.escape_code_span(c);
+                out.escape_code_span(&ctx.literal(c));
                 out.push_str("</code>");
             }
-            Inline::Autolink { target, is_email } => {
+            Inline::Autolink { target, kind } => {
                 out.push_str("<a href=\"");
-                if *is_email {
-                    out.push_str("mailto:");
-                }
+                out.push_str(kind.scheme_prefix());
                 out.escape_href_autolink(target);
                 out.push_str("\">");
                 out.escape_html(target);
                 out.push_str("</a>");
             }
-            Inline::RawHtml(html) => out.push_str(html),
+            Inline::FootnoteRef {
+                label,
+                number,
+                occurrence,
+            } => Self::render_footnote_ref(label, *number, *occurrence, out),
+            Inline::RawHtml(html) => ext::TagFilter::inline(out, &ctx.literal(html)),
             Inline::Link { text, url, title } => {
                 out.push_str("<a href=\"");
                 out.escape_href(url);
@@ -600,7 +732,7 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_BLOCK_
                     out.push('"');
                 }
                 out.push('>');
-                self.render_inlines(*text, out);
+                self.render_inlines_in(*text, ctx, out);
                 out.push_str("</a>");
             }
             Inline::Image { alt, url, title } => {

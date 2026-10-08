@@ -2,14 +2,27 @@
 
 A zero-copy Markdown parser for Rust. Parses markdown strings into structured sections and inline elements, borrowing directly from the input with no intermediate allocations for text content.
 
-**100% CommonMark conformant** — passes all 652 examples in the CommonMark spec test suite, with the zero-copy guarantee fully intact.
+**100% CommonMark conformant**: passes all 652 examples in the CommonMark spec test suite, with the zero-copy guarantee fully intact. With the default `gfm` feature it also implements GitHub Flavored Markdown, checked against every extension example in the GFM spec and cmark-gfm's extension tests.
 
 ## Features
 
-- Zero-copy parsing — all text slices borrow from the input
+- Zero-copy parsing: all text slices borrow from the input
 - Full CommonMark conformance (652/652 spec examples), gated in CI
+- GitHub Flavored Markdown behind the default `gfm` cargo feature
 - Type-safe representation of markdown elements via `SpecialChar`, `Section`, and `Inline`
 - Fold-based state machine for single-pass block-level parsing
+
+## Cargo features
+
+| Feature | Default | Effect |
+|---------|---------|--------|
+| `gfm`   | yes     | GitHub Flavored Markdown extensions (listed below). |
+
+For strict CommonMark, disable default features:
+
+```toml
+marki-parse = { version = "0.3", default-features = false }
+```
 
 ## Supported Sections
 
@@ -20,7 +33,6 @@ A zero-copy Markdown parser for Rust. Parses markdown strings into structured se
 - Unordered lists (`-`, `*`, or `+` markers) and ordered lists (with preserved start number)
 - Nested lists and multi-block list items, loose/tight detection
 - Blockquotes (including nested and lazy continuation)
-- GFM tables (pipe-delimited, per-column alignment, header/body rows)
 - Link reference definitions
 - Horizontal rules (`---`, `***`, `___`)
 - Tabs expanded to 4-column stops per spec, including partial expansion inside containers
@@ -35,6 +47,18 @@ A zero-copy Markdown parser for Rust. Parses markdown strings into structured se
 - Entity and numeric character references
 - Backslash escapes
 
+## GitHub Flavored Markdown (`gfm` feature)
+
+- Tables: pipe-delimited, per-column alignment, header and body rows (`Section::Table`)
+- Strikethrough: `~~text~~` or `~text~` (`Inline::Strikethrough`, rendered as `<del>`)
+- Task lists: `- [ ]` / `- [x]` items (`Section::ListItem { task: Some(Checkbox::…) }`)
+- Extended autolinks: bare `www.` hosts, `http://`, `https://`, `ftp://` URLs, and email addresses (`Inline::Autolink` with `AutolinkKind::Www`/`Uri`/`Email`)
+- Disallowed raw HTML: the `<` of `<script>`, `<style>`, `<iframe>`, `<textarea>`, `<title>`, `<xmp>`, `<noembed>`, `<noframes>`, and `<plaintext>` is rendered as `&lt;`
+- Footnotes: `[^label]` references and `[^label]: …` definitions, numbered by first reference and rendered as GitHub does (`Inline::FootnoteRef`, `Section::FootnoteDefinition`)
+- Alerts: `> [!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`, with an optional custom title (`Section::Alert`)
+
+Footnote definitions are recognised at the top level of a document only.
+
 ## Usage
 
 ```rust
@@ -48,7 +72,7 @@ for section in &md.sections {
 
 ## CRLF Support
 
-The parser operates on LF (`\n`) line endings. For CRLF (`\r\n`) input, call `normalize` before parsing — it returns the input borrowed when no `\r` is present (zero-cost), or an owned copy with `\r` stripped:
+The parser operates on LF (`\n`) line endings. For CRLF (`\r\n`) input, call `normalize` before parsing. It returns the input borrowed when no `\r` is present (zero cost), or an owned copy with `\r` stripped:
 
 ```rust
 use marki_parse::MarkdownFile;

@@ -178,6 +178,49 @@ impl ColumnAlignment {
     }
 }
 
+/// The kind of a GFM alert (`> [!NOTE]`, `> [!TIP]`, …).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertKind {
+    Note,
+    Tip,
+    Important,
+    Warning,
+    Caution,
+}
+
+impl AlertKind {
+    /// The title rendered when the alert has no custom one.
+    #[must_use]
+    pub const fn default_title(self) -> &'static str {
+        match self {
+            Self::Note => "Note",
+            Self::Tip => "Tip",
+            Self::Important => "Important",
+            Self::Warning => "Warning",
+            Self::Caution => "Caution",
+        }
+    }
+
+    /// The lowercase keyword, used for the `markdown-alert-…` CSS class.
+    #[must_use]
+    pub const fn keyword(self) -> &'static str {
+        match self {
+            Self::Note => "note",
+            Self::Tip => "tip",
+            Self::Important => "important",
+            Self::Warning => "warning",
+            Self::Caution => "caution",
+        }
+    }
+}
+
+/// The checkbox of a GFM task-list item (`- [ ]` / `- [x]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Checkbox {
+    Unchecked,
+    Checked,
+}
+
 impl Section<'_> {
     /// Number of pool entries this section occupies, including itself and its
     /// entire pre-order subtree. Leaves span 1; containers span `1 + len` of
@@ -189,9 +232,10 @@ impl Section<'_> {
             Section::UnorderedList { items, .. } | Section::OrderedList { items, .. } => {
                 1 + items.len as usize
             }
-            Section::ListItem { children } | Section::Blockquote { children } => {
-                1 + children.len as usize
-            }
+            Section::ListItem { children, .. }
+            | Section::Blockquote { children }
+            | Section::Alert { children, .. }
+            | Section::FootnoteDefinition { children, .. } => 1 + children.len as usize,
             Section::Table { rows, .. } => 1 + rows.len as usize,
             Section::TableRow { cells, .. } => 1 + cells.len as usize,
             _ => 1,
@@ -235,8 +279,10 @@ pub enum Section<'src> {
         items: SectionRange,
     },
     /// A single list item (`CommonMark` §5.2), containing child block-level
-    /// sections stored as a range in the document's section pool.
+    /// sections stored as a range in the document's section pool. `task` is
+    /// the GFM task-list checkbox, when the item starts with `[ ]` or `[x]`.
     ListItem {
+        task: Option<Checkbox>,
         children: SectionRange,
     },
     /// A code block whose content lines were dedented out of a container (list
@@ -249,6 +295,25 @@ pub enum Section<'src> {
     /// A blockquote (`CommonMark` §5.1) containing child block-level sections,
     /// stored as a range in the document's section pool.
     Blockquote {
+        children: SectionRange,
+    },
+    /// A GFM alert: a blockquote whose first line is `[!NOTE]`, `[!TIP]`,
+    /// `[!IMPORTANT]`, `[!WARNING]`, or `[!CAUTION]`. `title` is the raw text
+    /// after the marker, if any.
+    Alert {
+        kind: AlertKind,
+        title: Option<&'src str>,
+        children: SectionRange,
+    },
+    /// A GFM footnote definition (`[^label]: …`). It stays at its source
+    /// position; renderers collect referenced definitions at the document end.
+    /// `number` is the 1-based position in the footnote list, assigned in
+    /// order of first reference, and `references` counts the references to
+    /// it. Both are `0` for a definition that is never referenced.
+    FootnoteDefinition {
+        label: &'src str,
+        number: u32,
+        references: u32,
         children: SectionRange,
     },
     /// A raw HTML block (`CommonMark` §4.6). The slice is emitted verbatim,

@@ -1,11 +1,11 @@
 use crate::OffsetExt;
 use crate::VecReuse;
+use crate::ext;
 use crate::inline::InlineParser;
 use crate::link_def::{LinkDef, LinkDefs, LinkLabel};
 use crate::raw_html::HtmlScan;
-use crate::section::{
-    ColumnAlignment, InlineSpan, LineRange, OrderedListDelimiter, PoolLine, Section, SectionRange,
-};
+use crate::refs::{RefStore, Refs};
+use crate::section::{LineRange, OrderedListDelimiter, PoolLine, Section, SectionRange};
 use crate::simd::ByteSliceExt;
 use crate::small_bool::SmallBoolVec;
 use crate::special_char::SpecialChar;
@@ -59,15 +59,8 @@ enum RawSection<'src> {
         html: &'src str,
     },
     HorizontalRule,
-    /// A GFM table (`CommonMark`/GFM §4.10) captured as its verbatim source
-    /// span (header row + delimiter row + body rows, no trailing newline) plus
-    /// the column count fixed by the header/delimiter rows. Pass 2
-    /// ([`assemble_table`]) splits the rows, derives per-column alignment, and
-    /// inline-parses each cell.
-    Table {
-        source: &'src str,
-        columns: u16,
-    },
+    /// A block produced by a GFM extension (table, footnote definition).
+    Ext(ext::RawBlock<'src>),
 }
 
 /// Pass-1 metadata for one top-level list item: the half-open range of
@@ -89,18 +82,9 @@ struct ListScan {
     resume: usize,
 }
 
-/// Result of [`ParseCtx::scan_table`]: the verbatim table source span (header
-/// row + delimiter row + body rows, no trailing newline), its column count, and
-/// the byte offset to resume parsing at.
-struct TableScan<'src> {
-    source: &'src str,
-    columns: u16,
-    resume: usize,
-}
-
 /// A parsed list marker at the start of a (de-indented) line.
 #[derive(Clone, Copy)]
-struct Marker {
+pub struct Marker {
     /// `Some((start, delim))` for an ordered item, `None` for a bullet.
     ordered: Option<(u32, OrderedListDelimiter)>,
     /// Width of the marker characters only (bullet = 1; ordered = digits + 1).
@@ -133,7 +117,7 @@ impl Marker {
 /// pre-order arena, so each child block is appended in place (see
 /// [`MarkdownFile::resolve_blocks`]).
 #[derive(Default)]
-struct Scratch<'src> {
+pub struct Scratch<'src> {
     lines: Vec<Vec<&'src str>>,
 }
 
@@ -165,7 +149,7 @@ struct ParseScratch<'src> {
     lazy: Vec<bool>,
     pad: Vec<u8>,
     list_items: Vec<ItemMeta>,
-    defs: LinkDefs<'src>,
+    refs: RefStore<'src>,
 }
 
 impl ParseScratch<'_> {
@@ -178,7 +162,7 @@ impl ParseScratch<'_> {
         self.lazy.clear();
         self.pad.clear();
         self.list_items.clear();
-        self.defs.clear();
+        self.refs.clear();
     }
 }
 
@@ -194,12 +178,11 @@ thread_local! {
 impl ParseScratch<'_> {
     /// Re-type an emptied scratch set to a different lifetime, recycling each
     /// `Vec`'s heap allocation via [`crate::reuse_alloc`] (which clears it,
-    /// dropping every borrowed element). The `defs` map cannot reuse its
-    /// allocation across the lifetime change (`HashMap` has no in-place
-    /// re-collect), so it is replaced with a fresh empty map; this allocates
-    /// nothing in the common case (a document with no link definitions never
-    /// populates the table). This is the safe replacement for the lifetime
-    /// `transmute` the pooled scratch set used to require.
+    /// dropping every borrowed element). The definition registries cannot
+    /// reuse their allocations across the lifetime change (`HashMap` has no
+    /// in-place re-collect), so they are replaced with fresh empty ones; this
+    /// allocates nothing in the common case (a document with no definitions
+    /// never populates them).
     fn relifetime<'dst>(self) -> ParseScratch<'dst> {
         ParseScratch {
             sections: self.sections.reuse_alloc(),
@@ -207,7 +190,7 @@ impl ParseScratch<'_> {
             lazy: self.lazy,
             pad: self.pad,
             list_items: self.list_items,
-            defs: LinkDefs::default(),
+            refs: RefStore::default(),
         }
     }
 
@@ -233,19 +216,19 @@ impl ParseScratch<'_> {
     }
 }
 
-struct ParseCtx<'src> {
-    input: &'src str,
+pub struct ParseCtx<'src> {
+    pub input: &'src str,
     bytes: &'src [u8],
     sections: Vec<RawSection<'src>>,
     /// Shared pool for blockquote lines and list items, avoiding per-section
     /// `Vec<&str>` heap allocations.
-    lines: Vec<&'src str>,
+    pub lines: Vec<&'src str>,
     /// Parallel to [`lines`](Self::lines): `true` where a line was collected as
     /// a *lazy paragraph continuation* (`CommonMark` §5.1). Pass 2 consults the
     /// slice for a container's lines so a lazy line is never re-promoted to a
     /// setext heading or a sublist marker (examples 93 and 312). Always kept
     /// the same length as `lines` via [`push_line`](Self::push_line).
-    lazy: Vec<bool>,
+    pub lazy: Vec<bool>,
     /// Parallel to [`lines`](Self::lines): synthetic leading-space columns that
     /// were consumed *mid-tab* when a container prefix (a blockquote `>`
     /// padding or a list content column) was stripped (`CommonMark` §2.2 tab
@@ -253,12 +236,13 @@ struct ParseCtx<'src> {
     /// is a multiple of 4), so tab expansion *within* the slice stays
     /// absolute-correct; this count restores the columns lost between the
     /// container's content origin and that tab stop. Almost always `0`.
-    pad: Vec<u8>,
+    pub pad: Vec<u8>,
     /// Per-item metadata for top-level lists, referenced by
     /// [`RawSection::List`]; lets pass 2 skip re-scanning item boundaries.
     list_items: Vec<ItemMeta>,
-    /// Link reference definitions collected during pass 1 (`CommonMark` §4.7).
-    defs: LinkDefs<'src>,
+    /// Link reference definitions (`CommonMark` §4.7) and, with `gfm`,
+    /// footnote definitions collected during pass 1.
+    pub refs: RefStore<'src>,
 }
 
 enum Accumulator<'src> {
@@ -324,98 +308,7 @@ const COULD_START_BLOCK: [bool; 256] = {
     table
 };
 
-/// Upper bound on table columns we track alignment for. Columns beyond this
-/// keep [`ColumnAlignment::None`]; far past any real table width and bounds the
-/// stack array in [`assemble_table`].
-const MAX_TABLE_COLUMNS: usize = 128;
-
-/// Splits one GFM table row into its cell slices, honouring backslash-escaped
-/// pipes (`\|`) and stripping a single optional leading/trailing delimiter
-/// pipe (`CommonMark`/GFM §4.10). Yields borrowed source slices (cells are
-/// *not* trimmed here — the caller trims).
-///
-/// Escaping is detected by counting the run of backslashes preceding a `|`: an
-/// odd run escapes the pipe (it stays in the cell), an even run does not (it is
-/// a separator). The slices stay zero-copy, so an escaped `\|` is rendered
-/// verbatim by the inline parser (which resolves the backslash escape itself).
-struct TableCells<'src> {
-    rest: Option<&'src str>,
-}
-
-impl<'src> TableCells<'src> {
-    fn new(row: &'src str) -> Self {
-        // Strip a single optional leading pipe (after optional whitespace) and a
-        // single optional trailing pipe (before optional whitespace).
-        let trimmed = row.trim();
-        let without_lead = trimmed.strip_prefix('|').unwrap_or(trimmed);
-        let body = without_lead.strip_suffix('|').unwrap_or(without_lead);
-        Self { rest: Some(body) }
-    }
-
-    /// Byte index of the next *unescaped* `|` in `s`, or `None`.
-    fn next_pipe(s: &str) -> Option<usize> {
-        let bytes = s.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'|' {
-                // Count preceding backslashes; odd => escaped.
-                let mut bs = 0;
-                let mut j = i;
-                while j > 0 && bytes[j - 1] == b'\\' {
-                    bs += 1;
-                    j -= 1;
-                }
-                if bs % 2 == 0 {
-                    return Some(i);
-                }
-            }
-            i += 1;
-        }
-        None
-    }
-}
-
-impl<'src> Iterator for TableCells<'src> {
-    type Item = &'src str;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let s = self.rest?;
-        if let Some(i) = Self::next_pipe(s) {
-            let (cell, after) = (&s[..i], &s[i + 1..]);
-            self.rest = Some(after);
-            Some(cell)
-        } else {
-            self.rest = None;
-            Some(s)
-        }
-    }
-}
-
-/// Count the cells in a GFM table row (the [`TableCells`] split length). Used in
-/// pass 1 to verify the header and delimiter rows agree on a column count.
-fn table_row_cell_count(row: &str) -> usize {
-    TableCells::new(row).count()
-}
-
-/// Validate a GFM table delimiter row (`CommonMark`/GFM §4.10): every cell, once
-/// trimmed, must be a non-empty run of `-` with an optional leading and/or
-/// trailing `:` (e.g. `---`, `:--`, `:-:`, `--:`). Returns the column count
-/// when valid, else `None`.
-fn table_delimiter_columns(row: &str) -> Option<usize> {
-    let mut n = 0;
-    for cell in TableCells::new(row) {
-        let c = cell.trim().as_bytes();
-        let no_lead = c.strip_prefix(b":").unwrap_or(c);
-        let inner = no_lead.strip_suffix(b":").unwrap_or(no_lead);
-        if inner.is_empty() || !inner.iter().all(|&b| b == b'-') {
-            return None;
-        }
-        n += 1;
-    }
-    (n > 0).then_some(n)
-}
-
-trait BlockBytes {
+pub trait BlockBytes {
     fn is_blank_line(&self, start: usize, end: usize) -> bool;
     fn strip_indent(&self) -> Option<usize>;
     fn code_fence_opening(&self) -> Option<(u8, usize)>;
@@ -457,7 +350,7 @@ trait BlockBytes {
 
 /// Column-oriented indentation helpers on source-text lines (`&str`), kept as
 /// trait methods so the block parser has no bare functions.
-trait BlockStr {
+pub trait BlockStr {
     fn strip_columns(&self, cols: usize) -> Option<&str>;
     fn strip_columns_padded(&self, cols: usize) -> (u8, &str);
     fn strip_cols_from_padded(pad: u8, slice: &str, n: usize) -> (u8, &str);
@@ -969,8 +862,8 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
         // the document than its container-nested definition. So sweep every
         // container's collected lines for defs up front, merging them with the
         // top-level ones (top-level / earlier defs win via `or_insert`).
-        let combined_defs: LinkDefs<'src>;
-        let defs: &LinkDefs<'src> = if ctx
+        let with_nested: LinkDefs<'src>;
+        let link_defs: &LinkDefs<'src> = if ctx
             .sections
             .iter()
             .any(|s| matches!(s, RawSection::Blockquote { .. } | RawSection::List { .. }))
@@ -1010,18 +903,19 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
                 }
             }
             if found.is_empty() {
-                &ctx.defs
+                &ctx.refs.links
             } else {
-                let mut map = ctx.defs.clone();
+                let mut map = ctx.refs.links.clone();
                 for (label, val) in found {
                     map.entry(label).or_insert(val);
                 }
-                combined_defs = map;
-                &combined_defs
+                with_nested = map;
+                &with_nested
             }
         } else {
-            &ctx.defs
+            &ctx.refs.links
         };
+        let defs = ctx.refs.view_with(link_defs);
         let mut scratch = Scratch::default();
         let mut sections = Vec::with_capacity(ctx.sections.len());
         for raw_section in &ctx.sections {
@@ -1109,7 +1003,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
                     let raw_lines = lines.get(span.clone()).unwrap_or(&[]);
                     let raw_lazy = ctx.lazy.get(span.clone()).unwrap_or(&[]);
                     let raw_pad = ctx.pad.get(span).unwrap_or(&[]);
-                    let children = Self::resolve_blocks(
+                    let quote = Self::resolve_quote(
                         ctx.input,
                         1,
                         raw_lines,
@@ -1121,7 +1015,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
                         &mut scratch,
                         defs,
                     );
-                    sections.push(Section::Blockquote { children });
+                    sections.push(quote);
                 }
                 RawSection::HtmlBlock { html } => {
                     sections.push(Section::HtmlBlock { html });
@@ -1129,103 +1023,124 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
                 RawSection::HorizontalRule => {
                     sections.push(Section::HorizontalRule);
                 }
-                RawSection::Table { source, columns } => {
-                    let table = Self::assemble_table(source, columns, pool, section_pool, defs);
-                    sections.push(table);
+                RawSection::Ext(block) => {
+                    let section = Self::resolve_ext_block(
+                        block,
+                        ctx,
+                        pool,
+                        section_pool,
+                        line_pool,
+                        &mut scratch,
+                        defs,
+                    );
+                    sections.push(section);
                 }
             }
         }
         sections
     }
 
-    /// Assemble a [`Section::Table`] from its verbatim `source` span (header
-    /// row, delimiter row, then body rows) and the `columns` count fixed in
-    /// pass 1. Builds the pre-order sub-forest in the section pool: the `Table`
-    /// node, then each `TableRow` immediately followed by its `TableCell`
-    /// children. The header row is emitted first (`header: true`); the
-    /// delimiter row is consumed for alignment only and never emitted.
-    fn assemble_table(
-        source: &'src str,
-        columns: u16,
+    /// Resolve a blockquote's content lines into a [`Section::Blockquote`], or
+    /// a [`Section::Alert`] when its first line is a GFM alert marker.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_quote(
+        input: &'src str,
+        depth: u16,
+        lines: &[&'src str],
+        lazy: &[bool],
+        pad: &[u8],
         pool: &mut Vec<Inline<'src>>,
         section_pool: &mut Vec<Section<'src>>,
-        defs: &LinkDefs<'src>,
+        line_pool: &mut Vec<PoolLine<'src>>,
+        scratch: &mut Scratch<'src>,
+        defs: Refs<'_, 'src>,
     ) -> Section<'src> {
-        let ncols = columns as usize;
-        let mut lines = source.split('\n');
-        let header = lines.next().unwrap_or("");
-        let delimiter = lines.next().unwrap_or("");
-
-        // Per-column alignment from the delimiter row.
-        let mut aligns = [ColumnAlignment::None; MAX_TABLE_COLUMNS];
-        for (i, cell) in TableCells::new(delimiter).enumerate() {
-            if i >= ncols {
-                break;
-            }
-            aligns[i] = ColumnAlignment::from_delimiter(cell.trim().as_bytes());
+        let alert = lines.first().and_then(|first| ext::Alerts::marker(first));
+        let skip = usize::from(alert.is_some());
+        let children = Self::resolve_blocks(
+            input,
+            depth,
+            lines.get(skip..).unwrap_or(&[]),
+            lazy.get(skip..).unwrap_or(&[]),
+            pad.get(skip..).unwrap_or(&[]),
+            pool,
+            section_pool,
+            line_pool,
+            scratch,
+            defs,
+        );
+        match alert {
+            Some((kind, title)) => Section::Alert {
+                kind,
+                title,
+                children,
+            },
+            None => Section::Blockquote { children },
         }
-        let align_of = |i: usize| aligns.get(i).copied().unwrap_or(ColumnAlignment::None);
+    }
 
-        // Pre-order: the Table node, then each row + its cells.
-        let rows_start = section_pool.len().pool_offset();
-
-        // A small closure appends one row (header or body) and its cells.
-        let push_row = |section_pool: &mut Vec<Section<'src>>,
-                        pool: &mut Vec<Inline<'src>>,
-                        line: &'src str,
-                        is_header: bool| {
-            let row_at = section_pool.len();
-            section_pool.push(Section::TableRow {
-                header: is_header,
-                cells: SectionRange::EMPTY,
-            });
-            let cells_start = section_pool.len().pool_offset();
-            let mut n = 0usize;
-            for cell in TableCells::new(line) {
-                if n >= ncols {
-                    break;
-                }
-                let content = InlineParser::<MAX_INLINE_DEPTH, INLINE_STACK_CAP>::parse_configured(
-                    cell.trim(),
+    /// Append one [`Section::ListItem`] and its child-block subtree. With
+    /// `gfm`, a leading `[ ]`/`[x]` checkbox on the first content line makes it
+    /// a task item; the checkbox is removed before the content is resolved.
+    #[allow(clippy::too_many_arguments)]
+    fn push_item(
+        input: &'src str,
+        depth: u16,
+        lines: &[&'src str],
+        lazy: &[bool],
+        pad: &[u8],
+        pool: &mut Vec<Inline<'src>>,
+        section_pool: &mut Vec<Section<'src>>,
+        line_pool: &mut Vec<PoolLine<'src>>,
+        scratch: &mut Scratch<'src>,
+        defs: Refs<'_, 'src>,
+    ) {
+        let task = lines
+            .first()
+            .filter(|_| pad.first().copied().unwrap_or(0) == 0)
+            .and_then(|first| ext::Tasks::split(first));
+        let item_at = section_pool.len();
+        section_pool.push(Section::ListItem {
+            task: None,
+            children: SectionRange::EMPTY,
+        });
+        let children = match task {
+            Some((_, rest)) => {
+                let mut owned = scratch.take_lines();
+                owned.extend_from_slice(lines);
+                owned[0] = rest;
+                let range = Self::resolve_blocks(
+                    input,
+                    depth,
+                    &owned,
+                    lazy,
+                    pad,
                     pool,
+                    section_pool,
+                    line_pool,
+                    scratch,
                     defs,
                 );
-                section_pool.push(Section::TableCell {
-                    align: align_of(n),
-                    content,
-                });
-                n += 1;
+                scratch.give_lines(owned);
+                range
             }
-            // Pad short rows with empty cells (GFM truncates long, pads short).
-            while n < ncols {
-                section_pool.push(Section::TableCell {
-                    align: align_of(n),
-                    content: InlineSpan::EMPTY,
-                });
-                n += 1;
-            }
-            let cells_len = section_pool.len().pool_offset() - cells_start;
-            section_pool[row_at] = Section::TableRow {
-                header: is_header,
-                cells: SectionRange::new(cells_start, cells_len),
-            };
+            None => Self::resolve_blocks(
+                input,
+                depth,
+                lines,
+                lazy,
+                pad,
+                pool,
+                section_pool,
+                line_pool,
+                scratch,
+                defs,
+            ),
         };
-
-        push_row(section_pool, pool, header, true);
-        for line in lines {
-            // A trailing empty split fragment (source never has a trailing
-            // newline, but guard anyway) contributes no row.
-            if line.is_empty() {
-                continue;
-            }
-            push_row(section_pool, pool, line, false);
-        }
-
-        let rows_len = section_pool.len().pool_offset() - rows_start;
-        Section::Table {
-            columns,
-            rows: SectionRange::new(rows_start, rows_len),
-        }
+        section_pool[item_at] = Section::ListItem {
+            task: task.map(|(checkbox, _)| checkbox),
+            children,
+        };
     }
 
     /// Assemble a top-level list [`Section`] from the per-item metadata that
@@ -1247,7 +1162,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
         section_pool: &mut Vec<Section<'src>>,
         line_pool: &mut Vec<PoolLine<'src>>,
         scratch: &mut Scratch<'src>,
-        defs: &LinkDefs<'src>,
+        defs: Refs<'_, 'src>,
     ) -> Section<'src> {
         // Pre-order: each item is a ListItem container followed immediately by
         // its child-block subtree.
@@ -1257,11 +1172,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
             let item_lines = lines.get(span.clone()).unwrap_or(&[]);
             let item_lazy = lazy.get(span.clone()).unwrap_or(&[]);
             let item_pad = pad.get(span).unwrap_or(&[]);
-            let item_at = section_pool.len();
-            section_pool.push(Section::ListItem {
-                children: SectionRange::EMPTY,
-            });
-            let range = Self::resolve_blocks(
+            Self::push_item(
                 input,
                 depth,
                 item_lines,
@@ -1273,7 +1184,6 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
                 scratch,
                 defs,
             );
-            section_pool[item_at] = Section::ListItem { children: range };
         }
         let items_len = section_pool.len().pool_offset() - items_start;
         let items = SectionRange::new(items_start, items_len);
@@ -1297,7 +1207,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
     /// promotion), ATX headings, thematic breaks, fenced and indented code,
     /// nested blockquotes, and nested lists.
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-    fn resolve_blocks(
+    pub(crate) fn resolve_blocks(
         input: &'src str,
         depth: u16,
         lines: &[&'src str],
@@ -1307,7 +1217,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
         section_pool: &mut Vec<Section<'src>>,
         line_pool: &mut Vec<PoolLine<'src>>,
         scratch: &mut Scratch<'src>,
-        defs: &LinkDefs<'src>,
+        defs: Refs<'_, 'src>,
     ) -> SectionRange {
         let pad_at = |k: usize| pad.get(k).copied().unwrap_or(0);
         // Leading indentation of pooled line `k` in *columns*. When the line
@@ -1462,14 +1372,12 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
                         break;
                     }
                     // Placeholder, recurse to append the subtree, then backpatch.
-                    let at = section_pool.len();
-                    section_pool.push(Section::Blockquote {
-                        children: SectionRange::EMPTY,
-                    });
                     // Nested-container content does not carry straddled-tab
                     // pad (that lives only on the top-level container's pooled
                     // lines); an empty pad slice reads as all-zero.
-                    let range = Self::resolve_blocks(
+                    let at = section_pool.len();
+                    section_pool.push(Section::HorizontalRule);
+                    let quote = Self::resolve_quote(
                         input,
                         depth + 1,
                         &nested,
@@ -1482,7 +1390,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
                         defs,
                     );
                     scratch.give_lines(nested);
-                    section_pool[at] = Section::Blockquote { children: range };
+                    section_pool[at] = quote;
                     continue;
                 }
 
@@ -1651,7 +1559,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
         para: &mut Vec<&'src str>,
         section_pool: &mut Vec<Section<'src>>,
         pool: &mut Vec<Inline<'src>>,
-        defs: &LinkDefs<'src>,
+        defs: Refs<'_, 'src>,
     ) {
         if para.is_empty() {
             return;
@@ -1696,7 +1604,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
         section_pool: &mut Vec<Section<'src>>,
         line_pool: &mut Vec<PoolLine<'src>>,
         scratch: &mut Scratch<'src>,
-        defs: &LinkDefs<'src>,
+        defs: Refs<'_, 'src>,
     ) -> usize {
         // A nested sublist's content is dedented by a pure-space content
         // column (a straddled container tab only ever appears on the *outer*
@@ -1820,12 +1728,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
                 item_lazy.pop();
                 pending_blanks += 1;
             }
-            // ListItem placeholder, then append its subtree and backpatch.
-            let item_at = section_pool.len();
-            section_pool.push(Section::ListItem {
-                children: SectionRange::EMPTY,
-            });
-            let range = Self::resolve_blocks(
+            Self::push_item(
                 input,
                 depth,
                 &item,
@@ -1837,7 +1740,6 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
                 scratch,
                 defs,
             );
-            section_pool[item_at] = Section::ListItem { children: range };
         }
         scratch.give_lines(item);
 
@@ -1878,7 +1780,9 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
         let mut pool = Vec::with_capacity(input.len() / 20);
         let mut section_pool = Vec::with_capacity(ctx.list_items.len().saturating_mul(2));
         let mut line_pool = Vec::new();
-        let sections = Self::resolve_inlines(&ctx, &mut pool, &mut section_pool, &mut line_pool);
+        let mut sections =
+            Self::resolve_inlines(&ctx, &mut pool, &mut section_pool, &mut line_pool);
+        ctx.refs.number_footnotes(&mut sections);
 
         // Return the scratch buffers to the thread-local pool (reset clears the
         // `'src` borrows) so the next parse on this thread reuses their
@@ -1889,7 +1793,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
             lazy,
             pad,
             list_items,
-            defs,
+            refs,
             ..
         } = ctx;
         ParseScratch {
@@ -1898,7 +1802,7 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
             lazy,
             pad,
             list_items,
-            defs,
+            refs,
         }
         .checkin();
 
@@ -1932,7 +1836,7 @@ impl<'src> ParseCtx<'src> {
             lazy,
             pad,
             list_items,
-            defs,
+            refs,
         } = scratch;
         let mut ctx = ParseCtx {
             input,
@@ -1942,7 +1846,7 @@ impl<'src> ParseCtx<'src> {
             lazy,
             pad,
             list_items,
-            defs,
+            refs,
         };
         let mut acc = Accumulator::Empty;
         let mut pos = 0;
@@ -2005,20 +1909,38 @@ impl<'src> ParseCtx<'src> {
                 }
             }
 
+            let bracket_start = first == Some(b'[')
+                || (first == SpecialChar::Space
+                    && bytes[pos..line_end]
+                        .get(..4)
+                        .is_some_and(|w| w.contains(&b'[')));
+
+            // Footnote definitions (GFM): `[^label]:` opens a container whose
+            // content is the rest of the line plus following indented lines.
+            // Like a link definition it cannot interrupt a paragraph.
+            if bracket_start
+                && !matches!(acc, Accumulator::InParagraph { .. })
+                && let Some((block, resume)) =
+                    ext::RawBlock::footnote_at(&mut ctx, input, pos, line_end)
+            {
+                ctx.flush_acc(acc);
+                ctx.sections.push(RawSection::Ext(block));
+                pos = resume;
+                acc = Accumulator::Empty;
+                continue;
+            }
+
             // Link reference definitions (CommonMark §4.7): a `[` within the
             // first 4 bytes, not interrupting a paragraph. They span up to
             // three lines and produce no output, only a registry entry.
-            if !matches!(acc, Accumulator::InParagraph { .. })
-                && (first == Some(b'[')
-                    || (first == SpecialChar::Space
-                        && bytes[pos..line_end]
-                            .get(..4)
-                            .is_some_and(|w| w.contains(&b'['))))
+            if bracket_start
+                && !matches!(acc, Accumulator::InParagraph { .. })
                 && let Some(indent) = bytes[pos..line_end].strip_indent()
                 && let Some((def, resume)) = LinkDef::scan(ctx.input, pos + indent)
             {
                 ctx.flush_acc(acc);
-                ctx.defs
+                ctx.refs
+                    .links
                     .entry(def.label.normalize_label_cow())
                     .or_insert((def.url, def.title));
                 pos = resume;
@@ -2064,13 +1986,10 @@ impl<'src> ParseCtx<'src> {
             // matching column count. A table can interrupt a paragraph, so this
             // runs regardless of `acc` — the open paragraph (if any) is flushed
             // first. Detection needs one line of lookahead (the delimiter row).
-            if let Some(scan) = ctx.scan_table(pos, line_end) {
+            if let Some((block, resume)) = ext::RawBlock::table_at(input, pos, line_end) {
                 ctx.flush_acc(acc);
-                ctx.sections.push(RawSection::Table {
-                    source: scan.source,
-                    columns: scan.columns,
-                });
-                pos = scan.resume;
+                ctx.sections.push(RawSection::Ext(block));
+                pos = resume;
                 acc = Accumulator::Empty;
                 continue;
             }
@@ -2083,72 +2002,6 @@ impl<'src> ParseCtx<'src> {
         ctx
     }
 
-    /// Detect a GFM table (`CommonMark`/GFM §4.10) starting at the line
-    /// `[pos..line_end)`. A table is a header row containing at least one
-    /// unescaped pipe, immediately followed by a delimiter row whose column
-    /// count equals the header's, then zero or more body rows. Returns the
-    /// verbatim source span (no trailing newline), the column count, and the
-    /// byte offset to resume at — or `None` when the two-line shape is absent.
-    ///
-    /// Top-level only: tables nested inside a blockquote or list item are not
-    /// recognised by [`resolve_blocks`] and stay paragraphs.
-    fn scan_table(&self, pos: usize, line_end: usize) -> Option<TableScan<'src>> {
-        let bytes = self.bytes;
-        // The header must be indented 0-3 spaces and carry an unescaped pipe.
-        let indent = bytes[pos..line_end].strip_indent()?;
-        let header = self.input.get(pos + indent..line_end)?;
-        TableCells::next_pipe(header)?;
-        let header_cols = table_row_cell_count(header);
-
-        // The very next line must be a valid delimiter row of equal width.
-        let delim_start = line_end + 1;
-        if delim_start > bytes.len() {
-            return None;
-        }
-        let delim_end = bytes
-            .find_byte(delim_start, SpecialChar::Newline.byte())
-            .unwrap_or(bytes.len());
-        let delim_indent = bytes[delim_start..delim_end].strip_indent()?;
-        let delim = self.input.get(delim_start + delim_indent..delim_end)?;
-        let delim_cols = table_delimiter_columns(delim)?;
-        if delim_cols != header_cols {
-            return None;
-        }
-        let columns = u16::try_from(header_cols).ok()?;
-
-        // Body rows: consecutive non-blank lines that do not begin another
-        // block-level construct. The table source spans from the header row
-        // start to the end of the last body row.
-        let source_start = pos + indent;
-        let mut row_pos = delim_end + 1;
-        let mut source_end = delim_end;
-        while row_pos < bytes.len() {
-            let row_end = bytes
-                .find_byte(row_pos, SpecialChar::Newline.byte())
-                .unwrap_or(bytes.len());
-            if bytes.is_blank_line(row_pos, row_end) {
-                break;
-            }
-            let Some(rind) = bytes[row_pos..row_end].strip_indent() else {
-                break; // 4+ indent: indented code, ends the table.
-            };
-            let body = &bytes[row_pos + rind..row_end];
-            // A line that starts a new block (heading, hr, blockquote, fence,
-            // list marker) closes the table per GFM.
-            if body.begins_block() {
-                break;
-            }
-            source_end = row_end;
-            row_pos = row_end + 1;
-        }
-
-        let source = self.input.get(source_start..source_end)?;
-        Some(TableScan {
-            source,
-            columns,
-            resume: source_end.min(bytes.len()).saturating_add(1),
-        })
-    }
     /// Extract the language tag from a code fence opening line.
     /// `bytes` is the line with leading indentation already stripped.
     /// `fence_len` is the number of fence characters.
@@ -2510,21 +2363,21 @@ impl<'src> ParseCtx<'src> {
 
     /// Push one line onto the pool, recording whether it arrived as a lazy
     /// paragraph continuation. Keeps `lines` and `lazy` the same length.
-    fn push_line(&mut self, line: &'src str, lazy: bool) {
+    pub fn push_line(&mut self, line: &'src str, lazy: bool) {
         self.push_line_padded(line, lazy, 0);
     }
 
     /// Like [`push_line`](Self::push_line) but records `pad` synthetic leading
     /// columns consumed mid-tab when the container prefix was stripped (see
     /// [`ParseCtx::pad`]). The stored `line` begins on an absolute tab stop.
-    fn push_line_padded(&mut self, line: &'src str, lazy: bool, pad: u8) {
+    pub fn push_line_padded(&mut self, line: &'src str, lazy: bool, pad: u8) {
         self.lines.push(line);
         self.lazy.push(lazy);
         self.pad.push(pad);
     }
 
     /// Pop the last pooled line (and its lazy/pad metadata), returning the line.
-    fn pop_line(&mut self) -> Option<&'src str> {
+    pub fn pop_line(&mut self) -> Option<&'src str> {
         self.lazy.pop();
         self.pad.pop();
         self.lines.pop()

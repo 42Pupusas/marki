@@ -46,10 +46,19 @@
 mod block;
 pub(crate) mod entities_table;
 pub(crate) mod entity;
+#[cfg(feature = "gfm")]
+mod gfm;
+#[cfg(feature = "gfm")]
+use gfm as ext;
+#[cfg(not(feature = "gfm"))]
+mod strict;
+#[cfg(not(feature = "gfm"))]
+use strict as ext;
 mod html;
 mod inline;
 mod link_def;
 pub(crate) mod raw_html;
+mod refs;
 mod section;
 pub(crate) mod simd;
 mod small_bool;
@@ -60,7 +69,7 @@ mod fuzz_finds;
 #[cfg(test)]
 mod tests;
 
-pub use inline::Inline;
+pub use inline::{AutolinkKind, Inline};
 
 /// Recycle an emptied `Vec`'s heap allocation under a type that differs only in
 /// a lifetime parameter.
@@ -113,7 +122,8 @@ impl OffsetExt for usize {
 }
 use crate::simd::ByteSliceExt;
 pub use section::{
-    ColumnAlignment, InlineSpan, LineRange, OrderedListDelimiter, PoolLine, Section, SectionRange,
+    AlertKind, Checkbox, ColumnAlignment, InlineSpan, LineRange, OrderedListDelimiter, PoolLine,
+    Section, SectionRange,
 };
 pub use special_char::SpecialChar;
 
@@ -248,7 +258,10 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
                 | Section::TableCell { content, .. } => {
                     let _ = self.inlines(*content);
                 }
-                Section::Blockquote { children } | Section::ListItem { children } => {
+                Section::Blockquote { children }
+                | Section::ListItem { children, .. }
+                | Section::Alert { children, .. }
+                | Section::FootnoteDefinition { children, .. } => {
                     self.walk_sections(self.child_sections(*children));
                 }
                 Section::Table { rows, .. } => {

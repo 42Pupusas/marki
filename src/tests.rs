@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use crate::section::{OrderedListDelimiter, SectionRange};
-use crate::{Inline, InlineSpan, MarkdownFile, Section};
+use crate::{AutolinkKind, Inline, InlineSpan, MarkdownFile, Section};
 
 /// Assertion helper that carries a reference to the parsed document.
 struct Checker<'md, 'src> {
@@ -40,7 +40,7 @@ impl<'md, 'src> Checker<'md, 'src> {
         self.md
             .child_sections(items)
             .map(|item| match item {
-                Section::ListItem { children } => {
+                Section::ListItem { children, .. } => {
                     let kids: Vec<_> = self.md.child_sections(*children).collect();
                     assert_eq!(
                         kids.len(),
@@ -78,7 +78,8 @@ impl<'md, 'src> Checker<'md, 'src> {
                 assert_eq!(a, e, "Text mismatch at index {idx}");
             }
             (Inline::Bold(span), Expect::Bold(children))
-            | (Inline::Italic(span), Expect::Italic(children)) => {
+            | (Inline::Italic(span), Expect::Italic(children))
+            | (Inline::Strikethrough(span), Expect::Strike(children)) => {
                 self.check_span(*span, children);
             }
             (Inline::Code(a), Expect::Code(e)) => {
@@ -110,14 +111,14 @@ impl<'md, 'src> Checker<'md, 'src> {
                 self.check_span(*alt, ea);
             }
             (
-                Inline::Autolink { target, is_email },
+                Inline::Autolink { target, kind },
                 Expect::Autolink {
                     target: et,
-                    is_email: ee,
+                    kind: ek,
                 },
             ) => {
                 assert_eq!(target, et, "Autolink target mismatch at index {idx}");
-                assert_eq!(is_email, ee, "Autolink is_email mismatch at index {idx}");
+                assert_eq!(kind, ek, "Autolink kind mismatch at index {idx}");
             }
             (Inline::RawHtml(a), Expect::RawHtml(e)) => {
                 assert_eq!(a, e, "RawHtml mismatch at index {idx}");
@@ -134,6 +135,7 @@ enum Expect<'a> {
     Text(&'a str),
     Bold(Vec<Self>),
     Italic(Vec<Self>),
+    Strike(Vec<Self>),
     Code(&'a str),
     SoftBreak,
     HardBreak,
@@ -149,7 +151,7 @@ enum Expect<'a> {
     },
     Autolink {
         target: &'a str,
-        is_email: bool,
+        kind: AutolinkKind,
     },
     RawHtml(&'a str),
 }
@@ -519,7 +521,7 @@ fn test_autolink_uri() {
             *content,
             &[Expect::Autolink {
                 target: "http://foo.bar",
-                is_email: false,
+                kind: AutolinkKind::Uri,
             }],
         ),
         other => panic!("expected paragraph, got {other:?}"),
@@ -534,7 +536,7 @@ fn test_autolink_email() {
             *content,
             &[Expect::Autolink {
                 target: "foo@bar.com",
-                is_email: true,
+                kind: AutolinkKind::Email,
             }],
         ),
         other => panic!("expected paragraph, got {other:?}"),
@@ -1683,14 +1685,14 @@ fn test_ordered_list_empty_item() {
             let item_sections: Vec<_> = md.child_sections(*items).collect();
             assert_eq!(item_sections.len(), 2);
             match item_sections[0] {
-                Section::ListItem { children } => {
+                Section::ListItem { children, .. } => {
                     assert_eq!(md.child_sections(*children).count(), 0);
                 }
                 other => panic!("expected list item, got {other:?}"),
             }
             let checker = Checker::new(&md);
             match item_sections[1] {
-                Section::ListItem { children } => {
+                Section::ListItem { children, .. } => {
                     let kids: Vec<_> = md.child_sections(*children).collect();
                     assert_eq!(kids.len(), 1);
                     match kids[0] {
@@ -1754,164 +1756,23 @@ fn test_closing_fence_indented_4_spaces_not_closing() {
     );
 }
 
-// -----------------------------------------------------------------------
-// GFM tables (CommonMark/GFM §4.10)
-// -----------------------------------------------------------------------
-
-use crate::ColumnAlignment;
-
-/// The structural shape of a parsed table, flattened for easy assertions:
-/// `(columns, per-row (header?, cells-as-plain-text))`.
-fn table_shape<'src>(
-    md: &MarkdownFile<'src>,
-    section: &Section<'src>,
-) -> (u16, Vec<(bool, Vec<String>)>) {
-    let Section::Table { columns, rows } = section else {
-        panic!("expected table, got {section:?}");
-    };
-    let mut out = Vec::new();
-    for row in md.child_sections(*rows) {
-        let Section::TableRow { header, cells } = row else {
-            panic!("expected table row, got {row:?}");
-        };
-        let mut cell_texts = Vec::new();
-        for cell in md.child_sections(*cells) {
-            let Section::TableCell { content, .. } = cell else {
-                panic!("expected table cell, got {cell:?}");
-            };
-            // Flatten inline content to plain text for the shape comparison.
-            let mut s = String::new();
-            for inline in md.inlines(*content) {
-                if let Inline::Text(t) = inline {
-                    s.push_str(t);
-                }
-            }
-            cell_texts.push(s);
-        }
-        out.push((*header, cell_texts));
+#[cfg(not(feature = "gfm"))]
+#[test]
+fn test_gfm_syntax_is_plain_text_without_feature() {
+    let cases = [
+        ("a ~~b~~ c", "<p>a ~~b~~ c</p>\n"),
+        ("| a |\n| - |", "<p>| a |\n| - |</p>\n"),
+        ("- [x] done", "<ul>\n<li>[x] done</li>\n</ul>\n"),
+        ("see www.example.com", "<p>see www.example.com</p>\n"),
+        ("x[^1]\n\n[^1]: n", "<p>x<a href=\"n\">^1</a></p>\n"),
+        (
+            "> [!NOTE]\n> hi",
+            "<blockquote>\n<p>[!NOTE]\nhi</p>\n</blockquote>\n",
+        ),
+        ("<xmp>", "<xmp>\n"),
+    ];
+    for (input, expected) in cases {
+        let md: MarkdownFile<'_> = MarkdownFile::parse(input);
+        assert_eq!(md.to_html(), expected, "input: {input:?}");
     }
-    (*columns, out)
-}
-
-#[test]
-fn test_table_basic() {
-    let md: MarkdownFile<'_> =
-        MarkdownFile::parse("| abc | def |\n| --- | --- |\n| ghi | jkl |\n| mno | pqr |");
-    let (cols, rows) = table_shape(&md, &md.sections[0]);
-    assert_eq!(cols, 2);
-    assert_eq!(
-        rows,
-        vec![
-            (true, vec!["abc".to_owned(), "def".to_owned()]),
-            (false, vec!["ghi".to_owned(), "jkl".to_owned()]),
-            (false, vec!["mno".to_owned(), "pqr".to_owned()]),
-        ]
-    );
-}
-
-#[test]
-fn test_table_no_outer_pipes() {
-    // GFM "simpler" table: leading/trailing pipes are optional.
-    let md: MarkdownFile<'_> = MarkdownFile::parse("abc | def\n--- | ---\nxyz | ghi");
-    let (cols, rows) = table_shape(&md, &md.sections[0]);
-    assert_eq!(cols, 2);
-    assert_eq!(rows[0], (true, vec!["abc".to_owned(), "def".to_owned()]));
-    assert_eq!(rows[1], (false, vec!["xyz".to_owned(), "ghi".to_owned()]));
-}
-
-#[test]
-fn test_table_alignment() {
-    let md: MarkdownFile<'_> =
-        MarkdownFile::parse("a | b | c | d | e\n:-- | --- | :-: | --- | --:\nf | g | h | i | j");
-    let Section::Table { rows, .. } = &md.sections[0] else {
-        panic!("expected table");
-    };
-    let header = md.child_sections(*rows).next().unwrap();
-    let Section::TableRow { cells, .. } = header else {
-        panic!("expected row");
-    };
-    let aligns: Vec<ColumnAlignment> = md
-        .child_sections(*cells)
-        .map(|c| match c {
-            Section::TableCell { align, .. } => *align,
-            _ => panic!("expected cell"),
-        })
-        .collect();
-    assert_eq!(
-        aligns,
-        vec![
-            ColumnAlignment::Left,
-            ColumnAlignment::None,
-            ColumnAlignment::Center,
-            ColumnAlignment::None,
-            ColumnAlignment::Right,
-        ]
-    );
-}
-
-#[test]
-fn test_table_short_rows_padded_long_truncated() {
-    let md: MarkdownFile<'_> =
-        MarkdownFile::parse("| a | b | c |\n| --- | --- | --- |\n| x |\n| 1 | 2 | 3 | 4 | 5 |");
-    let (cols, rows) = table_shape(&md, &md.sections[0]);
-    assert_eq!(cols, 3);
-    // Short row padded to 3 cells.
-    assert_eq!(
-        rows[1],
-        (false, vec!["x".to_owned(), String::new(), String::new()])
-    );
-    // Long row truncated to 3 cells.
-    assert_eq!(
-        rows[2],
-        (false, vec!["1".to_owned(), "2".to_owned(), "3".to_owned()])
-    );
-}
-
-#[test]
-fn test_table_mismatched_delimiter_is_paragraph() {
-    // Header has 3 columns, delimiter has 2 -> not a table.
-    let md: MarkdownFile<'_> =
-        MarkdownFile::parse("| a | b | c |\n| --- | --- |\n| this | isn't | okay |");
-    assert!(
-        matches!(md.sections[0], Section::Paragraph { .. }),
-        "expected paragraph, got {:?}",
-        md.sections[0]
-    );
-}
-
-#[test]
-fn test_table_interrupts_paragraph() {
-    // GFM: a table can be recognised directly after paragraph text.
-    let md: MarkdownFile<'_> = MarkdownFile::parse("123\n456\n| a | b |\n| ---| --- |\nd | e");
-    assert!(matches!(md.sections[0], Section::Paragraph { .. }));
-    assert!(
-        matches!(md.sections[1], Section::Table { .. }),
-        "expected table as second section, got {:?}",
-        md.sections[1]
-    );
-}
-
-#[test]
-fn test_table_not_enough_rows_is_paragraph() {
-    // A single piped line with no delimiter row is just a paragraph.
-    let md: MarkdownFile<'_> = MarkdownFile::parse("| Not enough table | to be considered table |");
-    assert!(matches!(md.sections[0], Section::Paragraph { .. }));
-}
-
-#[test]
-fn test_table_header_only() {
-    // Header + delimiter with no body rows is a valid (header-only) table.
-    let md: MarkdownFile<'_> = MarkdownFile::parse("| xyz |\n| --- |");
-    let (cols, rows) = table_shape(&md, &md.sections[0]);
-    assert_eq!(cols, 1);
-    assert_eq!(rows, vec![(true, vec!["xyz".to_owned()])]);
-}
-
-#[test]
-fn test_table_html_render() {
-    let md: MarkdownFile<'_> = MarkdownFile::parse("| abc | def |\n| --- | --- |\n| ghi | jkl |");
-    let html = md.to_html();
-    let expected = "<table>\n<thead>\n<tr>\n<th>abc</th>\n<th>def</th>\n</tr>\n</thead>\n\
-<tbody>\n<tr>\n<td>ghi</td>\n<td>jkl</td>\n</tr>\n</tbody>\n</table>\n";
-    assert_eq!(html, expected);
 }

@@ -5,14 +5,21 @@
 //! parse the markdown, render it with [`MarkdownFile::to_html`], and compare
 //! against the expected HTML.
 //!
-//! `marki-parse` implements a subset of `CommonMark`, so we report a pass-rate
-//! and assert a floor rather than demanding 100%. To run against the full
-//! official suite, drop `spec.json` into `tests/fixtures/` and point
-//! `FIXTURE` at it.
+//! With the `gfm` feature, the spec examples whose output GFM deliberately
+//! changes (tagfilter on `<script>`/`<style>`/`<textarea>` blocks, and
+//! extended autolinks in plain text) are expected to differ; every other
+//! example must still match byte for byte. `tests/gfm.rs` covers the GFM
+//! output itself.
 
 use marki_parse::MarkdownFile;
 
 const FIXTURE: &str = include_str!("fixtures/spec.json");
+
+/// Spec examples whose expected HTML GFM changes.
+#[cfg(feature = "gfm")]
+const GFM_DIVERGENT: &[u32] = &[170, 171, 172, 173, 176, 178, 602, 608, 611, 612];
+#[cfg(not(feature = "gfm"))]
+const GFM_DIVERGENT: &[u32] = &[];
 
 /// One spec test case.
 struct Case {
@@ -238,11 +245,19 @@ fn commonmark_conformance() {
     let mut stats = SectionStats::default();
     let mut failures = Vec::new();
 
+    let mut unexpected_matches = Vec::new();
     for case in &cases {
         let normalized = MarkdownFile::normalize(&case.markdown);
         let md: MarkdownFile<'_> = MarkdownFile::parse(&normalized);
         let got = md.to_html();
         let ok = got == case.html;
+        let divergent = GFM_DIVERGENT.contains(&case.example);
+        if divergent {
+            if ok {
+                unexpected_matches.push(case.example);
+            }
+            continue;
+        }
         stats.record(&case.section, ok);
         if ok {
             passed += 1;
@@ -253,8 +268,13 @@ fn commonmark_conformance() {
             ));
         }
     }
+    assert!(
+        unexpected_matches.is_empty(),
+        "GFM-divergent examples now match strict CommonMark: {unexpected_matches:?}"
+    );
 
-    let total = u32::try_from(cases.len()).expect("fixture count fits in u32");
+    let total =
+        u32::try_from(cases.len() - GFM_DIVERGENT.len()).expect("fixture count fits in u32");
     let pct = f64::from(passed) / f64::from(total) * 100.0;
 
     eprintln!("\n=== CommonMark conformance: {passed}/{total} ({pct:.1}%) ===\n");
@@ -271,8 +291,6 @@ fn commonmark_conformance() {
         eprintln!("\nFAIL {f}");
     }
 
-    // Full CommonMark conformance reached (652/652). This test now gates:
-    // every spec vector must render byte-for-byte, so any regression fails CI.
     assert_eq!(
         passed,
         total,

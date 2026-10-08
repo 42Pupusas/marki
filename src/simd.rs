@@ -9,7 +9,7 @@ pub trait ByteSliceExt {
     fn find_byte(&self, offset: usize, needle: u8) -> Option<usize>;
 
     /// Find the first byte at or after `offset` that is contained in `set`.
-    fn find_byte_set(&self, offset: usize, set: &ByteSet) -> Option<usize>;
+    fn find_byte_set<const N: usize>(&self, offset: usize, set: &ByteSet<N>) -> Option<usize>;
 }
 
 impl ByteSliceExt for [u8] {
@@ -22,7 +22,7 @@ impl ByteSliceExt for [u8] {
     }
 
     #[inline]
-    fn find_byte_set(&self, offset: usize, set: &ByteSet) -> Option<usize> {
+    fn find_byte_set<const N: usize>(&self, offset: usize, set: &ByteSet<N>) -> Option<usize> {
         if offset >= self.len() {
             return None;
         }
@@ -31,27 +31,27 @@ impl ByteSliceExt for [u8] {
 }
 
 /// A pre-computed set of bytes to search for, stored in a format ready for SIMD.
-pub struct ByteSet {
-    /// The needle bytes. Unused slots duplicate `bytes[0]`.
-    bytes: [u8; 8],
+pub struct ByteSet<const N: usize> {
+    bytes: [u8; N],
     /// Scalar fallback lookup table.
     table: [bool; 256],
 }
 
-impl ByteSet {
-    /// Create a new `ByteSet` from a slice of distinct bytes (max 8).
+impl<const N: usize> ByteSet<N> {
+    /// Create a new `ByteSet` from `N` distinct bytes.
     #[inline]
-    pub const fn new(needles: &[u8]) -> Self {
-        assert!(!needles.is_empty() && needles.len() <= 8);
-        let mut bytes = [needles[0]; 8];
+    pub const fn new(needles: &[u8; N]) -> Self {
+        assert!(N > 0);
         let mut table = [false; 256];
         let mut i = 0;
-        while i < needles.len() {
-            bytes[i] = needles[i];
+        while i < N {
             table[needles[i] as usize] = true;
             i += 1;
         }
-        Self { bytes, table }
+        Self {
+            bytes: *needles,
+            table,
+        }
     }
 
     #[inline]
@@ -77,31 +77,16 @@ impl ByteSet {
         let ptr = bytes.as_ptr();
 
         unsafe {
-            // Load all needle lanes.
-            let n0 = _mm_set1_epi8(self.bytes[0].cast_signed());
-            let n1 = _mm_set1_epi8(self.bytes[1].cast_signed());
-            let n2 = _mm_set1_epi8(self.bytes[2].cast_signed());
-            let n3 = _mm_set1_epi8(self.bytes[3].cast_signed());
-            let n4 = _mm_set1_epi8(self.bytes[4].cast_signed());
-            let n5 = _mm_set1_epi8(self.bytes[5].cast_signed());
-            let n6 = _mm_set1_epi8(self.bytes[6].cast_signed());
-            let n7 = _mm_set1_epi8(self.bytes[7].cast_signed());
+            let lanes: [__m128i; N] = self.bytes.map(|b| _mm_set1_epi8(b.cast_signed()));
 
             let mut i = 0;
 
-            // Process 16-byte chunks.
             while i + 16 <= len {
                 let chunk = _mm_loadu_si128(ptr.add(i).cast::<__m128i>());
-                let eq = _mm_or_si128(
-                    _mm_or_si128(
-                        _mm_or_si128(_mm_cmpeq_epi8(chunk, n0), _mm_cmpeq_epi8(chunk, n1)),
-                        _mm_or_si128(_mm_cmpeq_epi8(chunk, n2), _mm_cmpeq_epi8(chunk, n3)),
-                    ),
-                    _mm_or_si128(
-                        _mm_or_si128(_mm_cmpeq_epi8(chunk, n4), _mm_cmpeq_epi8(chunk, n5)),
-                        _mm_or_si128(_mm_cmpeq_epi8(chunk, n6), _mm_cmpeq_epi8(chunk, n7)),
-                    ),
-                );
+                let mut eq = _mm_cmpeq_epi8(chunk, lanes[0]);
+                for lane in &lanes[1..] {
+                    eq = _mm_or_si128(eq, _mm_cmpeq_epi8(chunk, *lane));
+                }
                 let mask = _mm_movemask_epi8(eq).movemask_to_u32();
                 if mask != 0 {
                     return Some(offset + i + mask.trailing_zeros() as usize);

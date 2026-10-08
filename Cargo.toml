@@ -1,15 +1,22 @@
 [package]
 name = "marki-parse"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-description = "A fast, zero-copy CommonMark parser with SIMD-accelerated scanning"
+description = "A fast, zero-copy CommonMark and GitHub Flavored Markdown parser with SIMD-accelerated scanning"
 license = "MIT"
 repository = "https://github.com/42Pupusas/marki"
 readme = "README.md"
-keywords = ["markdown", "commonmark", "parser", "zero-copy"]
+keywords = ["markdown", "commonmark", "gfm", "parser", "zero-copy"]
 categories = ["parsing", "text-processing"]
-rust-version = "1.87"
+rust-version = "1.88"
 exclude = ["flamegraph.svg", "perf.data*", "fuzz/", "benches/", "examples/"]
+
+[features]
+default = ["gfm"]
+# GitHub Flavored Markdown: tables, strikethrough, task lists, extended
+# autolinks, disallowed raw HTML, footnotes, and alerts. Without it the parser
+# is strict CommonMark 0.31.2.
+gfm = []
 
 [lints.clippy]
 pedantic = "warn"
