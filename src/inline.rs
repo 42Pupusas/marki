@@ -8,6 +8,10 @@ use crate::refs::Refs;
 use crate::section::InlineSpan;
 use crate::simd::{ByteSet, ByteSliceExt};
 
+mod scan_state;
+
+use scan_state::ScanState;
+
 /// An inline element within a Markdown block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Inline<'src> {
@@ -560,84 +564,90 @@ impl<'src> EmphArena<'src> {
                 continue;
             }
             let ob_index = self.delims[closer as usize].openers_bottom_bucket();
-
-            let mut opener = self.delims[closer as usize].prev;
-            let mut opener_found = false;
-            while opener != NIL && opener != openers_bottom[ob_index] {
-                let od = &self.delims[opener as usize];
-                if od.opens_for(&self.delims[closer as usize]) {
-                    opener_found = true;
-                    break;
+            match self.find_opener(closer, openers_bottom[ob_index]) {
+                Some(opener)
+                    if !self.delims[closer as usize]
+                        .strikes_with(&self.delims[opener as usize]) =>
+                {
+                    closer = self.delims[closer as usize].next;
                 }
-                opener = od.prev;
-            }
-            let old_closer = closer;
-
-            if opener_found
-                && !self.delims[closer as usize].strikes_with(&self.delims[opener as usize])
-            {
-                closer = self.delims[closer as usize].next;
-                continue;
-            }
-
-            if opener_found {
-                let use_delims =
-                    self.delims[closer as usize].delims_used_with(&self.delims[opener as usize]);
-                let style = EmphStyle::of(self.delims[closer as usize].ch, use_delims);
-                let opener_node = self.delims[opener as usize].node;
-                let closer_node = self.delims[closer as usize].node;
-
-                // Consume delimiters from the inner edges.
-                self.delims[opener as usize].count -= use_delims;
-                self.delims[closer as usize].count -= use_delims;
-                self.shorten_text(opener_node, use_delims, false);
-                self.shorten_text(closer_node, use_delims, true);
-
-                // Gather nodes strictly between opener_node and closer_node
-                // into a child sub-list under a new Emph node, inserted right
-                // after opener_node.
-                let head = self.nodes[opener_node as usize].next;
-                // Detach [head .. closer_node) from the main list.
-                let emph = self.push_node_detached(EmphKind::Emph { style, head });
-                // Re-link child range: terminate it before closer_node.
-                let mut last_child = NIL;
-                let mut t = head;
-                while t != NIL && t != closer_node {
-                    last_child = t;
-                    t = self.nodes[t as usize].next;
-                }
-                if last_child != NIL {
-                    self.nodes[last_child as usize].next = NIL;
-                }
-                // Splice emph between opener_node and closer_node.
-                self.nodes[opener_node as usize].next = emph;
-                self.nodes[emph as usize].prev = opener_node;
-                self.nodes[emph as usize].next = closer_node;
-                self.nodes[closer_node as usize].prev = emph;
-
-                self.remove_delims_between(opener, closer);
-
-                if self.delims[opener as usize].count == 0 {
-                    self.unlink_node(opener_node);
-                    self.remove_delim(opener);
-                }
-                if self.delims[closer as usize].count == 0 {
-                    self.unlink_node(closer_node);
+                Some(opener) => closer = self.match_pair(opener, closer),
+                None => {
                     let next = self.delims[closer as usize].next;
-                    self.remove_delim(closer);
+                    openers_bottom[ob_index] = self.delims[closer as usize].prev;
+                    if !self.delims[closer as usize].can_open {
+                        self.remove_delim(closer);
+                    }
                     closer = next;
-                }
-            } else {
-                closer = self.delims[closer as usize].next;
-            }
-
-            if !opener_found {
-                openers_bottom[ob_index] = self.delims[old_closer as usize].prev;
-                if !self.delims[old_closer as usize].can_open {
-                    self.remove_delim(old_closer);
                 }
             }
         }
+    }
+
+    /// The nearest delimiter below `closer`, and above `bottom`, that can
+    /// open for it.
+    fn find_opener(&self, closer: i32, bottom: i32) -> Option<i32> {
+        let cd = &self.delims[closer as usize];
+        let mut opener = cd.prev;
+        while opener != NIL && opener != bottom {
+            let od = &self.delims[opener as usize];
+            if od.opens_for(cd) {
+                return Some(opener);
+            }
+            opener = od.prev;
+        }
+        None
+    }
+
+    /// Wrap the nodes between a matched `opener` and `closer` in an `Emph`
+    /// node, consuming delimiters from the inner edge of each run. Returns
+    /// the next closer to examine.
+    fn match_pair(&mut self, opener: i32, closer: i32) -> i32 {
+        let use_delims =
+            self.delims[closer as usize].delims_used_with(&self.delims[opener as usize]);
+        let style = EmphStyle::of(self.delims[closer as usize].ch, use_delims);
+        let opener_node = self.delims[opener as usize].node;
+        let closer_node = self.delims[closer as usize].node;
+
+        self.delims[opener as usize].count -= use_delims;
+        self.delims[closer as usize].count -= use_delims;
+        self.shorten_text(opener_node, use_delims, false);
+        self.shorten_text(closer_node, use_delims, true);
+        self.wrap_between(opener_node, closer_node, style);
+        self.remove_delims_between(opener, closer);
+
+        if self.delims[opener as usize].count == 0 {
+            self.unlink_node(opener_node);
+            self.remove_delim(opener);
+        }
+        if self.delims[closer as usize].count != 0 {
+            return closer;
+        }
+        self.unlink_node(closer_node);
+        let next = self.delims[closer as usize].next;
+        self.remove_delim(closer);
+        next
+    }
+
+    /// Move the nodes strictly between `opener_node` and `closer_node` into a
+    /// child list under a new `Emph` node spliced between the two.
+    fn wrap_between(&mut self, opener_node: i32, closer_node: i32, style: EmphStyle) {
+        let head = self.nodes[opener_node as usize].next;
+        let emph = self.push_node_detached(EmphKind::Emph { style, head });
+        // Terminate the child range before closer_node.
+        let mut last_child = NIL;
+        let mut t = head;
+        while t != NIL && t != closer_node {
+            last_child = t;
+            t = self.nodes[t as usize].next;
+        }
+        if last_child != NIL {
+            self.nodes[last_child as usize].next = NIL;
+        }
+        self.nodes[opener_node as usize].next = emph;
+        self.nodes[emph as usize].prev = opener_node;
+        self.nodes[emph as usize].next = closer_node;
+        self.nodes[closer_node as usize].prev = emph;
     }
 
     /// Allocate a node without linking it into the top-level list. Used for
@@ -1253,313 +1263,280 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
     /// compiles the emphasis branch out of the buffer fast path entirely, so
     /// the two former copies (`parse_into_buf` / `scan_line_into_arena`) stay
     /// zero-cost while sharing one body.
-    #[allow(
-        clippy::too_many_lines,
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap
-    )]
     fn scan_inline<S: InlineSink<'src>>(&mut self, bytes: &[u8], sink: &mut S, depth: u8) {
         // Paragraph reflow strips indentation at the start of the first line.
-        let mut plain_start = if self.strip_lines {
+        let start = if self.strip_lines {
             Self::skip_line_leading_ws(bytes, 0)
         } else {
             0
         };
-        let mut i = plain_start;
-
-        // A link, image, or reference can only ever close on a `]`. One SIMD
-        // scan up front: when the whole context has no `]`, every `[`/`!`
-        // becomes literal text and we skip the (forward-scanning) bracket
-        // branches entirely, keeping them as plain bytes — and skip checking out
-        // a scratch buffer at all, so link-free prose pays nothing.
-        let links_possible = bytes
-            .find_byte(0, SpecialChar::CloseBracket.byte())
-            .is_some();
-
-        // Bracket `[`->`]` matches are resolved lazily and memoized into this
-        // scratch on first query (see `matching_close`): flat links cost a
-        // short forward scan, nested brackets are resolved once then `O(1)`.
-        let mut bracket_scratch = if links_possible {
-            let mut s = BracketScratch::checkout();
-            Self::bracket_reset(&mut s, bytes.len());
-            Some(s)
-        } else {
-            None
-        };
-
-        // Flush pending plain text `[plain_start, upto)` as a text node.
-        macro_rules! flush_text {
-            ($upto:expr) => {
-                if let Some(text) = self.input.get(plain_start..$upto)
-                    && !text.is_empty()
-                {
-                    sink.text(text);
-                }
-            };
-        }
-
-        // GFM `www.`/URL autolinks are searched for in the plain text between
-        // special bytes. `open_brackets` counts the `[` that did not start a
-        // link and are not yet closed by a `]`; while any is open, no
-        // autolink is created.
-        let mut open_brackets = 0u32;
-        let linker = self.linker;
-        let urls_possible = linker.may_have_url(self.input);
+        let mut st = ScanState::new(start);
+        let mut brackets = Self::bracket_scratch(bytes);
+        let urls_possible = self.linker.may_have_url(self.input);
 
         // SIMD-accelerated scan: find next special byte.
         loop {
-            let next_special = bytes.find_byte_set(i, SPECIAL_SET);
+            let next_special = bytes.find_byte_set(st.i, SPECIAL_SET);
             let gap_end = next_special.unwrap_or(bytes.len());
-            if urls_possible
-                && i < gap_end
-                && let Some((start, end, link)) =
-                    linker.url_in(self.input, i, gap_end, plain_start, &mut open_brackets)
-            {
-                flush_text!(start);
-                sink.resolved(link);
-                plain_start = end;
-                i = end;
+            if urls_possible && self.scan_url(sink, &mut st, gap_end) {
                 continue;
             }
             let Some(pos) = next_special else { break };
-            i = pos;
-            let b = bytes[i];
-
-            if b == SpecialChar::Newline {
-                let (trim_end, is_hard) = self.line_break_pieces(bytes, plain_start, i);
-                flush_text!(trim_end);
-                sink.line_break(is_hard);
-                plain_start = i + 1;
-                // Paragraph reflow strips indentation at each line start.
-                if self.strip_lines {
-                    plain_start = Self::skip_line_leading_ws(bytes, plain_start);
-                }
-                i = plain_start;
-                continue;
-            }
-
-            // Backslash escape: only ASCII punctuation can be escaped (CommonMark spec).
-            // For non-punctuation, the backslash is kept as literal text.
-            if b == SpecialChar::Backslash
-                && let Some(&next) = bytes.get(i + 1)
-                && next.is_ascii_punctuation()
-            {
-                flush_text!(i);
-                // Emit the escaped char as its own isolated node (dropping the
-                // backslash). Isolating it prevents an escaped `&` from later
-                // merging with a following `name;` and being decoded as an
-                // entity at render time (e.g. `\&ouml;` must stay literal).
-                if let Some(text) = self.input.get(i + 1..i + 2) {
-                    sink.literal(text);
-                }
-                plain_start = i + 2;
-                i += 2;
-                continue;
-            }
-
-            // Inline code: `code` or ``code``
-            if b == SpecialChar::Backtick {
-                if let Some((code, end)) = Self::try_parse_inline_code(self.input, bytes, i) {
-                    flush_text!(i);
-                    sink.resolved(Inline::Code(code));
-                    plain_start = end;
-                    i = end;
-                    continue;
-                }
-                // No matching closing run: the entire opening run of backticks
-                // is literal text (CommonMark §6.1, the opening run is
-                // maximal). Skip past it so a shorter sub-run can't re-open.
-                i += SpecialChar::Backtick.count_leading_bytes(&bytes[i..]);
-                continue;
-            }
-
-            // Image: ![alt](url "title") or reference ![alt][label]
-            if links_possible
-                && b == SpecialChar::ExclamationMark
-                && bytes.get(i + 1) == SpecialChar::OpenBracket
-                && let Some((alt, url, title, end)) = Self::try_parse_bracket_paren(
-                    self.input,
-                    bytes,
-                    bracket_scratch.as_mut().unwrap(),
-                    i + 1,
-                )
-            {
-                flush_text!(i);
-                let alt = self.parse_inner(alt, depth.saturating_add(1));
-                sink.resolved(Inline::Image { alt, url, title });
-                plain_start = end;
-                i = end;
-                continue;
-            }
-            if links_possible
-                && b == SpecialChar::ExclamationMark
-                && bytes.get(i + 1) == SpecialChar::OpenBracket
-                && let Some((text_str, url, title, end)) =
-                    self.try_parse_reference(bytes, bracket_scratch.as_mut().unwrap(), i + 1)
-            {
-                flush_text!(i);
-                let alt = self.parse_inner(text_str, depth.saturating_add(1));
-                sink.resolved(Inline::Image { alt, url, title });
-                plain_start = end;
-                i = end;
-                continue;
-            }
-
-            if links_possible
-                && b == SpecialChar::OpenBracket
-                && let Some((note, end)) = ext::FootnoteRefs::parse(self.defs, self.input, i)
-            {
-                flush_text!(i);
-                sink.resolved(note);
-                plain_start = end;
-                i = end;
-                continue;
-            }
-
-            // Link: [text](url "title")
-            if links_possible
-                && b == SpecialChar::OpenBracket
-                && let Some((text_str, url, title, end)) = Self::try_parse_bracket_paren(
-                    self.input,
-                    bytes,
-                    bracket_scratch.as_mut().unwrap(),
-                    i,
-                )
-            {
-                // "No links in links" (CommonMark §6.3): if the bracket text
-                // already contains a link, the outer `[` is literal and the
-                // inner link wins. Test this *before* parsing the text — a
-                // cheap non-recursive scan — so `parse_inner` only ever runs on
-                // link-free text and never reverts (the former parse-then-
-                // revert was exponential on nested link text).
-                // The link text occupies `[i+1, i+1+text_str.len())` (the
-                // bracket interior), not up to `end` (which is past the URL).
-                //
-                // Fast path: `try_parse_bracket_paren` just resolved this `[`
-                // with a single `matching_close`, which recorded whether the
-                // interior held any inner `[`. A nested link requires one, so
-                // when there was none the §6.3 check is provably false and the
-                // whole `region_has_link` scan is skipped (the resolve scan
-                // already covered these bytes).
-                let text_start = i + 1;
-                let text_end = text_start + text_str.len();
-                if bracket_scratch.as_ref().unwrap().saw_inner_bracket
-                    && self.region_has_link(
-                        bytes,
-                        bracket_scratch.as_mut().unwrap(),
-                        text_start,
-                        text_end,
-                    )
-                {
-                    i += 1;
-                    continue;
-                }
-                flush_text!(i);
-                let text_span = self.parse_inner(text_str, depth.saturating_add(1));
-                sink.resolved(Inline::Link {
-                    text: text_span,
-                    url,
-                    title,
-                });
-                plain_start = end;
-                i = end;
-                continue;
-            }
-
-            // Reference link: [text][label], [label][], or [label]
-            if links_possible
-                && b == SpecialChar::OpenBracket
-                && let Some((text_str, url, title, end)) =
-                    self.try_parse_reference(bytes, bracket_scratch.as_mut().unwrap(), i)
-            {
-                // For full references the rendered text is the *first* bracket
-                // (`[text][label]`); for shortcut/collapsed it is the label
-                // itself. In every form the rendered text starts at `i+1` and
-                // spans `text_str.len()` bytes.
-                let text_start = i + 1;
-                let text_end = text_start + text_str.len();
-                if self.region_has_link(
-                    bytes,
-                    bracket_scratch.as_mut().unwrap(),
-                    text_start,
-                    text_end,
-                ) {
-                    i += 1;
-                    continue;
-                }
-                flush_text!(i);
-                let text_span = self.parse_inner(text_str, depth.saturating_add(1));
-                sink.resolved(Inline::Link {
-                    text: text_span,
-                    url,
-                    title,
-                });
-                plain_start = end;
-                i = end;
-                continue;
-            }
-
-            // Autolinks `<uri>` / `<email>` and raw inline HTML (§6.5, §6.6).
-            if b == SpecialChar::LessThan
-                && let Some((elem, end)) = Self::try_parse_angle(self.input, bytes, i)
-            {
-                flush_text!(i);
-                sink.resolved(elem);
-                plain_start = end;
-                i = end;
-                continue;
-            }
-
-            // Emphasis delimiter run (`*`/`_`). Only the arena path handles
-            // these; the buffer fast path is only chosen when the context has
-            // no emphasis, so this branch is compiled out there.
-            if S::HANDLES_DELIMS
-                && (b == SpecialChar::Asterisk
-                    || b == SpecialChar::Underscore
-                    || b == SpecialChar::Tilde)
-            {
-                let (count, can_open, can_close) = Self::scan_delims(bytes, i, b);
-                debug_assert!(count > 0);
-                if b == SpecialChar::Tilde && count > 2 {
-                    i += count;
-                    continue;
-                }
-                flush_text!(i);
-                let src = self.input.get(i..i + count).unwrap_or_default();
-                sink.delim_run(src, b, count, can_open, can_close);
-                plain_start = i + count;
-                i += count;
-                continue;
-            }
-
-            if b == SpecialChar::Tilde {
-                i += SpecialChar::Tilde.count_leading_bytes(&bytes[i..]);
-                continue;
-            }
-
-            if b == SpecialChar::OpenBracket {
-                open_brackets += 1;
-            }
-            i += 1;
+            st.i = pos;
+            self.scan_special(bytes, sink, &mut st, brackets.as_mut(), depth);
         }
+        self.flush_tail(sink, st.plain_start);
 
-        // Trailing segment: paragraph reflow strips whitespace at the end of
-        // the final line.
-        let tail = if self.strip_lines {
-            self.input
-                .get(plain_start..)
-                .map(|t| t.trim_end_matches([' ', '\t']))
-        } else {
-            self.input.get(plain_start..)
+        if let Some(scratch) = brackets {
+            scratch.checkin();
+        }
+    }
+
+    /// A link, image, or reference can only ever close on a `]`. One SIMD
+    /// scan up front: when the whole context has no `]`, every `[`/`!` is
+    /// literal text and no scratch buffer is checked out, so link-free prose
+    /// pays nothing.
+    ///
+    /// Bracket `[`->`]` matches are resolved lazily and memoized into the
+    /// scratch on first query (see `matching_close`): flat links cost a short
+    /// forward scan, nested brackets are resolved once then `O(1)`.
+    fn bracket_scratch(bytes: &[u8]) -> Option<BracketScratch> {
+        bytes.find_byte(0, SpecialChar::CloseBracket.byte())?;
+        let mut scratch = BracketScratch::checkout();
+        Self::bracket_reset(&mut scratch, bytes.len());
+        Some(scratch)
+    }
+
+    /// Dispatch on the special byte at `st.i`.
+    fn scan_special<S: InlineSink<'src>>(
+        &mut self,
+        bytes: &[u8],
+        sink: &mut S,
+        st: &mut ScanState,
+        brackets: Option<&mut BracketScratch>,
+        depth: u8,
+    ) {
+        let b = bytes[st.i];
+        match SpecialChar::from_byte(b) {
+            Some(SpecialChar::Newline) => self.scan_newline(bytes, sink, st),
+            Some(SpecialChar::Backslash) => self.scan_escape(bytes, sink, st),
+            Some(SpecialChar::Backtick) => self.scan_code(bytes, sink, st),
+            Some(SpecialChar::ExclamationMark) => {
+                self.scan_image(bytes, sink, st, brackets, depth);
+            }
+            Some(SpecialChar::OpenBracket) => self.scan_bracket(bytes, sink, st, brackets, depth),
+            Some(SpecialChar::LessThan) => self.scan_angle(bytes, sink, st),
+            Some(SpecialChar::Asterisk | SpecialChar::Underscore | SpecialChar::Tilde) => {
+                self.scan_delim(bytes, sink, st, b);
+            }
+            // `SPECIAL_SET` holds only the bytes above; advance defensively
+            // rather than risk a stall.
+            _ => st.i += 1,
+        }
+    }
+
+    /// GFM `www.`/URL autolink in the plain text `[st.i, gap_end)` before the
+    /// next special byte. Returns whether one was emitted.
+    fn scan_url<S: InlineSink<'src>>(
+        &self,
+        sink: &mut S,
+        st: &mut ScanState,
+        gap_end: usize,
+    ) -> bool {
+        if st.i >= gap_end {
+            return false;
+        }
+        let Some((start, end, link)) = self.linker.url_in(
+            self.input,
+            st.i,
+            gap_end,
+            st.plain_start,
+            &mut st.open_brackets,
+        ) else {
+            return false;
         };
+        st.emit(self.input, sink, start, link, end);
+        true
+    }
+
+    fn scan_newline<S: InlineSink<'src>>(&self, bytes: &[u8], sink: &mut S, st: &mut ScanState) {
+        let (trim_end, is_hard) = self.line_break_pieces(bytes, st.plain_start, st.i);
+        st.flush(self.input, sink, trim_end);
+        sink.line_break(is_hard);
+        // Paragraph reflow strips indentation at each line start.
+        let next = if self.strip_lines {
+            Self::skip_line_leading_ws(bytes, st.i + 1)
+        } else {
+            st.i + 1
+        };
+        st.resume(next);
+    }
+
+    /// Backslash escape: only ASCII punctuation can be escaped (`CommonMark`
+    /// §2.4). Before anything else, the backslash is literal text.
+    fn scan_escape<S: InlineSink<'src>>(&self, bytes: &[u8], sink: &mut S, st: &mut ScanState) {
+        let i = st.i;
+        if !bytes.get(i + 1).is_some_and(u8::is_ascii_punctuation) {
+            st.i += 1;
+            return;
+        }
+        st.flush(self.input, sink, i);
+        // Emit the escaped char as its own isolated node (dropping the
+        // backslash). Isolating it prevents an escaped `&` from later merging
+        // with a following `name;` and being decoded as an entity at render
+        // time (e.g. `\&ouml;` must stay literal).
+        if let Some(text) = self.input.get(i + 1..i + 2) {
+            sink.literal(text);
+        }
+        st.resume(i + 2);
+    }
+
+    /// Inline code: `` `code` `` or ``` ``code`` ```.
+    fn scan_code<S: InlineSink<'src>>(&self, bytes: &[u8], sink: &mut S, st: &mut ScanState) {
+        let i = st.i;
+        if let Some((code, end)) = Self::try_parse_inline_code(self.input, bytes, i) {
+            st.emit(self.input, sink, i, Inline::Code(code), end);
+            return;
+        }
+        // No matching closing run: the entire opening run of backticks is
+        // literal text (`CommonMark` §6.1, the opening run is maximal). Skip
+        // past it so a shorter sub-run can't re-open.
+        st.i += SpecialChar::Backtick.count_leading_bytes(&bytes[i..]);
+    }
+
+    /// Image: `![alt](url "title")` or reference `![alt][label]`.
+    fn scan_image<S: InlineSink<'src>>(
+        &mut self,
+        bytes: &[u8],
+        sink: &mut S,
+        st: &mut ScanState,
+        brackets: Option<&mut BracketScratch>,
+        depth: u8,
+    ) {
+        let i = st.i;
+        if let Some(scratch) = brackets
+            && bytes.get(i + 1) == SpecialChar::OpenBracket
+            && let Some((alt, url, title, end)) =
+                Self::try_parse_bracket_paren(self.input, bytes, scratch, i + 1)
+                    .or_else(|| self.try_parse_reference(bytes, scratch, i + 1))
+        {
+            st.flush(self.input, sink, i);
+            let alt = self.parse_inner(alt, depth.saturating_add(1));
+            st.resolve(sink, Inline::Image { alt, url, title }, end);
+            return;
+        }
+        st.i += 1;
+    }
+
+    /// Footnote reference `[^label]`, inline link `[text](url "title")`, or
+    /// reference link `[text][label]`, `[label][]`, `[label]`.
+    fn scan_bracket<S: InlineSink<'src>>(
+        &mut self,
+        bytes: &[u8],
+        sink: &mut S,
+        st: &mut ScanState,
+        brackets: Option<&mut BracketScratch>,
+        depth: u8,
+    ) {
+        let i = st.i;
+        let Some(scratch) = brackets else {
+            st.open_brackets += 1;
+            st.i += 1;
+            return;
+        };
+        if let Some((note, end)) = ext::FootnoteRefs::parse(self.defs, self.input, i) {
+            st.emit(self.input, sink, i, note, end);
+            return;
+        }
+        // `may_nest`: whether the link text can contain a link. After an
+        // inline link, `try_parse_bracket_paren` has just resolved this `[`
+        // with a single `matching_close`, which recorded whether the interior
+        // held any inner `[`; a nested link requires one, so without it the
+        // `region_has_link` scan is skipped.
+        let link = Self::try_parse_bracket_paren(self.input, bytes, scratch, i)
+            .map(|found| (found, scratch.saw_inner_bracket))
+            .or_else(|| {
+                self.try_parse_reference(bytes, scratch, i)
+                    .map(|found| (found, true))
+            });
+        let Some(((text_str, url, title, end), may_nest)) = link else {
+            st.open_brackets += 1;
+            st.i += 1;
+            return;
+        };
+        // "No links in links" (`CommonMark` §6.3): if the bracket text already
+        // contains a link, the outer `[` is literal and the inner link wins.
+        // Test this *before* parsing the text — a cheap non-recursive scan —
+        // so `parse_inner` only ever runs on link-free text and never reverts
+        // (the former parse-then-revert was exponential on nested link text).
+        // In every form the rendered text starts at `i+1` and spans
+        // `text_str.len()` bytes.
+        let text_start = i + 1;
+        if may_nest && self.region_has_link(bytes, scratch, text_start, text_start + text_str.len())
+        {
+            st.i += 1;
+            return;
+        }
+        st.flush(self.input, sink, i);
+        let text = self.parse_inner(text_str, depth.saturating_add(1));
+        st.resolve(sink, Inline::Link { text, url, title }, end);
+    }
+
+    /// Autolinks `<uri>` / `<email>` and raw inline HTML (§6.5, §6.6).
+    fn scan_angle<S: InlineSink<'src>>(&self, bytes: &[u8], sink: &mut S, st: &mut ScanState) {
+        let i = st.i;
+        if let Some((elem, end)) = Self::try_parse_angle(self.input, bytes, i) {
+            st.emit(self.input, sink, i, elem, end);
+        } else {
+            st.i += 1;
+        }
+    }
+
+    /// Emphasis or strikethrough delimiter run (`*`, `_`, `~`). Only the arena
+    /// path handles these; the buffer fast path is only chosen when the
+    /// context has no delimiters, so this branch is compiled out there.
+    fn scan_delim<S: InlineSink<'src>>(
+        &self,
+        bytes: &[u8],
+        sink: &mut S,
+        st: &mut ScanState,
+        b: u8,
+    ) {
+        let i = st.i;
+        if !S::HANDLES_DELIMS {
+            st.i += if b == SpecialChar::Tilde {
+                SpecialChar::Tilde.count_leading_bytes(&bytes[i..])
+            } else {
+                1
+            };
+            return;
+        }
+        let (count, can_open, can_close) = Self::scan_delims(bytes, i, b);
+        debug_assert!(count > 0);
+        if b == SpecialChar::Tilde && count > 2 {
+            st.i += count;
+            return;
+        }
+        st.flush(self.input, sink, i);
+        let src = self.input.get(i..i + count).unwrap_or_default();
+        sink.delim_run(src, b, count, can_open, can_close);
+        st.resume(i + count);
+    }
+
+    /// Trailing segment: paragraph reflow strips whitespace at the end of the
+    /// final line.
+    fn flush_tail<S: InlineSink<'src>>(&self, sink: &mut S, plain_start: usize) {
+        let tail = self.input.get(plain_start..).map(|t| {
+            if self.strip_lines {
+                t.trim_end_matches([' ', '\t'])
+            } else {
+                t
+            }
+        });
         if let Some(text) = tail
             && !text.is_empty()
         {
             sink.text(text);
-        }
-
-        if let Some(scratch) = bracket_scratch {
-            scratch.checkin();
         }
     }
 
@@ -1843,47 +1820,65 @@ impl<'src, 'pool, const MAX_DEPTH: u8, const CAP: usize> InlineParser<'src, 'poo
         start: usize,
     ) -> Option<(&'src str, usize)> {
         if bytes.get(start).copied() == Some(SpecialChar::LessThan.byte()) {
-            let mut j = start + 1;
-            loop {
-                match bytes.get(j).copied() {
-                    None | Some(b'\n' | b'<') => return None,
-                    Some(b'>') => return Some((input.get(start + 1..j)?, j + 1)),
-                    Some(b'\\') if bytes.get(j + 1).is_some_and(u8::is_ascii_punctuation) => {
-                        j += 2;
-                    }
-                    Some(_) => j += 1,
-                }
-            }
-        } else {
-            let mut j = start;
-            let mut depth = 0u32;
-            loop {
-                match bytes.get(j).copied() {
-                    None => break,
-                    Some(b'\\') if bytes.get(j + 1).is_some_and(u8::is_ascii_punctuation) => {
-                        j += 2;
-                    }
-                    Some(b'(') => {
-                        depth += 1;
-                        j += 1;
-                    }
-                    Some(b')') => {
-                        if depth == 0 {
-                            break;
-                        }
-                        depth -= 1;
-                        j += 1;
-                    }
-                    // ASCII space or any control character ends the destination.
-                    Some(b) if b <= b' ' || b == 0x7f => break,
-                    Some(_) => j += 1,
-                }
-            }
-            if depth != 0 {
-                return None;
-            }
-            Some((input.get(start..j)?, j))
+            return Self::scan_angle_destination(input, bytes, start);
         }
+        Self::scan_bare_destination(input, bytes, start)
+    }
+
+    /// The `<...>` destination form: no line breaks or unescaped `<`/`>`.
+    fn scan_angle_destination(
+        input: &'src str,
+        bytes: &[u8],
+        start: usize,
+    ) -> Option<(&'src str, usize)> {
+        let mut j = start + 1;
+        loop {
+            match bytes.get(j).copied() {
+                None | Some(b'\n' | b'<') => return None,
+                Some(b'>') => return Some((input.get(start + 1..j)?, j + 1)),
+                Some(b'\\') if bytes.get(j + 1).is_some_and(u8::is_ascii_punctuation) => {
+                    j += 2;
+                }
+                Some(_) => j += 1,
+            }
+        }
+    }
+
+    /// The bare destination form: balanced parentheses, no ASCII spaces or
+    /// control characters.
+    fn scan_bare_destination(
+        input: &'src str,
+        bytes: &[u8],
+        start: usize,
+    ) -> Option<(&'src str, usize)> {
+        let mut j = start;
+        let mut depth = 0u32;
+        loop {
+            match bytes.get(j).copied() {
+                None => break,
+                Some(b'\\') if bytes.get(j + 1).is_some_and(u8::is_ascii_punctuation) => {
+                    j += 2;
+                }
+                Some(b'(') => {
+                    depth += 1;
+                    j += 1;
+                }
+                Some(b')') => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                    j += 1;
+                }
+                // ASCII space or any control character ends the destination.
+                Some(b) if b <= b' ' || b == 0x7f => break,
+                Some(_) => j += 1,
+            }
+        }
+        if depth != 0 {
+            return None;
+        }
+        Some((input.get(start..j)?, j))
     }
 
     /// Scan an optional link title at `start` (`"..."`, `'...'`, or `(...)`),

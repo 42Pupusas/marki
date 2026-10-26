@@ -11,6 +11,8 @@ use crate::small_bool::SmallBoolVec;
 use crate::special_char::SpecialChar;
 use crate::{Inline, MarkdownFile};
 
+mod list_scan;
+
 // ---------------------------------------------------------------------------
 // Pass 1: block-level parsing into RawSection (no inline parsing)
 // ---------------------------------------------------------------------------
@@ -245,6 +247,7 @@ pub struct ParseCtx<'src> {
     pub refs: RefStore<'src>,
 }
 
+#[derive(Clone, Copy)]
 enum Accumulator<'src> {
     Empty,
     InBlockquote {
@@ -272,6 +275,19 @@ enum Accumulator<'src> {
 }
 
 impl<'src> Accumulator<'src> {
+    /// The blockquote's `lines_start` when a lazy continuation line may join
+    /// it: an inner paragraph is open and no fenced code block is active.
+    const fn lazy_lines_start(&self) -> Option<u32> {
+        match self {
+            Self::InBlockquote {
+                lines_start,
+                para_open: true,
+                fence: None,
+            } => Some(*lines_start),
+            _ => None,
+        }
+    }
+
     const fn flush(self, lines_pool_len: u32) -> Option<RawSection<'src>> {
         match self {
             // Empty produces nothing; indented code needs `input` to slice its
@@ -1219,23 +1235,6 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
         scratch: &mut Scratch<'src>,
         defs: Refs<'_, 'src>,
     ) -> SectionRange {
-        let pad_at = |k: usize| pad.get(k).copied().unwrap_or(0);
-        // Leading indentation of pooled line `k` in *columns*. When the line
-        // carries straddled-tab pad (`pad > 0`) it begins on an absolute tab
-        // stop, so its own tabs expand correctly from a local origin and the
-        // total indent is `pad + leading_columns`. When `pad == 0` we keep the
-        // historical `leading_spaces` measure exactly (a bare leading tab in a
-        // container is *not* promoted to indented code here), so every
-        // pre-existing path is byte-for-byte unchanged.
-        let indent_cols = |k: usize| {
-            let b = lines[k].as_bytes();
-            let p = pad_at(k);
-            if p > 0 {
-                p as usize + b.leading_columns()
-            } else {
-                b.leading_spaces()
-            }
-        };
         // Pre-order arena: append this forest's nodes directly to the section
         // pool. Containers push a placeholder, recurse to append their subtree
         // immediately after, then backpatch their child span. The returned
@@ -1259,43 +1258,14 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
             // computed separately. `indent_cols` reduces to the historical
             // `leading_spaces` whenever `pad == 0`, so existing paths are
             // unchanged.
-            let ind_cols = indent_cols(i);
+            let ind_cols = Self::indent_cols(line, Self::pad_at(pad, i));
             let ind = b.leading_spaces();
 
             // Indented code block (≥4 columns), but only when not continuing an
             // open paragraph (an indented line is lazy paragraph text there).
             if ind_cols >= 4 && para.is_empty() {
                 let code_start = line_pool.len().pool_offset();
-                while i < lines.len() {
-                    let l = lines[i];
-                    let lb = l.as_bytes();
-                    if lb.iter().all(u8::is_ascii_whitespace) {
-                        // Interior blank: keep, but only if a later indented
-                        // line follows (trailing blanks are trimmed below).
-                        line_pool.push(PoolLine::plain(""));
-                        i += 1;
-                        continue;
-                    }
-                    if indent_cols(i) < 4 {
-                        break;
-                    }
-                    // Strip the four indent columns, preserving any straddled-
-                    // tab pad so the rendered code keeps its leading spaces.
-                    let (cpad, ctext) = str::strip_cols_from_padded(pad_at(i), l, 4);
-                    line_pool.push(PoolLine {
-                        pad: cpad,
-                        text: ctext,
-                    });
-                    i += 1;
-                }
-                // Trim trailing blank lines out of the code block.
-                while line_pool.len().pool_offset() > code_start
-                    && line_pool
-                        .last()
-                        .is_some_and(|l| l.text.is_empty() && l.pad == 0)
-                {
-                    line_pool.pop();
-                }
+                i = Self::collect_indented_code(lines, pad, i, line_pool);
                 let len = line_pool.len().pool_offset() - code_start;
                 section_pool.push(Section::CodeLines {
                     language: None,
@@ -1327,50 +1297,10 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
                 if body.first() == SpecialChar::GreaterThan {
                     Self::flush_para(input, &mut para, section_pool, pool, defs);
                     let mut nested = scratch.take_lines();
-                    // `last_para` tracks whether the previous collected line is
-                    // paragraph content that a following marker-less line may
-                    // lazily continue (CommonMark §5.1). A blank `>` line or a
-                    // line that begins a block closes that paragraph.
-                    let mut last_para = false;
                     // Parallel lazy flags for the collected nested lines.
                     // Inline storage spills to the heap only for long runs.
                     let mut nested_lazy = SmallBoolVec::new();
-                    while i < lines.len() {
-                        let l = lines[i];
-                        let lb = l.as_bytes();
-                        let qind = lb.leading_spaces().min(3);
-                        let lbody = &lb[qind.min(lb.len())..];
-                        if lbody.first() == SpecialChar::GreaterThan {
-                            let after = qind + 1;
-                            let content = if lb.get(after) == Some(&SpecialChar::Space.byte()) {
-                                l.get(after + 1..).unwrap_or("")
-                            } else {
-                                l.get(after..).unwrap_or("")
-                            };
-                            last_para = content.as_bytes().is_lazy_paragraph_tail();
-                            nested.push(content);
-                            // A `>`-marked line carries its own lazy status down.
-                            nested_lazy.push(lazy.get(i).copied().unwrap_or(false));
-                            i += 1;
-                            continue;
-                        }
-                        // Lazy paragraph continuation: a marker-less, non-blank
-                        // line that doesn't begin a block extends the paragraph
-                        // still open inside the blockquote. Recursing on the
-                        // collected lines carries it down to the innermost one.
-                        let indent = lb.leading_spaces().min(lb.len());
-                        if last_para
-                            && !lb.is_blank_line(0, lb.len())
-                            && !lb[indent..].begins_block()
-                        {
-                            nested.push(l.trim());
-                            // This line lazily continues the inner paragraph.
-                            nested_lazy.push(true);
-                            i += 1;
-                            continue;
-                        }
-                        break;
-                    }
+                    i = Self::collect_quote_run(lines, lazy, i, &mut nested, &mut nested_lazy);
                     // Placeholder, recurse to append the subtree, then backpatch.
                     // Nested-container content does not carry straddled-tab
                     // pad (that lives only on the top-level container's pooled
@@ -1413,19 +1343,13 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
                     Self::flush_para(input, &mut para, section_pool, pool, defs);
                     let language = Self::fence_language(line, ind, fence_len);
                     let code_start = line_pool.len().pool_offset();
-                    i += 1;
-                    while i < lines.len() {
-                        let l = lines[i];
-                        let lb = l.as_bytes();
-                        let cind = lb.leading_spaces().min(3);
-                        if lb[cind.min(lb.len())..].is_closing_fence(fence_char, fence_len) {
-                            i += 1;
-                            break;
-                        }
-                        // Strip up to the opening fence's indentation.
-                        line_pool.push(PoolLine::plain(l.get(ind.min(l.len())..).unwrap_or("")));
-                        i += 1;
-                    }
+                    i = Self::collect_fenced_code(
+                        lines,
+                        i + 1,
+                        ind,
+                        (fence_char, fence_len),
+                        line_pool,
+                    );
                     let len = line_pool.len().pool_offset() - code_start;
                     section_pool.push(Section::CodeLines {
                         language,
@@ -1513,6 +1437,138 @@ impl<'src, const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_
         scratch.give_lines(para);
         let len = section_pool.len().pool_offset() - start;
         SectionRange::new(start, len)
+    }
+
+    fn pad_at(pad: &[u8], k: usize) -> u8 {
+        pad.get(k).copied().unwrap_or(0)
+    }
+
+    /// Leading indentation of a pooled container line in *columns*. When the
+    /// line carries straddled-tab pad (`pad > 0`) it begins on an absolute tab
+    /// stop, so its own tabs expand correctly from a local origin and the
+    /// total indent is `pad + leading_columns`. When `pad == 0` we keep the
+    /// historical `leading_spaces` measure exactly (a bare leading tab in a
+    /// container is *not* promoted to indented code here), so every
+    /// pre-existing path is byte-for-byte unchanged.
+    fn indent_cols(line: &str, pad: u8) -> usize {
+        let b = line.as_bytes();
+        if pad > 0 {
+            pad as usize + b.leading_columns()
+        } else {
+            b.leading_spaces()
+        }
+    }
+
+    /// Push the indented code block starting at `lines[i]` onto `line_pool`,
+    /// with its four indent columns stripped and trailing blank lines trimmed.
+    /// Returns the index of the first line after the block.
+    fn collect_indented_code(
+        lines: &[&'src str],
+        pad: &[u8],
+        mut i: usize,
+        line_pool: &mut Vec<PoolLine<'src>>,
+    ) -> usize {
+        let code_start = line_pool.len();
+        while i < lines.len() {
+            let l = lines[i];
+            if l.bytes().all(|c| c.is_ascii_whitespace()) {
+                // Interior blank: keep, but only if a later indented line
+                // follows (trailing blanks are trimmed below).
+                line_pool.push(PoolLine::plain(""));
+            } else if Self::indent_cols(l, Self::pad_at(pad, i)) < 4 {
+                break;
+            } else {
+                // Strip the four indent columns, preserving any straddled-tab
+                // pad so the rendered code keeps its leading spaces.
+                let (cpad, ctext) = str::strip_cols_from_padded(Self::pad_at(pad, i), l, 4);
+                line_pool.push(PoolLine {
+                    pad: cpad,
+                    text: ctext,
+                });
+            }
+            i += 1;
+        }
+        while line_pool.len() > code_start
+            && line_pool
+                .last()
+                .is_some_and(|l| l.text.is_empty() && l.pad == 0)
+        {
+            line_pool.pop();
+        }
+        i
+    }
+
+    /// Collect the run of nested blockquote lines starting at `lines[i]`, with
+    /// their `>` markers stripped, into `nested`, and their lazy flags into
+    /// `nested_lazy`. Returns the index of the first line after the run.
+    fn collect_quote_run(
+        lines: &[&'src str],
+        lazy: &[bool],
+        mut i: usize,
+        nested: &mut Vec<&'src str>,
+        nested_lazy: &mut SmallBoolVec,
+    ) -> usize {
+        // `last_para` tracks whether the previous collected line is paragraph
+        // content that a following marker-less line may lazily continue
+        // (CommonMark §5.1). A blank `>` line or a line that begins a block
+        // closes that paragraph.
+        let mut last_para = false;
+        while i < lines.len() {
+            let l = lines[i];
+            let lb = l.as_bytes();
+            let qind = lb.leading_spaces().min(3);
+            if lb[qind.min(lb.len())..].first() == SpecialChar::GreaterThan {
+                let after = qind + 1;
+                let content = if lb.get(after) == Some(&SpecialChar::Space.byte()) {
+                    l.get(after + 1..).unwrap_or("")
+                } else {
+                    l.get(after..).unwrap_or("")
+                };
+                last_para = content.as_bytes().is_lazy_paragraph_tail();
+                nested.push(content);
+                // A `>`-marked line carries its own lazy status down.
+                nested_lazy.push(lazy.get(i).copied().unwrap_or(false));
+            } else if last_para
+                && !lb.is_blank_line(0, lb.len())
+                && !lb[lb.leading_spaces().min(lb.len())..].begins_block()
+            {
+                // Lazy paragraph continuation: a marker-less, non-blank line
+                // that doesn't begin a block extends the paragraph still open
+                // inside the blockquote. Recursing on the collected lines
+                // carries it down to the innermost one.
+                nested.push(l.trim());
+                nested_lazy.push(true);
+            } else {
+                break;
+            }
+            i += 1;
+        }
+        i
+    }
+
+    /// Push the body lines of a fenced code block, starting at `lines[i]`
+    /// (just past the opening fence `fence` = `(char, len)` indented `ind`
+    /// spaces), onto `line_pool`. Returns the index just past the closing
+    /// fence, or `lines.len()` when the block is unclosed.
+    fn collect_fenced_code(
+        lines: &[&'src str],
+        mut i: usize,
+        ind: usize,
+        (fence_char, fence_len): (u8, usize),
+        line_pool: &mut Vec<PoolLine<'src>>,
+    ) -> usize {
+        while i < lines.len() {
+            let l = lines[i];
+            let lb = l.as_bytes();
+            let cind = lb.leading_spaces().min(3);
+            i += 1;
+            if lb[cind.min(lb.len())..].is_closing_fence(fence_char, fence_len) {
+                break;
+            }
+            // Strip up to the opening fence's indentation.
+            line_pool.push(PoolLine::plain(l.get(ind.min(l.len())..).unwrap_or("")));
+        }
+        i
     }
 
     /// Collect the lines of an HTML block (`CommonMark` §4.6) from a container's
@@ -1824,7 +1880,6 @@ impl<'src> ParseCtx<'src> {
     /// into [`RawSection`]s. Owns the entire block-parsing loop so the public
     /// [`MarkdownFile`] type never touches the `Accumulator`/`RawSection`
     /// intermediates.
-    #[allow(clippy::too_many_lines)]
     fn block_pass(input: &'src str, scratch: ParseScratch<'src>) -> Self {
         let bytes = input.as_bytes();
         // Adopt the recycled (already-cleared) buffers from the thread-local
@@ -1855,151 +1910,173 @@ impl<'src> ParseCtx<'src> {
             let line_end = bytes
                 .find_byte(pos, SpecialChar::Newline.byte())
                 .unwrap_or(bytes.len());
-
-            // Fast-path: when we detect a code fence opening, scan ahead for
-            // the closing fence in one shot instead of processing line-by-line.
-            // CommonMark §4.5: a code fence can be indented 0-3 spaces, so we
-            // check if a backtick or tilde appears within the first 4 bytes.
-            let first = bytes.get(pos).copied();
-            if (first == SpecialChar::Backtick
-                || first == SpecialChar::Tilde
-                || (first == SpecialChar::Space
-                    && bytes[pos..line_end].get(..4).is_some_and(|w| {
-                        w.contains(&SpecialChar::Backtick.byte())
-                            || w.contains(&SpecialChar::Tilde.byte())
-                    })))
-                && let Some(indent) = bytes[pos..line_end].strip_indent()
-                && let Some((fence_char, fence_len)) =
-                    bytes[pos + indent..line_end].code_fence_opening()
-            {
-                let spos = pos + indent;
-                let language = ctx.extract_language(&bytes[spos..line_end], fence_len);
-                ctx.flush_acc(acc);
-                let content_start = line_end + 1;
-                let (code, resume) = ctx.scan_code_block_fast(content_start, fence_len, fence_char);
-                ctx.sections.push(RawSection::CodeBlock {
-                    language,
-                    code,
-                    indent,
-                });
+            if let Some(resume) = ctx.block_start(acc, pos, line_end) {
                 pos = resume;
                 acc = Accumulator::Empty;
                 continue;
             }
-
-            // HTML blocks (CommonMark §4.6): detected by a `<` within the first
-            // 4 bytes. Type 7 (a bare standalone tag) cannot interrupt an open
-            // paragraph; the other six can.
-            if (first == Some(b'<')
-                || (first == SpecialChar::Space
-                    && bytes[pos..line_end]
-                        .get(..4)
-                        .is_some_and(|w| w.contains(&b'<'))))
-                && let Some(indent) = bytes[pos..line_end].strip_indent()
-            {
-                let spos = pos + indent;
-                let in_paragraph = matches!(acc, Accumulator::InParagraph { .. });
-                if let Some(kind) = bytes[spos..line_end].html_block_start(in_paragraph) {
-                    ctx.flush_acc(acc);
-                    let (html, resume) = ctx.scan_html_block(pos, line_end, kind);
-                    ctx.sections.push(RawSection::HtmlBlock { html });
-                    pos = resume;
-                    acc = Accumulator::Empty;
-                    continue;
-                }
-            }
-
-            let bracket_start = first == Some(b'[')
-                || (first == SpecialChar::Space
-                    && bytes[pos..line_end]
-                        .get(..4)
-                        .is_some_and(|w| w.contains(&b'[')));
-
-            // Footnote definitions (GFM): `[^label]:` opens a container whose
-            // content is the rest of the line plus following indented lines.
-            // Like a link definition it cannot interrupt a paragraph.
-            if bracket_start
-                && !matches!(acc, Accumulator::InParagraph { .. })
-                && let Some((block, resume)) =
-                    ext::RawBlock::footnote_at(&mut ctx, input, pos, line_end)
-            {
-                ctx.flush_acc(acc);
-                ctx.sections.push(RawSection::Ext(block));
-                pos = resume;
-                acc = Accumulator::Empty;
-                continue;
-            }
-
-            // Link reference definitions (CommonMark §4.7): a `[` within the
-            // first 4 bytes, not interrupting a paragraph. They span up to
-            // three lines and produce no output, only a registry entry.
-            if bracket_start
-                && !matches!(acc, Accumulator::InParagraph { .. })
-                && let Some(indent) = bytes[pos..line_end].strip_indent()
-                && let Some((def, resume)) = LinkDef::scan(ctx.input, pos + indent)
-            {
-                ctx.flush_acc(acc);
-                ctx.refs
-                    .links
-                    .entry(def.label.normalize_label_cow())
-                    .or_insert((def.url, def.title));
-                pos = resume;
-                acc = Accumulator::Empty;
-                continue;
-            }
-
-            // Lists (CommonMark §5.2/§5.3): when a line opens a list item, scan
-            // the whole list run (all items + their continuation lines) in one
-            // shot and let pass 2 resolve item structure. A list can interrupt
-            // a paragraph only with a non-empty first item, and an ordered list
-            // only when it starts at 1.
-            if let Some(indent) = bytes[pos..line_end].strip_indent()
-                && !bytes[pos + indent..line_end].is_horizontal_rule()
-                && let Some(m) = bytes[pos + indent..line_end].list_marker()
-            {
-                let in_para = matches!(acc, Accumulator::InParagraph { .. });
-                let rest = &bytes[pos + indent + m.width..line_end];
-                let empty_item = rest.iter().all(u8::is_ascii_whitespace);
-                let interrupts_ok = !in_para
-                    || (!empty_item
-                        && match m.ordered {
-                            Some((n, _)) => n == 1,
-                            None => true,
-                        });
-                if interrupts_ok {
-                    ctx.flush_acc(acc);
-                    let scan = ctx.scan_list(pos);
-                    ctx.sections.push(RawSection::List {
-                        items_start: scan.items_start,
-                        items_len: scan.items_len,
-                        tight: scan.tight,
-                        ordered: scan.ordered,
-                    });
-                    pos = scan.resume;
-                    acc = Accumulator::Empty;
-                    continue;
-                }
-            }
-
-            // GFM tables (CommonMark/GFM §4.10): a header row containing an
-            // unescaped pipe immediately followed by a delimiter row with a
-            // matching column count. A table can interrupt a paragraph, so this
-            // runs regardless of `acc` — the open paragraph (if any) is flushed
-            // first. Detection needs one line of lookahead (the delimiter row).
-            if let Some((block, resume)) = ext::RawBlock::table_at(input, pos, line_end) {
-                ctx.flush_acc(acc);
-                ctx.sections.push(RawSection::Ext(block));
-                pos = resume;
-                acc = Accumulator::Empty;
-                continue;
-            }
-
             acc = ctx.fold_line(acc, pos, line_end);
             pos = line_end + 1;
         }
 
         ctx.flush_acc(acc);
         ctx
+    }
+
+    /// A block that starts on the line `pos..line_end` and is scanned as a
+    /// whole rather than folded line by line. When one is found, `acc` is
+    /// flushed, the block recorded, and the offset to resume at returned.
+    fn block_start(
+        &mut self,
+        acc: Accumulator<'src>,
+        pos: usize,
+        line_end: usize,
+    ) -> Option<usize> {
+        self.fence_start(acc, pos, line_end)
+            .or_else(|| self.html_start(acc, pos, line_end))
+            .or_else(|| self.footnote_start(acc, pos, line_end))
+            .or_else(|| self.link_def_start(acc, pos, line_end))
+            .or_else(|| self.list_start(acc, pos, line_end))
+            .or_else(|| self.table_start(acc, pos, line_end))
+    }
+
+    /// Whether the line `pos..line_end` begins with one of `needles`, or with
+    /// a space and has one within its first 4 bytes. A cheap pre-filter for
+    /// constructs that allow 0-3 spaces of indentation.
+    fn opens_with(&self, pos: usize, line_end: usize, needles: &[u8]) -> bool {
+        let line = &self.bytes[pos..line_end];
+        match line.first() {
+            Some(&b' ') => line
+                .get(..4)
+                .is_some_and(|w| w.iter().any(|b| needles.contains(b))),
+            Some(b) => needles.contains(b),
+            None => false,
+        }
+    }
+
+    /// Fenced code block (`CommonMark` §4.5), scanned ahead to its closing
+    /// fence in one shot instead of line by line.
+    fn fence_start(
+        &mut self,
+        acc: Accumulator<'src>,
+        pos: usize,
+        line_end: usize,
+    ) -> Option<usize> {
+        if !self.opens_with(pos, line_end, b"`~") {
+            return None;
+        }
+        let bytes = self.bytes;
+        let indent = bytes[pos..line_end].strip_indent()?;
+        let line = &bytes[pos + indent..line_end];
+        let (fence_char, fence_len) = line.code_fence_opening()?;
+        let language = self.extract_language(line, fence_len);
+        self.flush_acc(acc);
+        let (code, resume) = self.scan_code_block_fast(line_end + 1, fence_len, fence_char);
+        self.sections.push(RawSection::CodeBlock {
+            language,
+            code,
+            indent,
+        });
+        Some(resume)
+    }
+
+    /// HTML block (`CommonMark` §4.6). Type 7 (a bare standalone tag) cannot
+    /// interrupt an open paragraph; the other six can.
+    fn html_start(&mut self, acc: Accumulator<'src>, pos: usize, line_end: usize) -> Option<usize> {
+        if !self.opens_with(pos, line_end, b"<") {
+            return None;
+        }
+        let indent = self.bytes[pos..line_end].strip_indent()?;
+        let in_paragraph = matches!(acc, Accumulator::InParagraph { .. });
+        let kind = self.bytes[pos + indent..line_end].html_block_start(in_paragraph)?;
+        self.flush_acc(acc);
+        let (html, resume) = self.scan_html_block(pos, line_end, kind);
+        self.sections.push(RawSection::HtmlBlock { html });
+        Some(resume)
+    }
+
+    /// GFM footnote definition: `[^label]:` opens a container whose content
+    /// is the rest of the line plus following indented lines. Like a link
+    /// definition it cannot interrupt a paragraph.
+    fn footnote_start(
+        &mut self,
+        acc: Accumulator<'src>,
+        pos: usize,
+        line_end: usize,
+    ) -> Option<usize> {
+        if matches!(acc, Accumulator::InParagraph { .. }) || !self.opens_with(pos, line_end, b"[") {
+            return None;
+        }
+        let input = self.input;
+        let (block, resume) = ext::RawBlock::footnote_at(self, input, pos, line_end)?;
+        self.flush_acc(acc);
+        self.sections.push(RawSection::Ext(block));
+        Some(resume)
+    }
+
+    /// Link reference definition (`CommonMark` §4.7), not interrupting a
+    /// paragraph. It spans up to three lines and produces no output, only a
+    /// registry entry.
+    fn link_def_start(
+        &mut self,
+        acc: Accumulator<'src>,
+        pos: usize,
+        line_end: usize,
+    ) -> Option<usize> {
+        if matches!(acc, Accumulator::InParagraph { .. }) || !self.opens_with(pos, line_end, b"[") {
+            return None;
+        }
+        let indent = self.bytes[pos..line_end].strip_indent()?;
+        let (def, resume) = LinkDef::scan(self.input, pos + indent)?;
+        self.flush_acc(acc);
+        self.refs
+            .links
+            .entry(def.label.normalize_label_cow())
+            .or_insert((def.url, def.title));
+        Some(resume)
+    }
+
+    /// List (`CommonMark` §5.2/§5.3): the whole run (all items and their
+    /// continuation lines) is scanned in one shot, and pass 2 resolves item
+    /// structure. A list can interrupt a paragraph only with a non-empty first
+    /// item, and an ordered list only when it starts at 1.
+    fn list_start(&mut self, acc: Accumulator<'src>, pos: usize, line_end: usize) -> Option<usize> {
+        let indent = self.bytes[pos..line_end].strip_indent()?;
+        let body = &self.bytes[pos + indent..line_end];
+        if body.is_horizontal_rule() {
+            return None;
+        }
+        let m = body.list_marker()?;
+        if matches!(acc, Accumulator::InParagraph { .. })
+            && (body[m.width..].iter().all(u8::is_ascii_whitespace)
+                || m.ordered.is_some_and(|(n, _)| n != 1))
+        {
+            return None;
+        }
+        self.flush_acc(acc);
+        let scan = self.scan_list(pos);
+        self.sections.push(RawSection::List {
+            items_start: scan.items_start,
+            items_len: scan.items_len,
+            tight: scan.tight,
+            ordered: scan.ordered,
+        });
+        Some(scan.resume)
+    }
+
+    /// GFM table: a header row containing an unescaped pipe immediately
+    /// followed by a delimiter row with a matching column count. A table can
+    /// interrupt a paragraph.
+    fn table_start(
+        &mut self,
+        acc: Accumulator<'src>,
+        pos: usize,
+        line_end: usize,
+    ) -> Option<usize> {
+        let (block, resume) = ext::RawBlock::table_at(self.input, pos, line_end)?;
+        self.flush_acc(acc);
+        self.sections.push(RawSection::Ext(block));
+        Some(resume)
     }
 
     /// Extract the language tag from a code fence opening line.
@@ -2132,233 +2209,6 @@ impl<'src> ParseCtx<'src> {
         // Reached end of input: the block ends at the last non-blank line, not
         // the buffer end (which would wrongly include a trailing newline).
         finish(last_end, bytes.len())
-    }
-
-    /// Scan a whole top-level list (`CommonMark` §5.2/§5.3) starting at
-    /// `start`. Splits the list into items in a single byte walk, pushes each
-    /// item's *dedented* content lines onto the line pool, and records an
-    /// [`ItemMeta`] per item plus the loose/tight flag and ordered start.
-    ///
-    /// This subsumes the item-boundary and content-column work that pass 2
-    /// used to redo: [`assemble_list`] now just maps each [`ItemMeta`] through
-    /// [`resolve_blocks`]. Nested sublists are still derived lazily in pass 2
-    /// (the dedented item lines are re-scanned only when their own marker is
-    /// met), so this walk only tracks the *outermost* item structure.
-    #[allow(clippy::too_many_lines)]
-    fn scan_list(&mut self, start: usize) -> ListScan {
-        let bytes = self.bytes;
-        let line_end_of = |p: usize| {
-            bytes
-                .find_byte(p, SpecialChar::Newline.byte())
-                .unwrap_or(bytes.len())
-        };
-
-        let items_start = self.list_items.len().lines_offset();
-        let ind0 = bytes[start..line_end_of(start)].leading_spaces();
-        let family = bytes[start + ind0..line_end_of(start)]
-            .list_marker()
-            .expect("caller verified a marker");
-        let ordered = family.ordered;
-
-        let mut pos = start;
-        let mut loose = false;
-        // Per-item state, (re)initialised at each marker line.
-        let mut item_start = self.lines.len().lines_offset();
-        let mut col; // content column of the current item
-        let mut item_blanks = 0usize; // blanks seen inside the current item
-        let mut pending_blanks = 0usize; // trailing blanks not yet attributed
-        let mut last_para = true;
-        // `Some((char,len))` while the current item's content is inside a fenced
-        // code block; blank lines there must not loosen the list.
-        let mut fence: Option<(u8, usize)> = None;
-        // Set when the current item is empty (marker only) and a blank line has
-        // followed: a later indented line cannot then join this item.
-        let mut empty_then_blank = false;
-        // Looseness must only count a blank that separates two *direct* children
-        // of the item (CommonMark §5.3: "directly contain"). A blank *inside* a
-        // sub-container (a nested list or blockquote) does not loosen the outer
-        // list. `sub_col` is the dedented-indent threshold of the outermost open
-        // sub-container: a post-blank line at or beyond it continues that
-        // sub-container (no loosening); a line below it is a direct child.
-        let mut sub_col: Option<usize> = None;
-
-        // Open the first item.
-        {
-            let le = line_end_of(pos);
-            col = bytes[start + ind0 + family.width..le].item_content_indent(ind0, family);
-            fence = bytes[(start + ind0 + family.width).min(le)..le].update_fence(fence);
-            self.push_marker_content(pos, le, col);
-            pos = le + 1;
-        }
-
-        while pos < bytes.len() {
-            let le = line_end_of(pos);
-            let line = &bytes[pos..le];
-
-            if line.iter().all(u8::is_ascii_whitespace) {
-                // An empty list item (marker with no content) followed by a
-                // blank line begins with a blank line, so it cannot contain a
-                // following continuation block (CommonMark §5.2). Record this so
-                // the continuation branch below won't absorb the next indented
-                // line into the empty item; a sibling marker can still extend
-                // the list.
-                if self.lines.len().lines_offset() == item_start && fence.is_none() {
-                    empty_then_blank = true;
-                }
-                // A blank line inside a fenced code block stays part of the
-                // block and does not make the list loose.
-                if fence.is_none() {
-                    item_blanks += 1;
-                }
-                self.push_line("", false);
-                pos = le + 1;
-                last_para = false;
-                continue;
-            }
-
-            let ind = line.leading_spaces();
-
-            // A continuation line may reach the content column via a tab even
-            // when its leading *spaces* fall short (e.g. `\tbar` is 4 columns).
-            if ind < col && !empty_then_blank && line.leading_columns() >= col {
-                let src = self.input.get(pos..le).unwrap_or("");
-                if let Some(content) = src.strip_columns(col) {
-                    // Clean byte boundary (pure-space prefix, or a tab landing
-                    // exactly on the content column): borrow the slice as-is.
-                    if item_blanks > 0 {
-                        loose = true;
-                    }
-                    item_blanks = 0;
-                    fence = content.as_bytes().update_fence(fence);
-                    self.push_line(content, false);
-                    pos = le + 1;
-                    last_para = true;
-                    continue;
-                } else if line.leading_columns() - col >= 4 {
-                    // The content column lands mid-tab *and* the remainder is
-                    // indented code (≥4 columns past the column). Emit the
-                    // straddled tab's leftover columns as synthetic `pad`; the
-                    // slice resumes on a tab stop so it still renders with the
-                    // correct leading spaces (`CommonMark` §2.2, example 5).
-                    // When the remainder is shallower it is a nested list /
-                    // paragraph, handled byte-wise by the paths below — feeding
-                    // pad there would confuse the byte-based sublist parser.
-                    let (cpad, content) = src.strip_columns_padded(col);
-                    if item_blanks > 0 {
-                        loose = true;
-                    }
-                    item_blanks = 0;
-                    fence = content.as_bytes().update_fence(fence);
-                    self.push_line_padded(content, false, cpad);
-                    pos = le + 1;
-                    last_para = true;
-                    continue;
-                }
-            }
-
-            // Continuation indented to the item's content column.
-            if ind >= col {
-                // An empty item followed by a blank line cannot absorb later
-                // content: end the list here so it parses outside.
-                if empty_then_blank {
-                    break;
-                }
-                // Dedented indentation of this line within the item frame, and
-                // its content past that indentation.
-                let dind = ind - col;
-                let content = self.input.get(pos + col..le).unwrap_or("");
-                let inner = &content.as_bytes()[dind.min(content.len())..];
-                // A preceding blank loosens the list only when this line is a
-                // *direct* child of the item. If an inner sub-container (nested
-                // list / blockquote) was open and this line lies within it
-                // (indented past its marker), the blank was interior to that
-                // sub-container and must not loosen the outer list.
-                let in_sub = sub_col.is_some_and(|th| dind >= th);
-                if item_blanks > 0 && !in_sub {
-                    loose = true;
-                }
-                item_blanks = 0;
-                // Update the open-sub-container threshold. A line that does not
-                // continue the current sub-container becomes a new direct child:
-                // a nested list/blockquote (re)opens a sub-container at its
-                // marker column; anything else closes it.
-                if !in_sub {
-                    sub_col = if (!inner.is_horizontal_rule() && inner.list_marker().is_some())
-                        || inner.first() == Some(&SpecialChar::GreaterThan.byte())
-                    {
-                        Some(dind + 1)
-                    } else {
-                        None
-                    };
-                }
-                fence = content.as_bytes().update_fence(fence);
-                self.push_dedented(pos, le, col);
-                pos = le + 1;
-                last_para = true;
-                continue;
-            }
-
-            // A thematic break (`* * *`) ends the list rather than opening a
-            // new item, even though its first run looks like a bullet marker.
-            if ind <= 3 && bytes[pos + ind..le].is_horizontal_rule() {
-                break;
-            }
-
-            // Dedented sibling marker: close this item, open the next.
-            if ind <= 3
-                && let Some(m) = bytes[pos + ind..le].list_marker()
-            {
-                if !family.same_family(m) {
-                    break;
-                }
-                self.close_item(item_start, &mut pending_blanks);
-                if pending_blanks > 0 {
-                    loose = true;
-                    pending_blanks = 0;
-                }
-                item_start = self.lines.len().lines_offset();
-                col = bytes[pos + ind + m.width..le].item_content_indent(ind, m);
-                item_blanks = 0;
-                empty_then_blank = false;
-                sub_col = None;
-                fence = bytes[(pos + ind + m.width).min(le)..le].update_fence(None);
-                self.push_marker_content(pos, le, col);
-                pos = le + 1;
-                last_para = true;
-                continue;
-            }
-
-            // Lazy paragraph continuation. A marker in the "dead zone" —
-            // indented past the 3-space sibling threshold but short of the item
-            // content column — can neither open a sub-item (too shallow) nor a
-            // sibling (too deep), so it is ordinary lazy paragraph text and must
-            // stay text in pass 2 (flagged lazy; CommonMark example 312).
-            let body = &bytes[pos + ind..le];
-            let dead_zone_marker =
-                ind > 3 && ind < col && !body.is_horizontal_rule() && body.list_marker().is_some();
-            if item_blanks == 0 && last_para && (!body.begins_block() || dead_zone_marker) {
-                // Lazy lines are dedented by trimming (they sit left of `col`).
-                self.push_line(
-                    self.input.get(pos + ind..le).unwrap_or(""),
-                    dead_zone_marker,
-                );
-                pos = le + 1;
-                continue;
-            }
-            break;
-        }
-
-        // Close the final item.
-        self.close_item(item_start, &mut pending_blanks);
-
-        let items_len = self.list_items.len().lines_offset() - items_start;
-        ListScan {
-            items_start,
-            items_len,
-            tight: !loose,
-            ordered,
-            resume: pos,
-        }
     }
 
     /// Push one line onto the pool, recording whether it arrived as a lazy
@@ -2514,7 +2364,6 @@ impl<'src> ParseCtx<'src> {
     /// Detect and fold all block-level constructs. Computes `CommonMark` 0-3
     /// space indentation internally.
     #[inline]
-    #[allow(clippy::too_many_lines)]
     fn fold_block_element(
         &mut self,
         acc: Accumulator<'src>,
@@ -2524,41 +2373,7 @@ impl<'src> ParseCtx<'src> {
         // Strip 0-3 spaces of optional indentation (CommonMark §4).
         // Lines with 4+ leading spaces cannot start a block-level construct.
         let Some(indent) = self.bytes[pos..line_end].strip_indent() else {
-            // 4+ leading spaces.
-            if let Accumulator::InBlockquote {
-                lines_start,
-                para_open,
-                fence,
-            } = acc
-            {
-                // Lazy continuation only when an inner paragraph is open and we
-                // are not inside a fenced code block.
-                if para_open && fence.is_none() {
-                    self.push_line(self.input.get(pos..line_end).unwrap_or(""), true);
-                    return Accumulator::InBlockquote {
-                        lines_start,
-                        para_open: true,
-                        fence: None,
-                    };
-                }
-                self.flush_acc(Accumulator::InBlockquote {
-                    lines_start,
-                    para_open,
-                    fence,
-                });
-                return self.fold_block_element(Accumulator::Empty, pos, line_end);
-            }
-            if matches!(acc, Accumulator::InParagraph { .. }) {
-                // An indented line cannot interrupt a paragraph (CommonMark
-                // §4.4): it is lazy paragraph continuation text.
-                return self.fold_paragraph(acc, pos, line_end);
-            }
-            // Otherwise this opens an indented code block.
-            self.flush_acc(acc);
-            return Accumulator::InIndentedCode {
-                start: pos,
-                last_nonblank_end: line_end,
-            };
+            return self.fold_deep_indent(acc, pos, line_end);
         };
         let spos = pos + indent;
         let line_bytes = &self.bytes[spos..line_end];
@@ -2598,85 +2413,12 @@ impl<'src> ParseCtx<'src> {
         }
 
         if line_bytes.first() == SpecialChar::GreaterThan {
-            // Strip the `>` marker plus up to one column of following
-            // whitespace (`CommonMark` §5.1). When that one column lands inside
-            // a tab, the tab's remaining columns survive as synthetic `pad`
-            // (§2.2): the content slice resumes on the next tab stop, so its own
-            // tabs still expand from a local origin of 0. `>` sits at column
-            // `indent` (the 0-3 space prefix is pure spaces).
-            let content_start = spos + 1;
-            let (bq_pad, content) = match self.bytes.get(content_start) {
-                Some(&b' ') => (0, self.input.get(content_start + 1..line_end).unwrap_or("")),
-                Some(&b'\t') => {
-                    // Tab begins at column `indent + 1`; consuming one column
-                    // leaves `(tab_width - 1)` columns of pad.
-                    let tab_col = indent + 1;
-                    let pad = u8::try_from((4 - (tab_col % 4)).saturating_sub(1)).unwrap_or(0);
-                    (
-                        pad,
-                        self.input.get(content_start + 1..line_end).unwrap_or(""),
-                    )
-                }
-                _ => (0, self.input.get(content_start..line_end).unwrap_or("")),
-            };
-            let cb = content.as_bytes();
-            let (prev_para, prev_fence) = match acc {
-                Accumulator::InBlockquote {
-                    para_open, fence, ..
-                } => (para_open, fence),
-                _ => (false, None),
-            };
-            // Track inner paragraph / fenced-code state so a later lazy line is
-            // only absorbed when an inner paragraph is genuinely open.
-            let (para_open, fence) =
-                Self::blockquote_inner_state(cb, bq_pad, prev_para, prev_fence);
-            if let Accumulator::InBlockquote { lines_start, .. } = acc {
-                self.push_line_padded(content, false, bq_pad);
-                return Accumulator::InBlockquote {
-                    lines_start,
-                    para_open,
-                    fence,
-                };
-            }
-            self.flush_acc(acc);
-            let lines_start = self.lines.len().lines_offset();
-            self.push_line_padded(content, false, bq_pad);
-            return Accumulator::InBlockquote {
-                lines_start,
-                para_open,
-                fence,
-            };
+            return self.fold_blockquote_line(acc, spos, indent, line_end);
         }
 
-        // Blockquote lazy continuation (CommonMark §5.1): a non-blank line
-        // that doesn't start a new block-level construct continues the
-        // current blockquote — but only when the blockquote's last line was
-        // not blank (a blank line closes the inner paragraph, ending laziness).
-        let acc = if let Accumulator::InBlockquote {
-            lines_start,
-            para_open,
-            fence,
-        } = acc
-        {
-            // Lazy continuation requires an open inner paragraph (not blank,
-            // not inside indented/fenced code).
-            if para_open && fence.is_none() && self.blockquote_continues(line_bytes, spos) {
-                self.push_line(self.input.get(pos..line_end).unwrap_or(""), true);
-                return Accumulator::InBlockquote {
-                    lines_start,
-                    para_open: true,
-                    fence: None,
-                };
-            }
-            // Line starts a new block — flush the blockquote and fall through.
-            self.flush_acc(Accumulator::InBlockquote {
-                lines_start,
-                para_open,
-                fence,
-            });
-            Accumulator::Empty
-        } else {
-            acc
+        let acc = match self.fold_lazy_blockquote(acc, pos, spos, line_end) {
+            Ok(continued) => return continued,
+            Err(acc) => acc,
         };
 
         // Horizontal rules (CommonMark §4.1): three or more -, *, or _
@@ -2688,6 +2430,129 @@ impl<'src> ParseCtx<'src> {
         }
 
         self.fold_paragraph(acc, pos, line_end)
+    }
+
+    /// A line with 4+ leading spaces, which cannot start a block-level
+    /// construct.
+    fn fold_deep_indent(
+        &mut self,
+        acc: Accumulator<'src>,
+        pos: usize,
+        line_end: usize,
+    ) -> Accumulator<'src> {
+        if let Accumulator::InBlockquote { .. } = acc {
+            if let Some(lines_start) = acc.lazy_lines_start() {
+                return self.push_lazy_line(lines_start, pos, line_end);
+            }
+            self.flush_acc(acc);
+            return self.fold_block_element(Accumulator::Empty, pos, line_end);
+        }
+        if matches!(acc, Accumulator::InParagraph { .. }) {
+            // An indented line cannot interrupt a paragraph (CommonMark
+            // §4.4): it is lazy paragraph continuation text.
+            return self.fold_paragraph(acc, pos, line_end);
+        }
+        // Otherwise this opens an indented code block.
+        self.flush_acc(acc);
+        Accumulator::InIndentedCode {
+            start: pos,
+            last_nonblank_end: line_end,
+        }
+    }
+
+    /// Append `pos..line_end` to the blockquote starting at `lines_start` as
+    /// a lazy paragraph continuation line.
+    fn push_lazy_line(
+        &mut self,
+        lines_start: u32,
+        pos: usize,
+        line_end: usize,
+    ) -> Accumulator<'src> {
+        self.push_line(self.input.get(pos..line_end).unwrap_or(""), true);
+        Accumulator::InBlockquote {
+            lines_start,
+            para_open: true,
+            fence: None,
+        }
+    }
+
+    /// A line whose first non-indent byte (at `spos`, column `indent`) is a
+    /// `>` blockquote marker.
+    fn fold_blockquote_line(
+        &mut self,
+        acc: Accumulator<'src>,
+        spos: usize,
+        indent: usize,
+        line_end: usize,
+    ) -> Accumulator<'src> {
+        // Strip the `>` marker plus up to one column of following whitespace
+        // (`CommonMark` §5.1). When that one column lands inside a tab, the
+        // tab's remaining columns survive as synthetic `pad` (§2.2): the
+        // content slice resumes on the next tab stop, so its own tabs still
+        // expand from a local origin of 0. `>` sits at column `indent` (the
+        // 0-3 space prefix is pure spaces).
+        let content_start = spos + 1;
+        let (bq_pad, content) = match self.bytes.get(content_start) {
+            Some(&b' ') => (0, self.input.get(content_start + 1..line_end).unwrap_or("")),
+            Some(&b'\t') => {
+                // Tab begins at column `indent + 1`; consuming one column
+                // leaves `(tab_width - 1)` columns of pad.
+                let tab_col = indent + 1;
+                let pad = u8::try_from((4 - (tab_col % 4)).saturating_sub(1)).unwrap_or(0);
+                (
+                    pad,
+                    self.input.get(content_start + 1..line_end).unwrap_or(""),
+                )
+            }
+            _ => (0, self.input.get(content_start..line_end).unwrap_or("")),
+        };
+        let (prev_para, prev_fence) = match acc {
+            Accumulator::InBlockquote {
+                para_open, fence, ..
+            } => (para_open, fence),
+            _ => (false, None),
+        };
+        // Track inner paragraph / fenced-code state so a later lazy line is
+        // only absorbed when an inner paragraph is genuinely open.
+        let (para_open, fence) =
+            Self::blockquote_inner_state(content.as_bytes(), bq_pad, prev_para, prev_fence);
+        let lines_start = if let Accumulator::InBlockquote { lines_start, .. } = acc {
+            lines_start
+        } else {
+            self.flush_acc(acc);
+            self.lines.len().lines_offset()
+        };
+        self.push_line_padded(content, false, bq_pad);
+        Accumulator::InBlockquote {
+            lines_start,
+            para_open,
+            fence,
+        }
+    }
+
+    /// Blockquote lazy continuation (`CommonMark` §5.1): a non-blank line that
+    /// doesn't start a new block-level construct continues the current
+    /// blockquote — but only when its inner paragraph is open (a blank line
+    /// closes it, ending laziness). `Ok` holds the continued blockquote; `Err`
+    /// the accumulator to keep folding with (the blockquote flushed).
+    fn fold_lazy_blockquote(
+        &mut self,
+        acc: Accumulator<'src>,
+        pos: usize,
+        spos: usize,
+        line_end: usize,
+    ) -> Result<Accumulator<'src>, Accumulator<'src>> {
+        if !matches!(acc, Accumulator::InBlockquote { .. }) {
+            return Err(acc);
+        }
+        if let Some(lines_start) = acc.lazy_lines_start()
+            && self.blockquote_continues(&self.bytes[spos..line_end], spos)
+        {
+            return Ok(self.push_lazy_line(lines_start, pos, line_end));
+        }
+        // Line starts a new block — flush the blockquote and fall through.
+        self.flush_acc(acc);
+        Err(Accumulator::Empty)
     }
 
     #[inline]

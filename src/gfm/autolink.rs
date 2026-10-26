@@ -235,12 +235,24 @@ impl<'t> AutolinkScanner<'t> {
     }
 
     fn email_at(&self, at: usize, floor: usize) -> Option<AutolinkMatch> {
-        let text = self.text;
+        let (start, kind, xmpp) = self.email_local_start(at, floor);
+        if start == at {
+            return None;
+        }
+        let end = self.email_domain_end(at, xmpp)?;
+        let end = self.trim_trailing(at, end);
+        (end > at).then_some(AutolinkMatch { start, end, kind })
+    }
+
+    /// Scan back from the `@` at `at` over the local part, and an optional
+    /// `mailto:` or `xmpp:` prefix, to no earlier than `floor`. Returns
+    /// `(start, kind, xmpp)`.
+    fn email_local_start(&self, at: usize, floor: usize) -> (usize, AutolinkKind, bool) {
         let mut start = at;
         let mut kind = AutolinkKind::Email;
         let mut xmpp = false;
         while start > floor {
-            let c = text[start - 1];
+            let c = self.text[start - 1];
             if c.is_ascii_alphanumeric() || matches!(c, b'.' | b'+' | b'-' | b'_') {
                 start -= 1;
             } else if c == b':' && self.protocol_before(start - 1, floor, b"mailto") {
@@ -254,17 +266,21 @@ impl<'t> AutolinkScanner<'t> {
                 break;
             }
         }
-        if start == at {
-            return None;
-        }
+        (start, kind, xmpp)
+    }
+
+    /// End of the domain after the `@` at `at`. It needs a `.` followed by an
+    /// alphanumeric and must end in a letter or `.`; a second `@` rejects the
+    /// match. An `xmpp:` address may also contain `/`.
+    fn email_domain_end(&self, at: usize, xmpp: bool) -> Option<usize> {
+        let text = self.text;
         let mut end = at + 1;
         let mut dots = 0;
         while let Some(&c) = text.get(end) {
             if c == b'@' {
                 return None;
             }
-            let dot = c == b'.' && text.get(end + 1).is_some_and(u8::is_ascii_alphanumeric);
-            if dot {
+            if c == b'.' && text.get(end + 1).is_some_and(u8::is_ascii_alphanumeric) {
                 dots += 1;
             } else if !(c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || (xmpp && c == b'/'))
             {
@@ -273,11 +289,7 @@ impl<'t> AutolinkScanner<'t> {
             end += 1;
         }
         let last = text[end - 1];
-        if end - at < 2 || dots == 0 || !(last.is_ascii_alphabetic() || last == b'.') {
-            return None;
-        }
-        let end = self.trim_trailing(at, end);
-        (end > at).then_some(AutolinkMatch { start, end, kind })
+        (end - at >= 2 && dots > 0 && (last.is_ascii_alphabetic() || last == b'.')).then_some(end)
     }
 
     fn protocol_before(&self, colon: usize, floor: usize, protocol: &[u8]) -> bool {

@@ -411,6 +411,53 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_BLOCK_
 
     fn render_section(&self, section: &Section<'_>, out: &mut String) {
         match section {
+            Section::UnorderedList { tight, items } => {
+                out.push_str("<ul>\n");
+                self.render_list_items(*items, *tight, out);
+                out.push_str("</ul>\n");
+            }
+            Section::OrderedList {
+                start,
+                tight,
+                items,
+                ..
+            } => {
+                if *start == 1 {
+                    out.push_str("<ol>\n");
+                } else {
+                    let _ = writeln!(out, "<ol start=\"{start}\">");
+                }
+                self.render_list_items(*items, *tight, out);
+                out.push_str("</ol>\n");
+            }
+            // A bare ListItem (not reached via a list) renders loose.
+            Section::ListItem { .. } => self.render_list_item(section, false, out),
+            Section::Blockquote { children } => {
+                out.push_str("<blockquote>\n");
+                for child in self.child_sections(*children) {
+                    self.render_section(child, out);
+                }
+                out.push_str("</blockquote>\n");
+            }
+            Section::Alert {
+                kind,
+                title,
+                children,
+            } => self.render_alert(*kind, *title, *children, out),
+            Section::Table { rows, .. } => self.render_table(*rows, out),
+            _ => self.render_leaf(section, out),
+        }
+    }
+
+    fn render_list_items(&self, items: SectionRange, tight: bool, out: &mut String) {
+        for item in self.child_sections(items) {
+            self.render_list_item(item, tight, out);
+        }
+    }
+
+    /// Render a block that holds no child sections.
+    fn render_leaf(&self, section: &Section<'_>, out: &mut String) {
+        match section {
             Section::Heading { level, content } => {
                 let _ = write!(out, "<h{level}>");
                 self.render_inlines(*content, out);
@@ -458,43 +505,6 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_BLOCK_
                 }
                 out.push_str("\n</code></pre>\n");
             }
-            Section::UnorderedList { tight, items } => {
-                out.push_str("<ul>\n");
-                for item in self.child_sections(*items) {
-                    self.render_list_item(item, *tight, out);
-                }
-                out.push_str("</ul>\n");
-            }
-            Section::OrderedList {
-                start,
-                tight,
-                items,
-                ..
-            } => {
-                if *start == 1 {
-                    out.push_str("<ol>\n");
-                } else {
-                    let _ = writeln!(out, "<ol start=\"{start}\">");
-                }
-                for item in self.child_sections(*items) {
-                    self.render_list_item(item, *tight, out);
-                }
-                out.push_str("</ol>\n");
-            }
-            // A bare ListItem (not reached via a list) renders loose.
-            Section::ListItem { .. } => self.render_list_item(section, false, out),
-            Section::Blockquote { children } => {
-                out.push_str("<blockquote>\n");
-                for child in self.child_sections(*children) {
-                    self.render_section(child, out);
-                }
-                out.push_str("</blockquote>\n");
-            }
-            Section::Alert {
-                kind,
-                title,
-                children,
-            } => self.render_alert(*kind, *title, *children, out),
             Section::HtmlBlock { html } => {
                 // Emitted verbatim, with the trailing newline CommonMark adds.
                 ext::TagFilter::block(out, html);
@@ -502,10 +512,16 @@ impl<const MAX_INLINE_DEPTH: u8, const INLINE_STACK_CAP: usize, const MAX_BLOCK_
             }
             Section::HtmlLines { lines } => self.render_html_lines(*lines, out),
             Section::HorizontalRule => out.push_str("<hr />\n"),
-            Section::Table { rows, .. } => self.render_table(*rows, out),
-            // Rows and cells are emitted by their parent `Table`, and footnote
-            // definitions by `render_footnotes` after the body.
-            Section::TableRow { .. }
+            // Containers go through `render_section`. Rows and cells are
+            // emitted by their parent `Table`, and footnote definitions by
+            // `render_footnotes` after the body.
+            Section::UnorderedList { .. }
+            | Section::OrderedList { .. }
+            | Section::ListItem { .. }
+            | Section::Blockquote { .. }
+            | Section::Alert { .. }
+            | Section::Table { .. }
+            | Section::TableRow { .. }
             | Section::TableCell { .. }
             | Section::FootnoteDefinition { .. } => {}
         }

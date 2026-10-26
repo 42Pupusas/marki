@@ -160,44 +160,54 @@ impl<'src> LinkDef<'src> {
     /// whitespace or a control character, with balanced parentheses).
     fn scan_destination(bytes: &[u8], i: usize) -> Option<(usize, usize, usize)> {
         if bytes.get(i) == Some(&b'<') {
-            let mut j = i + 1;
-            loop {
-                match bytes.get(j) {
-                    None | Some(b'\n' | b'<') => return None,
-                    _ if Self::is_escape(bytes, j) => j += 2,
-                    Some(b'>') => return Some((i + 1, j, j + 1)),
-                    _ => j += 1,
-                }
-            }
-        } else {
-            let start = i;
-            let mut j = i;
-            let mut depth: i32 = 0;
-            loop {
-                match bytes.get(j) {
-                    None => break,
-                    Some(&b) if b.is_ascii_whitespace() => break,
-                    _ if Self::is_escape(bytes, j) => {
-                        j += 2;
-                        continue;
-                    }
-                    Some(b'(') => depth += 1,
-                    Some(b')') => {
-                        if depth == 0 {
-                            break;
-                        }
-                        depth -= 1;
-                    }
-                    Some(&b) if b < 0x20 => break,
-                    _ => {}
-                }
-                j += 1;
-            }
-            if j == start || depth != 0 {
-                return None;
-            }
-            Some((start, j, j))
+            return Self::scan_angle_destination(bytes, i);
         }
+        Self::scan_bare_destination(bytes, i)
+    }
+
+    /// The `<...>` destination form at `i`.
+    fn scan_angle_destination(bytes: &[u8], i: usize) -> Option<(usize, usize, usize)> {
+        let mut j = i + 1;
+        loop {
+            match bytes.get(j) {
+                None | Some(b'\n' | b'<') => return None,
+                _ if Self::is_escape(bytes, j) => j += 2,
+                Some(b'>') => return Some((i + 1, j, j + 1)),
+                _ => j += 1,
+            }
+        }
+    }
+
+    /// The bare destination form at `i`: non-empty, balanced parentheses,
+    /// ended by whitespace or a control character.
+    fn scan_bare_destination(bytes: &[u8], i: usize) -> Option<(usize, usize, usize)> {
+        let start = i;
+        let mut j = i;
+        let mut depth: i32 = 0;
+        loop {
+            match bytes.get(j) {
+                None => break,
+                Some(&b) if b.is_ascii_whitespace() => break,
+                _ if Self::is_escape(bytes, j) => {
+                    j += 2;
+                    continue;
+                }
+                Some(b'(') => depth += 1,
+                Some(b')') => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                Some(&b) if b < 0x20 => break,
+                _ => {}
+            }
+            j += 1;
+        }
+        if j == start || depth != 0 {
+            return None;
+        }
+        Some((start, j, j))
     }
 
     /// Scan a title at `i` delimited by `"`, `'`, or `(...)`.
